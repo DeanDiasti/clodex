@@ -1,7 +1,8 @@
 #![cfg(unix)]
 
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,7 @@ fn concurrent_supervisors_share_one_proxy_until_the_final_lease_closes() {
     let codex_home = temporary.0.join("codex");
     let fake_bin = temporary.0.join("bin");
     let starts = temporary.0.join("proxy-starts");
+    let test_binary = std::env::current_exe().unwrap();
     fs::create_dir_all(&codex_home).unwrap();
     fs::create_dir_all(&fake_bin).unwrap();
 
@@ -53,33 +55,26 @@ fn concurrent_supervisors_share_one_proxy_until_the_final_lease_closes() {
     let fake_proxy = fake_bin.join("claude-code-proxy");
     fs::write(
         &fake_proxy,
-        r#"#!/usr/bin/env python3
-import http.server
-import json
-import os
-import sys
+        r#"#!/usr/bin/env bash
+set -euo pipefail
 
-port = int(sys.argv[sys.argv.index("--port") + 1])
-with open(os.environ["FAKE_PROXY_STARTS"], "a", encoding="utf-8") as output:
-    output.write(f"{os.getpid()} {port} {os.environ.get('CCP_CODEX_TRANSPORT', '')}\n")
+port=""
+while (($# > 0)); do
+  case "$1" in
+    --port)
+      port="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path != "/healthz":
-            self.send_response(404)
-            self.end_headers()
-            return
-        body = json.dumps({"ok": True}, separators=(",", ":")).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *_args):
-        pass
-
-http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+[[ -n "${port}" ]] || exit 2
+export FAKE_PROXY_PORT="${port}"
+export FAKE_PROXY_TRANSPORT="${CCP_CODEX_TRANSPORT:-}"
+exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocapture
 "#,
     )
     .unwrap();
@@ -97,6 +92,7 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
                 .env("CLODEX_HOME", &clodex_home)
                 .env("CODEX_HOME", &codex_home)
                 .env("FAKE_PROXY_STARTS", &starts)
+                .env("FAKE_PROXY_TEST_BINARY", &test_binary)
                 .env("PATH", &path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -145,6 +141,7 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
         .env("CLODEX_HOME", &clodex_home)
         .env("CODEX_HOME", &codex_home)
         .env("FAKE_PROXY_STARTS", &starts)
+        .env("FAKE_PROXY_TEST_BINARY", &test_binary)
         .env("PATH", &path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -170,6 +167,47 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
         std::net::TcpStream::connect(("127.0.0.1", signaled_port)).is_err(),
         "the proxy survived supervisor SIGTERM"
     );
+}
+
+#[test]
+#[ignore = "runs only as the lifecycle test's external proxy process"]
+fn fake_proxy_process() {
+    let port: u16 = std::env::var("FAKE_PROXY_PORT")
+        .expect("FAKE_PROXY_PORT is required")
+        .parse()
+        .expect("FAKE_PROXY_PORT must be a port number");
+    let starts = std::env::var("FAKE_PROXY_STARTS").expect("FAKE_PROXY_STARTS is required");
+    let transport = std::env::var("FAKE_PROXY_TRANSPORT").unwrap_or_default();
+
+    writeln!(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(starts)
+            .unwrap(),
+        "{} {port} {transport}",
+        std::process::id()
+    )
+    .unwrap();
+
+    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    for incoming in listener.incoming() {
+        let mut stream = incoming.unwrap();
+        let mut request = [0_u8; 1024];
+        let bytes = stream.read(&mut request).unwrap_or_default();
+        let healthy = request[..bytes].starts_with(b"GET /healthz ");
+        let (status, body) = if healthy {
+            ("200 OK", "{\"ok\":true}")
+        } else {
+            ("404 Not Found", "{\"ok\":false}")
+        };
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    }
 }
 
 fn acquire_lease(socket: &Path) -> (UnixStream, u16) {
