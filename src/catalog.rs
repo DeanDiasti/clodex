@@ -109,9 +109,9 @@ impl Catalog {
 }
 
 fn format_context_window(tokens: u64) -> String {
-    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
+    if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
         format!("{}m context", tokens / 1_000_000)
-    } else if tokens >= 1_000 && tokens.is_multiple_of(1_000) {
+    } else if tokens >= 1_000 && tokens % 1_000 == 0 {
         format!("{}k context", tokens / 1_000)
     } else {
         format!("{tokens} context")

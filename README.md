@@ -1,22 +1,45 @@
 # Clodex
 
-Clodex runs Claude Code as the interactive coding harness while routing model
-requests through the local Codex subscription. It keeps Claude Code's UI,
-agents, tools, permissions, and workflows; only the model transport and model
-aliases are changed for the launched process.
+[![CI](https://github.com/DeanDiasti/clodex/actions/workflows/ci.yml/badge.svg)](https://github.com/DeanDiasti/clodex/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/tools/install)
+[![macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#requirements)
+
+**Use Claude Code's agentic coding interface with subscription-backed OpenAI
+Codex models.**
+
+Clodex is a local, open-source launcher that runs Claude Code as the interactive
+coding harness while routing model requests through your existing Codex CLI
+login. It keeps Claude Code's UI, agents, tools, permissions, and workflows;
+only the model transport and model aliases change for the launched process.
 
 ```text
 Claude Code → loopback translation proxy → authenticated Codex session
 ```
 
-Ordinary `claude` sessions are unaffected. Clodex does not call the OpenAI API
-with a separately configured API key: it reuses the existing file-backed
-ChatGPT login owned by the Codex CLI.
+Ordinary `claude` sessions are unaffected. Clodex does not require a separately
+configured OpenAI API key: it reuses the existing file-backed ChatGPT login
+owned by the Codex CLI.
 
-## Requirements
+> [!IMPORTANT]
+> Clodex is an independent community project. It is not affiliated with,
+> endorsed by, or supported by Anthropic or OpenAI.
+
+## Why Clodex?
+
+- Keep Claude Code's terminal experience, subagents, tool use, and permission
+  controls.
+- Use the models visible to an authenticated Codex CLI session without
+  hard-coding model names.
+- Run everything locally through a loopback-only translation proxy.
+- Leave normal Claude Code sessions and global model settings untouched.
+- Share one supervised proxy safely across concurrent Clodex sessions.
+
+## Quick start
+
+### 1. Requirements
 
 - macOS or Linux
-- Rust 1.85 or newer
 - [Codex CLI](https://developers.openai.com/codex/cli), logged in with ChatGPT
 - [Claude Code](https://code.claude.com/docs/en/setup)
 - [`claude-code-proxy`](https://github.com/raine/claude-code-proxy)
@@ -24,11 +47,25 @@ ChatGPT login owned by the Codex CLI.
 Clodex currently relies on Unix domain sockets and does not support native
 Windows.
 
-## Install and update
+### 2. Install Clodex
 
-From a source checkout:
+Download the archive for your platform from the
+[latest release](https://github.com/DeanDiasti/clodex/releases/latest), then:
 
 ```sh
+tar -xzf clodex-v*-*.tar.gz
+mkdir -p ~/.local/bin
+install -m 755 clodex ~/.local/bin/clodex
+```
+
+Release archives are available for Linux x86-64/ARM64 and macOS
+Intel/Apple Silicon. Ensure `~/.local/bin` is on `PATH`.
+
+To build from source instead, install Rust 1.85 or newer and run:
+
+```sh
+git clone https://github.com/DeanDiasti/clodex.git
+cd clodex
 ./scripts/install.sh --install-proxy
 ```
 
@@ -39,11 +76,34 @@ If every prerequisite is already present, use:
 ./scripts/install.sh
 ```
 
-The default installation prefix is `~/.local`, producing
-`~/.local/bin/clodex`. Ensure that directory is on `PATH`.
+The source installer uses `~/.local` by default, producing
+`~/.local/bin/clodex`.
 
-The installer is deliberately repeatable. To update Clodex, update the source
-checkout and run the same command again:
+### 3. Verify and run
+
+```sh
+clodex doctor
+clodex auth status
+clodex
+```
+
+Run `clodex` from any project directory. Arguments that are not Clodex
+management commands pass directly to Claude Code:
+
+```sh
+clodex --resume
+clodex -p "summarize this repository"
+clodex -- --resume
+```
+
+Clodex shows a purple launch banner, changes the terminal title while it runs,
+and selects a Clodex-only purple Claude theme, including the welcome logo. The
+theme definition is stored at `~/.claude/themes/clodex.json`; ordinary Claude
+sessions retain their own theme.
+
+## Update or uninstall
+
+The installer is repeatable. Update the checkout and run it again:
 
 ```sh
 git pull
@@ -62,35 +122,6 @@ Useful installer options:
 `CLODEX_INSTALL_ROOT` supplies the default for `--root`. To uninstall, remove
 `<install-root>/bin/clodex`; remove `~/.clodex` as well only if the saved
 configuration and logs are no longer wanted.
-
-## Quick start
-
-First verify the machine and reusable login:
-
-```sh
-clodex doctor
-clodex auth status
-```
-
-Then start Clodex in any repository:
-
-```sh
-clodex
-```
-
-Arguments that are not Clodex management commands pass directly to Claude
-Code:
-
-```sh
-clodex --resume
-clodex -p "summarize this repository"
-clodex -- --resume
-```
-
-Clodex shows a purple launch banner, changes the terminal title while it runs,
-and selects a Clodex-only purple Claude theme, including the welcome logo. The
-theme definition is stored at `~/.claude/themes/clodex.json`; ordinary Claude
-sessions retain their own theme.
 
 ## Commands
 
@@ -338,3 +369,12 @@ CI is defined in `.github/workflows/ci.yml` and runs formatting, Clippy, and all
 tests on both current Ubuntu and macOS runners for every push and pull request.
 The lifecycle test uses a local fake proxy, so CI does not need real Claude,
 Codex, credentials, or network access.
+
+## Community and support
+
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing a change.
+- Use [GitHub Issues](https://github.com/DeanDiasti/clodex/issues) for bugs and
+  feature requests.
+- Report vulnerabilities privately as described in
+  [SECURITY.md](SECURITY.md).
+- See [CHANGELOG.md](CHANGELOG.md) for release notes.

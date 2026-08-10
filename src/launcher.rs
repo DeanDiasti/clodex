@@ -236,9 +236,9 @@ fn restore_terminal_title() {
 }
 
 fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
+    if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
         format!("{}m", tokens / 1_000_000)
-    } else if tokens >= 1_000 && tokens.is_multiple_of(1_000) {
+    } else if tokens >= 1_000 && tokens % 1_000 == 0 {
         format!("{}k", tokens / 1_000)
     } else {
         tokens.to_string()

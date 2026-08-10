@@ -2,8 +2,14 @@
 name = "clodex"
 version = "0.1.0"
 edition = "2024"
-description = "Run Claude Code as a harness for subscription-backed Codex models"
+rust-version = "1.85"
+description = "Use Claude Code's agentic interface with subscription-backed Codex models"
 license = "MIT"
+repository = "https://github.com/DeanDiasti/clodex"
+homepage = "https://github.com/DeanDiasti/clodex"
+readme = "README.md"
+keywords = ["claude-code", "codex", "cli", "ai", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0"
@@ -21,3 +27,8 @@ zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
