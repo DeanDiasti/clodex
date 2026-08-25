@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub context: ContextConfig,
     pub codex: CodexConfig,
     pub compaction: CompactionConfig,
+    pub usage: UsageConfig,
     pub permissions: PermissionsConfig,
 }
 
@@ -34,6 +35,13 @@ pub struct ContextConfig {
 #[serde(default)]
 pub struct CodexConfig {
     pub transport: CodexTransport,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct UsageConfig {
+    /// Reports Codex subscription usage to Claude Code's status line.
+    pub report_limits: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -67,7 +75,18 @@ impl Default for AppConfig {
             context: ContextConfig::default(),
             codex: CodexConfig::default(),
             compaction: CompactionConfig::default(),
+            usage: UsageConfig::default(),
             permissions: PermissionsConfig::default(),
+        }
+    }
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        // On by default: it restores status-line bars that a plain Claude Code
+        // session already shows, and costs one cached lookup per minute.
+        Self {
+            report_limits: true,
         }
     }
 }
@@ -156,11 +175,17 @@ impl AppConfig {
              Compact at:     {}%\n\
              Codex transport: {}\n\
              Hierarchical compaction: {}\n\
+             Report Codex limits: {}\n\
              Trusted tools:  {}\n",
             self.context.render_limit(),
             self.context.compact_at_percent,
             self.codex.transport.as_str(),
             if self.compaction.hierarchical {
+                "on"
+            } else {
+                "off"
+            },
+            if self.usage.report_limits {
                 "on"
             } else {
                 "off"

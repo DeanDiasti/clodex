@@ -25,6 +25,9 @@ const MAX_TRACKED_ROUTES: usize = 16_384;
 /// Code to assemble and send the compaction it just announced, short enough
 /// that a cancelled compaction does not leave a session armed indefinitely.
 const ARM_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long a usage reading is reused before refetching. Claude Code redraws
+/// its status line far more often than a subscription window moves.
+const USAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Concurrent token-count requests while planning a fold.
 const COUNT_CONCURRENCY: usize = 8;
 /// How often to ping while a round is in flight. A round can run for minutes,
@@ -55,6 +58,7 @@ struct BridgeState {
     client: reqwest::Client,
     hierarchical: bool,
     ceiling: u64,
+    report_usage: bool,
 }
 
 pub struct FastBridge {
@@ -66,7 +70,12 @@ pub struct FastBridge {
 impl FastBridge {
     /// `ceiling` is the capacity a fold round must fit inside; zero, or
     /// `hierarchical` unset, leaves every request forwarded untouched.
-    pub fn start(upstream_port: u16, hierarchical: bool, ceiling: u64) -> Result<Self> {
+    pub fn start(
+        upstream_port: u16,
+        hierarchical: bool,
+        ceiling: u64,
+        report_usage: bool,
+    ) -> Result<Self> {
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).context("could not bind the Clodex fast bridge")?;
         listener.set_nonblocking(true)?;
@@ -89,6 +98,7 @@ impl FastBridge {
                         .context("could not create the Clodex fast bridge client")?,
                     hierarchical,
                     ceiling,
+                    report_usage,
                 });
                 let app = Router::new()
                     .route("/__clodex/health", get(health))
@@ -558,6 +568,47 @@ fn sse(event: &str, data: &Value) -> Vec<u8> {
     format!("event: {event}\ndata: {data}\n\n").into_bytes()
 }
 
+/// Current Codex usage, refetched at most once per `USAGE_TTL`.
+async fn cached_rate_limits(state: &BridgeState) -> Option<crate::usage::RateLimits> {
+    {
+        let cache = usage_cache().lock().expect("Clodex usage lock");
+        if let Some((limits, at)) = cache.as_ref()
+            && std::time::Instant::now().duration_since(*at) < USAGE_TTL
+        {
+            return *limits;
+        }
+    }
+
+    let fetched = crate::usage::fetch(&state.client).await;
+    let mut cache = usage_cache().lock().expect("Clodex usage lock");
+    // Cache misses too, so a failing endpoint is not retried on every request.
+    *cache = Some((fetched, std::time::Instant::now()));
+    fetched
+}
+
+type UsageCache = Option<(Option<crate::usage::RateLimits>, std::time::Instant)>;
+
+fn usage_cache() -> &'static Mutex<UsageCache> {
+    static CACHE: std::sync::OnceLock<Mutex<UsageCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Adds the rate-limit headers Claude Code renders its status bars from.
+///
+/// Behind a custom base URL these never arrive, so the bars vanish even though
+/// the session is spending a real Codex quota. Supplying them in the shape
+/// Claude Code already parses means an existing status line keeps working.
+fn apply_rate_limit_headers(response: &mut Response, limits: &crate::usage::RateLimits) {
+    for (name, value) in limits.headers() {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            axum::http::HeaderValue::from_str(&value),
+        ) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+}
+
 async fn proxy(State(state): State<std::sync::Arc<BridgeState>>, request: Request) -> Response {
     match proxy_inner(&state, request).await {
         Ok(response) => response,
@@ -631,6 +682,14 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         tokio::time::sleep(RETRY_BACKOFF * attempt).await;
     };
 
+    // Fetched before the response is built so the status line reflects the
+    // quota this very request is spending.
+    let rate_limits = if state.report_usage && is_messages {
+        cached_rate_limits(state).await
+    } else {
+        None
+    };
+
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
     let stream = upstream.bytes_stream().map_err(std::io::Error::other);
@@ -640,6 +699,9 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         if should_forward_response_header(name) {
             response.headers_mut().append(name, value.clone());
         }
+    }
+    if let Some(limits) = &rate_limits {
+        apply_rate_limit_headers(&mut response, limits);
     }
     Ok(response)
 }
@@ -892,6 +954,7 @@ mod tests {
             client: reqwest::Client::new(),
             hierarchical: false,
             ceiling: 828_400,
+            report_usage: false,
         };
         let body = serde_json::json!({
             "model": "gpt-5.6-sol",
@@ -923,6 +986,7 @@ mod tests {
             client: reqwest::Client::new(),
             hierarchical: true,
             ceiling: 828_400,
+            report_usage: false,
         };
         let body = serde_json::json!({
             "model": "gpt-5.6-sol",
@@ -1226,7 +1290,7 @@ mod tests {
             }
         });
 
-        let bridge = FastBridge::start(upstream_port, false, 0).unwrap();
+        let bridge = FastBridge::start(upstream_port, false, 0, false).unwrap();
         let url = format!("http://127.0.0.1:{}/v1/messages", bridge.port());
         let client = reqwest::blocking::Client::new();
         let send = |marked: bool, model: &str, fast: bool| {
