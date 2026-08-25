@@ -23,6 +23,14 @@ pub struct Model {
     pub priority: u32,
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// The extended ceiling the model can reach on the Codex transport. The
+    /// catalog reports this separately from the standard `context_window`
+    /// usage threshold.
+    #[serde(default)]
+    pub max_context_window: Option<u64>,
+    /// The share of a window Codex treats as usable, as a percentage.
+    #[serde(default)]
+    pub effective_context_window_percent: Option<u64>,
     #[serde(default)]
     pub supported_reasoning_levels: Vec<ReasoningLevel>,
     #[serde(default)]
@@ -38,6 +46,22 @@ pub struct ReasoningLevel {
 
 const fn default_priority() -> u32 {
     u32::MAX
+}
+
+const DEFAULT_EFFECTIVE_CONTEXT_PERCENT: u64 = 95;
+
+impl Model {
+    /// The largest prompt this model will actually accept, after applying the
+    /// catalog's effective-window percentage. Prefers the extended ceiling and
+    /// falls back to the standard usage threshold.
+    pub fn usable_context_window(&self) -> Option<u64> {
+        let window = self.max_context_window.max(self.context_window)?;
+        let percent = self
+            .effective_context_window_percent
+            .filter(|percent| (1..=100).contains(percent))
+            .unwrap_or(DEFAULT_EFFECTIVE_CONTEXT_PERCENT);
+        Some(window * percent / 100)
+    }
 }
 
 impl Catalog {
@@ -131,6 +155,8 @@ mod tests {
             supported_in_api: supported,
             priority,
             context_window: None,
+            max_context_window: None,
+            effective_context_window_percent: None,
             supported_reasoning_levels: Vec::new(),
             additional_speed_tiers: Vec::new(),
         }

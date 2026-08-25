@@ -78,6 +78,8 @@ mod tests {
             supported_in_api: true,
             priority,
             context_window: None,
+            max_context_window: None,
+            effective_context_window_percent: None,
             supported_reasoning_levels: Vec::new(),
             additional_speed_tiers: Vec::new(),
         }

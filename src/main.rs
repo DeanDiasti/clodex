@@ -94,6 +94,11 @@ enum ConfigCommand {
         /// Percentage from 1 through 95.
         percent: u8,
     },
+    /// Select Codex HTTP SSE, WebSocket, or automatic transport.
+    Transport {
+        /// One of: http, websocket, or auto.
+        value: String,
+    },
     /// Trust an exact Claude tool name in every Clodex agent.
     AllowTool {
         /// Tool name, such as mcp__codebase-memory-mcp__search_code.
@@ -224,6 +229,15 @@ fn run_config(args: ConfigArgs) -> Result<()> {
             println!(
                 "Auto-compaction set to {}% for all clodex instances.",
                 percent
+            );
+        }
+        ConfigCommand::Transport { value } => {
+            let mut config = config::AppConfig::load()?;
+            config.codex.transport = config::CodexTransport::parse(&value)?;
+            config.save()?;
+            println!(
+                "Codex transport set to {}. Close every active Clodex session, then start a new one to apply it.",
+                config.codex.transport.as_str()
             );
         }
         ConfigCommand::AllowTool { tool } => {

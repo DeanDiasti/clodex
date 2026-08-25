@@ -157,8 +157,13 @@ pub fn run() -> Result<()> {
 
     let mut credentials = auth::load_codex_credentials(false)?;
     write_proxy_auth(&paths.proxy_config, &credentials)?;
+    let app_config = config::AppConfig::load()?;
     let upstream_port = available_proxy_port()?;
-    cleanup.proxy = Some(spawn_proxy(&paths, upstream_port)?);
+    cleanup.proxy = Some(spawn_proxy(
+        &paths,
+        upstream_port,
+        app_config.codex.transport,
+    )?);
     wait_for_owned_proxy(
         cleanup
             .proxy
@@ -379,17 +384,25 @@ fn spawn_supervisor() -> Result<()> {
     Ok(())
 }
 
-fn spawn_proxy(paths: &SupervisorPaths, proxy_port: u16) -> Result<Child> {
+fn spawn_proxy(
+    paths: &SupervisorPaths,
+    proxy_port: u16,
+    transport: config::CodexTransport,
+) -> Result<Child> {
     let stdout = append_log(&paths.proxy_log)?;
     let stderr = stdout.try_clone()?;
 
     Command::new("claude-code-proxy")
         .args(["serve", "--no-monitor", "--port", &proxy_port.to_string()])
         .env("CCP_CONFIG_DIR", &paths.proxy_config)
-        // Parallel Claude Code agents can exhaust or be rejected by the
-        // upstream WebSocket connection pool. HTTP SSE preserves streaming
-        // without requiring one WebSocket upgrade per concurrent request.
-        .env("CCP_CODEX_TRANSPORT", "http")
+        .env("CCP_CODEX_TRANSPORT", transport.as_str())
+        // Lets Codex compact its own context upstream when a prompt approaches
+        // the model's limit, instead of rejecting it with a 413. This is not
+        // what makes the extended context window available — that is already
+        // served without it — but a 413 is expensive to recover from, because
+        // Claude Code answers it by compacting and the compaction request
+        // carries the same oversized conversation.
+        .env("CCP_CODEX_SERVER_COMPACTION", "1")
         .env("XDG_STATE_HOME", config::clodex_home()?.join("logs"))
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))

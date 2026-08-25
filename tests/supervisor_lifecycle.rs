@@ -136,6 +136,12 @@ exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocaptur
     assert!(!socket.exists());
     assert!(!clodex_home.join("run/proxy/codex/auth.json").exists());
 
+    fs::write(
+        clodex_home.join("config.json"),
+        r#"{"version":1,"codex":{"transport":"websocket"}}"#,
+    )
+    .unwrap();
+
     let mut signaled_supervisor = Command::new(env!("CARGO_BIN_EXE_clodex"))
         .arg("__supervisor")
         .env("CLODEX_HOME", &clodex_home)
@@ -166,6 +172,14 @@ exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocaptur
     assert!(
         std::net::TcpStream::connect(("127.0.0.1", signaled_port)).is_err(),
         "the proxy survived supervisor SIGTERM"
+    );
+    let starts_log = fs::read_to_string(&starts).unwrap();
+    assert!(
+        starts_log
+            .lines()
+            .last()
+            .is_some_and(|line| line.ends_with(" websocket")),
+        "the restarted proxy did not receive the configured WebSocket transport: {starts_log}"
     );
 }
 

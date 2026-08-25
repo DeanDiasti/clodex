@@ -40,6 +40,7 @@ pub fn run(claude_args: Vec<OsString>) -> Result<()> {
         config.save()?;
     }
     let context_capacity = config.effective_context_capacity(&catalog, &mapping)?;
+    warn_if_context_was_clamped(config.context.max_tokens, context_capacity);
     let lease = supervisor::acquire()?;
     let proxy_port = lease.proxy_port();
     let supports_fast_bridge = lease.supports_fast_bridge();
@@ -215,6 +216,23 @@ fn write_clodex_theme(themes_directory: &Path) -> Result<()> {
         .with_context(|| format!("could not write Clodex theme {}", temporary.display()))?;
     fs::rename(&temporary, &path)
         .with_context(|| format!("could not save Clodex theme {}", path.display()))
+}
+
+/// A configured capacity above what the routed models accept is not a harmless
+/// over-request: Claude Code would auto-compact well past the point where Codex
+/// rejects every prompt, and the compaction request carries the same oversized
+/// conversation, so it is rejected too.
+fn warn_if_context_was_clamped(configured: Option<u64>, capacity: u64) {
+    let Some(configured) = configured.filter(|configured| *configured > capacity) else {
+        return;
+    };
+    if io::stderr().is_terminal() {
+        eprintln!(
+            "\x1b[33m!\x1b[0m Configured context {} exceeds what the routed Codex models accept; using {}.",
+            format_tokens(configured),
+            format_tokens(capacity)
+        );
+    }
 }
 
 fn print_banner(mapping: &ModelMapping, context_capacity: u64, compact_at: u8) {

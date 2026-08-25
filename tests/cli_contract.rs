@@ -37,6 +37,7 @@ fn nested_command_help_documents_the_public_configuration_contract() {
         "show",
         "context",
         "compact-at",
+        "transport",
         "allow-tool",
         "forget-tool",
         "path",

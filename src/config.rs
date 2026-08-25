@@ -17,6 +17,7 @@ const MAX_COMPACT_AT_PERCENT: u8 = 95;
 pub struct AppConfig {
     pub version: u32,
     pub context: ContextConfig,
+    pub codex: CodexConfig,
     pub permissions: PermissionsConfig,
 }
 
@@ -26,6 +27,21 @@ pub struct ContextConfig {
     /// `None` follows the smallest context window among routed models.
     pub max_tokens: Option<u64>,
     pub compact_at_percent: u8,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CodexConfig {
+    pub transport: CodexTransport,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexTransport {
+    #[default]
+    Http,
+    Websocket,
+    Auto,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -40,6 +56,7 @@ impl Default for AppConfig {
         Self {
             version: CONFIG_VERSION,
             context: ContextConfig::default(),
+            codex: CodexConfig::default(),
             permissions: PermissionsConfig::default(),
         }
     }
@@ -127,9 +144,11 @@ impl AppConfig {
             "Persistent clodex defaults\n\n\
              Context ceiling: {}\n\
              Compact at:     {}%\n\
+             Codex transport: {}\n\
              Trusted tools:  {}\n",
             self.context.render_limit(),
             self.context.compact_at_percent,
+            self.codex.transport.as_str(),
             trusted_tools
         )
     }
@@ -140,17 +159,30 @@ impl AppConfig {
         mapping: &ModelMapping,
     ) -> Result<String> {
         let standard = smallest_mapped_context(catalog, mapping)?;
+        let ceiling = routed_context_ceiling(catalog, mapping)?;
         let capacity = self.effective_context_capacity(catalog, mapping)?;
+        debug_assert!(capacity <= ceiling);
         let trigger = capacity * u64::from(self.context.compact_at_percent) / 100;
+        let clamped = self
+            .context
+            .max_tokens
+            .is_some_and(|configured| configured > ceiling);
 
         Ok(format!(
             "Effective context configuration\n\n\
              Catalog standard: {}\n\
-             Claude capacity:  {}\n\
+             Routed ceiling:   {}\n\
+             Claude capacity:  {}{}\n\
              Auto-compact at:  {}%\n\
              Effective trigger: {}\n",
             format_tokens(standard),
+            format_tokens(ceiling),
             format_tokens(capacity),
+            if clamped {
+                " (clamped to the routed ceiling)"
+            } else {
+                ""
+            },
             self.context.compact_at_percent,
             format_tokens(trigger)
         ))
@@ -161,12 +193,36 @@ impl AppConfig {
         catalog: &Catalog,
         mapping: &ModelMapping,
     ) -> Result<u64> {
+        // The routed ceiling is authoritative in both directions. `auto` opts
+        // into the extended window the catalog advertises, and an explicit
+        // value is clamped to it: a capacity above what Codex accepts leaves
+        // Claude Code auto-compacting past the point where every request is
+        // rejected, and a rejected compaction request cannot recover.
         match self.context.max_tokens {
-            // Explicit values opt into the model's extended context window.
-            // The Codex catalog currently reports the standard 272K usage
-            // threshold for GPT-5.6 even though the models support 1.05M.
-            Some(configured) => Ok(configured),
-            None => smallest_mapped_context(catalog, mapping),
+            // A silent catalog leaves nothing to clamp against, so an explicit
+            // value stays an escape hatch.
+            Some(configured) => Ok(routed_context_ceiling(catalog, mapping)
+                .map_or(configured, |ceiling| configured.min(ceiling))),
+            None => routed_context_ceiling(catalog, mapping),
+        }
+    }
+}
+
+impl CodexTransport {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "http" => Ok(Self::Http),
+            "websocket" => Ok(Self::Websocket),
+            "auto" => Ok(Self::Auto),
+            _ => bail!("invalid Codex transport {value:?}; expected http, websocket, or auto"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Websocket => "websocket",
+            Self::Auto => "auto",
         }
     }
 }
@@ -303,6 +359,22 @@ fn legacy_config_path() -> Result<PathBuf> {
 }
 
 fn smallest_mapped_context(catalog: &Catalog, mapping: &ModelMapping) -> Result<u64> {
+    routed_window(catalog, mapping, |model| model.context_window)
+        .context("mapped Codex models did not report a context window")
+}
+
+/// The largest capacity every routed model will actually accept. Claude Code
+/// must never be told it has more room than this.
+pub fn routed_context_ceiling(catalog: &Catalog, mapping: &ModelMapping) -> Result<u64> {
+    routed_window(catalog, mapping, |model| model.usable_context_window())
+        .context("mapped Codex models did not report a context window")
+}
+
+fn routed_window(
+    catalog: &Catalog,
+    mapping: &ModelMapping,
+    window: impl Fn(&crate::catalog::Model) -> Option<u64>,
+) -> Option<u64> {
     let routed = [
         mapping.fable.model.as_str(),
         mapping.opus.model.as_str(),
@@ -316,10 +388,9 @@ fn smallest_mapped_context(catalog: &Catalog, mapping: &ModelMapping) -> Result<
                 .models
                 .iter()
                 .find(|model| model.slug == *slug)
-                .and_then(|model| model.context_window)
+                .and_then(&window)
         })
         .min()
-        .context("mapped Codex models did not report a context window")
 }
 
 fn validate_compact_at_percent(percent: u8) -> Result<()> {
@@ -372,8 +443,20 @@ mod tests {
             supported_in_api: true,
             priority,
             context_window: Some(context_window),
+            max_context_window: None,
+            effective_context_window_percent: None,
             supported_reasoning_levels: Vec::new(),
             additional_speed_tiers: Vec::new(),
+        }
+    }
+
+    /// A catalog entry shaped like the live GPT-5.6 models, which advertise an
+    /// extended ceiling alongside the standard usage threshold.
+    fn extended_model(slug: &str, priority: u32, standard: u64, extended: u64) -> Model {
+        Model {
+            max_context_window: Some(extended),
+            effective_context_window_percent: Some(95),
+            ..model(slug, priority, standard)
         }
     }
 
@@ -392,6 +475,17 @@ mod tests {
         assert!(parse_context_limit("1.5m").is_err());
         assert!(parse_context_limit("1mb").is_err());
         assert!(parse_context_limit("18446744073709551615m").is_err());
+    }
+
+    #[test]
+    fn parses_codex_transport_names() {
+        assert_eq!(CodexTransport::parse("http").unwrap(), CodexTransport::Http);
+        assert_eq!(
+            CodexTransport::parse(" WEBSOCKET ").unwrap(),
+            CodexTransport::Websocket
+        );
+        assert_eq!(CodexTransport::parse("AUTO").unwrap(), CodexTransport::Auto);
+        assert!(CodexTransport::parse("sse").is_err());
     }
 
     #[test]
@@ -418,38 +512,85 @@ mod tests {
         assert_eq!(AppConfig::load_from(&path).unwrap(), AppConfig::default());
     }
 
-    #[test]
-    fn explicit_context_can_exceed_the_catalog_standard_window() {
-        let catalog = Catalog {
+    fn extended_catalog() -> Catalog {
+        Catalog {
             models: vec![
-                model("sol", 1, 300_000),
-                model("terra", 2, 272_000),
-                model("luna", 3, 128_000),
+                extended_model("sol", 1, 272_000, 872_000),
+                extended_model("terra", 2, 272_000, 872_000),
+                extended_model("luna", 3, 272_000, 872_000),
             ],
-        };
+        }
+    }
+
+    #[test]
+    fn automatic_context_opts_into_the_extended_catalog_ceiling() {
+        let catalog = extended_catalog();
+        let mapping = ModelMapping::from_catalog(&catalog).unwrap();
+
+        // 872_000 * 95%, not the 272_000 standard usage threshold.
+        assert_eq!(
+            AppConfig::default()
+                .effective_context_capacity(&catalog, &mapping)
+                .unwrap(),
+            828_400
+        );
+    }
+
+    #[test]
+    fn explicit_context_is_clamped_to_what_codex_will_accept() {
+        let catalog = extended_catalog();
         let mapping = ModelMapping::from_catalog(&catalog).unwrap();
         let config = AppConfig {
             context: ContextConfig {
-                max_tokens: Some(256_000),
+                max_tokens: Some(1_000_000),
                 compact_at_percent: 90,
             },
             ..AppConfig::default()
         };
 
-        let output = config.render_effective_context(&catalog, &mapping).unwrap();
+        assert_eq!(
+            config
+                .effective_context_capacity(&catalog, &mapping)
+                .unwrap(),
+            828_400
+        );
 
-        assert!(output.contains("Catalog standard: 128000 tokens"));
-        assert!(output.contains("Claude capacity:  256000 tokens"));
-        assert!(output.contains("Effective trigger: 230400 tokens"));
+        let output = config.render_effective_context(&catalog, &mapping).unwrap();
+        assert!(output.contains("Catalog standard: 272000 tokens"));
+        assert!(output.contains("Routed ceiling:   828400 tokens"));
+        assert!(output.contains("clamped to the routed ceiling"));
+        assert!(output.contains("Effective trigger: 745560 tokens"));
     }
 
     #[test]
-    fn automatic_context_follows_the_smallest_catalog_window() {
+    fn an_explicit_value_below_the_ceiling_is_preserved() {
+        let catalog = extended_catalog();
+        let mapping = ModelMapping::from_catalog(&catalog).unwrap();
+        let config = AppConfig {
+            context: ContextConfig {
+                max_tokens: Some(400_000),
+                compact_at_percent: 90,
+            },
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            config
+                .effective_context_capacity(&catalog, &mapping)
+                .unwrap(),
+            400_000
+        );
+        let output = config.render_effective_context(&catalog, &mapping).unwrap();
+        assert!(!output.contains("clamped to the routed ceiling"));
+    }
+
+    #[test]
+    fn the_ceiling_follows_the_smallest_routed_model() {
         let catalog = Catalog {
             models: vec![
-                model("sol", 1, 300_000),
-                model("terra", 2, 272_000),
-                model("luna", 3, 128_000),
+                extended_model("sol", 1, 272_000, 872_000),
+                extended_model("terra", 2, 272_000, 872_000),
+                extended_model("luna", 3, 128_000, 128_000),
             ],
         };
         let mapping = ModelMapping::from_catalog(&catalog).unwrap();
@@ -458,7 +599,27 @@ mod tests {
             AppConfig::default()
                 .effective_context_capacity(&catalog, &mapping)
                 .unwrap(),
-            128_000
+            121_600
+        );
+    }
+
+    #[test]
+    fn a_catalog_without_an_extended_window_still_resolves() {
+        let catalog = Catalog {
+            models: vec![
+                model("sol", 1, 300_000),
+                model("terra", 2, 272_000),
+                model("luna", 3, 128_000),
+            ],
+        };
+        let mapping = ModelMapping::from_catalog(&catalog).unwrap();
+
+        // No effective percentage reported, so the 95% default applies.
+        assert_eq!(
+            AppConfig::default()
+                .effective_context_capacity(&catalog, &mapping)
+                .unwrap(),
+            121_600
         );
     }
 
@@ -522,6 +683,7 @@ mod tests {
         .unwrap();
 
         let config = AppConfig::load_from(&path).unwrap();
+        assert_eq!(config.codex.transport, CodexTransport::Http);
         assert!(config.permissions.trusted_tools.is_empty());
         fs::remove_file(path).unwrap();
     }
@@ -551,13 +713,16 @@ mod tests {
     fn renders_empty_and_populated_configuration() {
         let empty = AppConfig::default().render();
         assert!(empty.contains("Context ceiling: auto"));
+        assert!(empty.contains("Codex transport: http"));
         assert!(empty.contains("Trusted tools:  none"));
 
         let mut configured = AppConfig::default();
         configured.context.max_tokens = Some(600_000);
+        configured.codex.transport = CodexTransport::Websocket;
         configured.permissions.trust("mcp__memory__search").unwrap();
         let output = configured.render();
         assert!(output.contains("Context ceiling: 600000 tokens"));
+        assert!(output.contains("Codex transport: websocket"));
         assert!(output.contains("Trusted tools:  mcp__memory__search"));
     }
 

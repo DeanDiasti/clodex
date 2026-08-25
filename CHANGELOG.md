@@ -7,6 +7,27 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Configurable Codex transport with `clodex config transport`, while retaining
+  HTTP SSE as the concurrency-safe default.
+- Configured transport reporting in `clodex doctor` and recovery guidance for
+  interrupted Codex response streams.
+- Codex server-side compaction, enabled for every launched proxy, so Codex can
+  compact upstream instead of rejecting a prompt near the model's limit.
+- Context capacity reporting in `clodex doctor`, and a launch warning when a
+  configured capacity is clamped.
+
+### Fixed
+
+- `auto` context capacity now follows the catalog's extended
+  `max_context_window` and `effective_context_window_percent` instead of the
+  smaller standard usage threshold.
+- A configured context capacity above what the routed Codex models accept is
+  clamped to the routed ceiling. Passing it through left Claude Code
+  auto-compacting past the point where every request is rejected, and a
+  rejected compaction request cannot recover.
+
 ## [0.1.0] - 2026-08-09
 
 ### Added
