@@ -194,15 +194,16 @@ clodex models map --json
 
 ## Context and compaction
 
-The default `auto` setting uses the smallest standard context window reported
-by the three routed catalog models:
+The default `auto` setting resolves to the largest capacity every routed model
+will actually accept. Clodex reads the catalog's extended `max_context_window`
+and applies its `effective_context_window_percent`, rather than the smaller
+standard usage threshold:
 
 ```sh
 clodex config context auto
 ```
 
-An explicit value opts into a larger model window and is passed through
-unchanged:
+An explicit value is honoured up to that ceiling and clamped above it:
 
 ```sh
 clodex config context 600k
@@ -216,12 +217,21 @@ underscores are accepted as well. Clodex supplies the selected value as both
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, with the percentage in
 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`.
 
-This explicit override matters because Claude Code otherwise applies a
-conservative window to an unfamiliar model behind a custom Anthropic base URL.
-The Codex catalog may report a smaller standard or usage threshold even when a
-model supports an extended window. For example, a configured `600k` capacity
-with compaction at `90` produces a 540,000-token trigger. The upstream model
-remains authoritative and will reject a value beyond its real capability.
+This matters because Claude Code otherwise applies a conservative window to an
+unfamiliar model behind a custom Anthropic base URL. For example, a configured
+`600k` capacity with compaction at `90` produces a 540,000-token trigger.
+
+A capacity above the routed ceiling is clamped rather than passed through, and
+`clodex doctor` reports both numbers. This is not a harmless over-request:
+Codex rejects an oversized prompt with a 413, and Claude Code's recovery is to
+compact — but the compaction request carries the same oversized conversation,
+so it is rejected too. The session then cannot compact its way back under the
+limit.
+
+Clodex also launches the proxy with Codex server-side compaction enabled, which
+lets Codex compact upstream rather than reject a prompt that approaches the
+model's limit. The extended window is served without it; this is defence in
+depth against the rejection path above.
 
 Settings apply when a new Clodex process starts. Restart existing sessions
 after changing them. Subagents inherit the launch environment and therefore
@@ -276,7 +286,19 @@ path. A supervisor that never receives a lease exits after 15 seconds.
 
 Codex traffic uses streaming HTTP SSE by default. This avoids the 403
 WebSocket-upgrade failures that can occur when many Claude subagents start
-concurrently.
+concurrently. The transport can be changed persistently:
+
+```sh
+clodex config transport http
+clodex config transport websocket
+clodex config transport auto
+```
+
+`websocket` can reduce exposure to HTTP response-body interruptions, but it
+may be less reliable under heavy parallel-agent load. `auto` starts with
+WebSocket and falls back to HTTP only if setup fails before a request is sent;
+it cannot replay an interrupted in-flight request. Close every active Clodex
+session after changing the transport so the shared supervisor restarts.
 
 ## Credentials and local files
 
@@ -323,9 +345,24 @@ clodex auth sync
 clodex context
 ```
 
-- **“Run `/login`” or `403 WebSocket upgrade was rejected`:** update Clodex
-  and restart all Clodex sessions. Current launches force the proxy's HTTP SSE
-  transport. Confirm the proxy version with `clodex doctor`.
+- **“Agent terminated early” with “error decoding response body”:** this is an
+  interrupted upstream Codex response. The proxy retries failures that are
+  still safe to replay, but it cannot safely replay a partially emitted tool
+  stream. Retry the failed agent after connectivity recovers. If interruptions
+  persist and the workload does not use heavy agent concurrency, try
+  `clodex config transport websocket`, close every Clodex session, and start a
+  new one. Inspect `~/.clodex/logs/claude-code-proxy/proxy.log` for
+  `codex_http_stream_failed` and `buffered_transport_retry_exhausted`.
+- **“Run `/login`” or `403 WebSocket upgrade was rejected`:** update Clodex,
+  run `clodex config transport http`, and restart all Clodex sessions. Confirm
+  the configured transport and proxy version with `clodex doctor`.
+- **“Prompt is too long” or `413 request_too_large` mid-session:** the
+  conversation passed what Codex accepts. Run `clodex doctor` and compare
+  "Context capacity" against the routed ceiling; a capacity above the ceiling
+  means an older Clodex passed a configured value through unclamped. Update
+  Clodex and start a new session. Note that the upstream 413 message carries no
+  token counts, so Claude Code cannot size its compaction retry precisely and
+  may fail to recover.
 - **The prompt bar still shows a small window:** context changes affect new
   processes only. Close and restart the session, then run `clodex context`.
 - **A trusted tool still prompts:** confirm the exact Claude tool identifier in
