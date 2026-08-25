@@ -135,6 +135,7 @@ configuration and logs are no longer wanted.
 | `clodex config [show]` | Show persistent defaults |
 | `clodex config context <auto\|tokens>` | Set context capacity |
 | `clodex config compact-at <1..95>` | Set the auto-compaction percentage |
+| `clodex config hierarchical-compaction <on\|off>` | Fold an oversized compaction into rounds |
 | `clodex config allow-tool <exact-name>` | Trust one tool for sessions and subagents |
 | `clodex config forget-tool <exact-name>` | Remove a trusted tool |
 | `clodex config path` | Print the configuration path |
@@ -237,6 +238,38 @@ Settings apply when a new Clodex process starts. Restart existing sessions
 after changing them. Subagents inherit the launch environment and therefore
 receive the same capacity and percentage, but each agent has its own context
 window.
+
+## Hierarchical compaction
+
+Opt-in. When a conversation grows past what the routed models accept, the
+compaction request carries the same oversized conversation and is rejected too,
+so the session cannot compact its way back under the limit. Hierarchical
+compaction replaces that single request with a fold whose rounds each fit by
+construction:
+
+```text
+S₀ = compact(chunk₀)
+Sᵢ = compact(Sᵢ₋₁ ++ chunkᵢ)
+```
+
+```sh
+clodex config hierarchical-compaction on
+```
+
+The round count follows the conversation size rather than a fixed number, so a
+conversation at twice the ceiling folds in two rounds and one at ten times the
+ceiling folds in ten. Each round costs one model call, which is why this is
+off by default.
+
+Claude Code's `PreCompact` hook arms the fold, and the bridge confirms the
+request that follows carries the summary prompt before folding it. The fold
+engages only once a conversation genuinely exceeds the ceiling, so it never
+pre-empts a compaction that would have succeeded, and every uncertain
+path — an unreadable catalog, a conversation with no safe split point, a
+message larger than a whole round — forwards the request unchanged.
+
+Rounds never split a `tool_use` from its `tool_result`, and each round retries
+on the interrupted upstream responses that are common on this transport.
 
 ## Reasoning effort
 

@@ -15,6 +15,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   interrupted Codex response streams.
 - Codex server-side compaction, enabled for every launched proxy, so Codex can
   compact upstream instead of rejecting a prompt near the model's limit.
+- Opt-in hierarchical compaction (`clodex config hierarchical-compaction`),
+  which folds an oversized compaction request into successive rounds that each
+  fit the context window, so a conversation past the ceiling can still compact.
 - Context capacity reporting in `clodex doctor`, and a launch warning when a
   configured capacity is clamped.
 

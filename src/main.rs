@@ -1,5 +1,6 @@
 mod auth;
 mod catalog;
+mod compaction;
 mod config;
 mod doctor;
 mod fast_bridge;
@@ -97,6 +98,11 @@ enum ConfigCommand {
     /// Select Codex HTTP SSE, WebSocket, or automatic transport.
     Transport {
         /// One of: http, websocket, or auto.
+        value: String,
+    },
+    /// Fold an oversized compaction into rounds that each fit the window.
+    HierarchicalCompaction {
+        /// One of: on or off.
         value: String,
     },
     /// Trust an exact Claude tool name in every Clodex agent.
@@ -238,6 +244,20 @@ fn run_config(args: ConfigArgs) -> Result<()> {
             println!(
                 "Codex transport set to {}. Close every active Clodex session, then start a new one to apply it.",
                 config.codex.transport.as_str()
+            );
+        }
+        ConfigCommand::HierarchicalCompaction { value } => {
+            let enabled = match value.trim().to_ascii_lowercase().as_str() {
+                "on" | "true" | "enabled" => true,
+                "off" | "false" | "disabled" => false,
+                _ => anyhow::bail!("invalid value {value:?}; expected on or off"),
+            };
+            let mut config = config::AppConfig::load()?;
+            config.compaction.hierarchical = enabled;
+            config.save()?;
+            println!(
+                "Hierarchical compaction {}. Start a new Clodex session to apply it.",
+                if enabled { "enabled" } else { "disabled" }
             );
         }
         ConfigCommand::AllowTool { tool } => {
