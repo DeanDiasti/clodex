@@ -39,6 +39,7 @@ fn nested_command_help_documents_the_public_configuration_contract() {
         "compact-at",
         "transport",
         "hierarchical-compaction",
+        "report-limits",
         "allow-tool",
         "forget-tool",
         "path",
