@@ -30,6 +30,11 @@ const COUNT_CONCURRENCY: usize = 8;
 /// How often to ping while a round is in flight. A round can run for minutes,
 /// and Claude Code drops a stream that goes idle.
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+/// Extra attempts for an upstream request that failed before any of its
+/// response reached Claude Code.
+const UPSTREAM_RETRIES: u32 = 2;
+/// Base backoff between those attempts, scaled by attempt number.
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConversationKey {
@@ -598,17 +603,33 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         .path_and_query()
         .map_or("/", axum::http::uri::PathAndQuery::as_str);
     let url = format!("http://127.0.0.1:{}{query}", state.upstream_port);
-    let mut upstream = state.client.request(parts.method, url);
-    for (name, value) in &parts.headers {
-        if should_forward_request_header(name) {
-            upstream = upstream.header(name, value);
+
+    // Codex intermittently drops a pooled connection, which surfaces as a 502
+    // that fails in tens of milliseconds -- before the request was ever sent.
+    // Nothing has reached Claude Code at this point, so replaying is safe, and
+    // without it these surface to the user as hard API errors.
+    let mut attempt = 0;
+    let upstream = loop {
+        let mut request = state.client.request(parts.method.clone(), &url);
+        for (name, value) in &parts.headers {
+            if should_forward_request_header(name) {
+                request = request.header(name, value);
+            }
         }
-    }
-    let upstream = upstream
-        .body(bytes)
-        .send()
-        .await
-        .context("could not reach claude-code-proxy")?;
+        let sent = request.body(bytes.clone()).send().await;
+
+        let retryable =
+            attempt < UPSTREAM_RETRIES && is_replayable(&parts.method, parts.uri.path());
+        match sent {
+            Ok(response) if response.status() == StatusCode::BAD_GATEWAY && retryable => {}
+            Ok(response) => break response,
+            Err(_) if retryable => {}
+            Err(error) => return Err(error).context("could not reach claude-code-proxy"),
+        }
+
+        attempt += 1;
+        tokio::time::sleep(RETRY_BACKOFF * attempt).await;
+    };
 
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
@@ -621,6 +642,16 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         }
     }
     Ok(response)
+}
+
+/// Whether a failed attempt can be sent again.
+///
+/// Only the message endpoints, and only before any response has been
+/// forwarded: replaying once Claude Code has seen part of a stream would
+/// duplicate content it has already rendered.
+fn is_replayable(method: &axum::http::Method, path: &str) -> bool {
+    method == axum::http::Method::POST
+        && (path == "/v1/messages" || path == "/v1/messages/count_tokens")
 }
 
 fn should_forward_request_header(name: &HeaderName) -> bool {
@@ -1030,6 +1061,120 @@ mod tests {
             custom_headers("gpt-5.6-terra"),
             "X-Clodex-Fast-Bridge: 1\nX-Clodex-Initial-Model: gpt-5.6-terra"
         );
+    }
+
+    const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Reads a whole request before responding. Answering early closes the
+    /// socket while the client is still writing, which surfaces as a client
+    /// write error rather than the status under test.
+    fn drain_request(stream: &mut std::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let count = stream.read(&mut chunk).unwrap();
+            assert!(count > 0, "upstream connection closed mid-request");
+            request.extend_from_slice(&chunk[..count]);
+            let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| position + 4)
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_lowercase();
+            let length: usize = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            if request.len() >= header_end + length {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn a_transient_upstream_502_is_retried_before_the_client_sees_it() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+        let (attempts_tx, attempts_rx) = mpsc::channel();
+
+        // Fails the first attempt the way a dropped pooled connection does,
+        // then succeeds -- exactly the pattern seen against Codex.
+        let upstream = thread::spawn(move || {
+            for attempt in 0..2 {
+                let mut stream = listener.accept().unwrap().0;
+                drain_request(&mut stream);
+                let response: &[u8] = if attempt == 0 {
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}"
+                };
+                stream.write_all(response).unwrap();
+                attempts_tx.send(attempt).unwrap();
+            }
+        });
+
+        let bridge = FastBridge::start(upstream_port, false, 0).unwrap();
+        let response = reqwest::blocking::Client::new()
+            .post(format!("http://127.0.0.1:{}/v1/messages", bridge.port()))
+            .header(SESSION_HEADER, "retry-session")
+            .json(&serde_json::json!({"model": "gpt-5.6-sol", "messages": []}))
+            .send()
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            200,
+            "the transient 502 reached the client instead of being retried"
+        );
+        assert_eq!(attempts_rx.recv_timeout(TEST_TIMEOUT).unwrap(), 0);
+        assert_eq!(
+            attempts_rx.recv_timeout(TEST_TIMEOUT).unwrap(),
+            1,
+            "the request was not replayed"
+        );
+
+        drop(bridge);
+        upstream.join().unwrap();
+    }
+
+    #[test]
+    fn a_persistent_upstream_502_is_surfaced_rather_than_retried_forever() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+        let (attempts_tx, attempts_rx) = mpsc::channel();
+
+        let upstream = thread::spawn(move || {
+            for _ in 0..(UPSTREAM_RETRIES + 1) {
+                let mut stream = listener.accept().unwrap().0;
+                drain_request(&mut stream);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .unwrap();
+                attempts_tx.send(()).unwrap();
+            }
+        });
+
+        let bridge = FastBridge::start(upstream_port, false, 0).unwrap();
+        let response = reqwest::blocking::Client::new()
+            .post(format!("http://127.0.0.1:{}/v1/messages", bridge.port()))
+            .header(SESSION_HEADER, "persistent-session")
+            .json(&serde_json::json!({"model": "gpt-5.6-sol", "messages": []}))
+            .send()
+            .unwrap();
+
+        assert_eq!(response.status(), 502);
+        for _ in 0..(UPSTREAM_RETRIES + 1) {
+            attempts_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+        }
+        assert!(attempts_rx.recv_timeout(TEST_TIMEOUT).is_err());
+
+        drop(bridge);
+        upstream.join().unwrap();
     }
 
     #[test]
