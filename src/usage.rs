@@ -150,6 +150,52 @@ pub fn parse(body: &str) -> Option<RateLimits> {
     }
 }
 
+/// Writes the latest reading where a status line can read it.
+///
+/// Claude Code only populates its own rate-limit state for a Claude
+/// subscription login; behind `ANTHROPIC_AUTH_TOKEN` it ignores the headers
+/// entirely. A snapshot on disk gives a status line a source that does not
+/// depend on how Claude Code authenticates.
+pub fn write_snapshot(limits: &RateLimits) {
+    let Ok(home) = crate::config::clodex_home() else {
+        return;
+    };
+    let path = home.join("run").join("usage.json");
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    let window = |window: Option<Window>| {
+        window.map(|window| {
+            serde_json::json!({
+                "used_percent": (window.utilization * 100.0).round(),
+                "resets_at": window.resets_at,
+            })
+        })
+    };
+    let snapshot = serde_json::json!({
+        "five_hour": window(limits.five_hour),
+        "seven_day": window(limits.seven_day),
+        "updated_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or_default(),
+    });
+
+    // Written via a temporary file so a status line never reads a partial
+    // snapshot mid-write.
+    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if serde_json::to_vec(&snapshot)
+        .map(|bytes| std::fs::write(&temporary, bytes))
+        .is_ok()
+    {
+        let _ = std::fs::rename(&temporary, &path);
+    }
+}
+
 /// Fetches current usage using the Codex login clodex already reuses.
 pub async fn fetch(client: &reqwest::Client) -> Option<RateLimits> {
     let credentials = crate::auth::load_codex_credentials(false).ok()?;
@@ -172,7 +218,9 @@ pub async fn fetch(client: &reqwest::Client) -> Option<RateLimits> {
         eprintln!("clodex usage endpoint returned {}", response.status());
         return None;
     }
-    parse(&response.text().await.ok()?)
+    let limits = parse(&response.text().await.ok()?)?;
+    write_snapshot(&limits);
+    Some(limits)
 }
 
 #[cfg(test)]
@@ -278,6 +326,23 @@ mod tests {
             value("anthropic-ratelimit-unified-status"),
             Some("allowed".to_string())
         );
+    }
+
+    #[test]
+    fn a_snapshot_is_written_as_whole_percentages() {
+        let home = std::env::temp_dir().join(format!("clodex-usage-{}", std::process::id()));
+        // SAFETY: single-threaded test setup for a process-local override.
+        unsafe { std::env::set_var("CLODEX_HOME", &home) };
+
+        write_snapshot(&parse(PRO_PLAN).unwrap());
+
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.join("run").join("usage.json")).unwrap())
+                .unwrap();
+        assert_eq!(written["seven_day"]["used_percent"], 77.0);
+        assert_eq!(written["seven_day"]["resets_at"], 1_788_276_117u64);
+        assert_eq!(written["five_hour"]["used_percent"], 0.0);
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
