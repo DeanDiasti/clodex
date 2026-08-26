@@ -25,6 +25,11 @@ const MAX_TRACKED_ROUTES: usize = 16_384;
 /// Code to assemble and send the compaction it just announced, short enough
 /// that a cancelled compaction does not leave a session armed indefinitely.
 const ARM_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+/// Concurrent token-count requests while planning a fold.
+const COUNT_CONCURRENCY: usize = 8;
+/// How often to ping while a round is in flight. A round can run for minutes,
+/// and Claude Code drops a stream that goes idle.
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConversationKey {
@@ -161,6 +166,14 @@ fn armed_sessions() -> &'static Mutex<HashMap<String, std::time::Instant>> {
     ARMED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Whether this session has a live arming, without consuming it.
+fn is_armed(session: &str) -> bool {
+    let armed = armed_sessions().lock().expect("Clodex arm lock");
+    armed
+        .get(session)
+        .is_some_and(|at| std::time::Instant::now().duration_since(*at) < ARM_TTL)
+}
+
 /// Consumes the arming record, so one `PreCompact` arms exactly one fold.
 fn take_armed(session: &str) -> bool {
     let mut armed = armed_sessions().lock().expect("Clodex arm lock");
@@ -193,14 +206,19 @@ async fn hierarchical_compaction(
     if !crate::compaction::carries_summary_prompt(messages) {
         return None;
     }
-    // The hook armed this session, and the request carries the summary prompt.
-    if !take_armed(&session) {
+    // Only peek here. Consuming the arming before the plan is known would
+    // spend it on an attempt that may forward the request untouched, leaving a
+    // genuine compaction unarmed.
+    if !is_armed(&session) {
         return None;
     }
 
     // Everything before the summary prompt is conversation; the prompt and
     // anything after it is the instruction tail every round repeats.
-    let marker_at = messages.iter().position(|message| {
+    // The last marker, not the first: an earlier compaction summary quoted in
+    // history also contains it, and cutting there would treat live
+    // conversation as instruction tail.
+    let marker_at = messages.iter().rposition(|message| {
         crate::compaction::message_text(message)
             .is_some_and(|text| text.contains(crate::compaction::COMPACTION_MARKER))
     })?;
@@ -220,9 +238,21 @@ async fn hierarchical_compaction(
     // Fixed overhead is the system prompt and the instruction tail, which
     // every round repeats.
     let fixed_overhead = count_tokens(state, &model, system.as_ref(), &tail).await?;
-    let mut counts = Vec::with_capacity(conversation.len());
-    for message in conversation {
-        counts.push(count_tokens(state, &model, None, std::slice::from_ref(message)).await?);
+    // Counted concurrently: the client is still waiting on response headers at
+    // this point, so a long conversation counted one request at a time delays
+    // the stream that keeps Claude Code from timing out.
+    let owned: Vec<Value> = conversation.to_vec();
+    let mut counts: Vec<u64> = Vec::with_capacity(owned.len());
+    for group in owned.chunks(COUNT_CONCURRENCY) {
+        let counted = futures_util::future::join_all(
+            group
+                .iter()
+                .map(|message| count_tokens(state, &model, None, std::slice::from_ref(message))),
+        )
+        .await;
+        for count in counted {
+            counts.push(count?);
+        }
     }
 
     let total: u64 = counts.iter().sum::<u64>() + fixed_overhead;
@@ -258,6 +288,8 @@ async fn hierarchical_compaction(
         })
         .collect();
 
+    // Committed: from here the fold owns the response, so the arming is spent.
+    take_armed(&session);
     Some(fold_response(
         state.clone(),
         model,
@@ -365,7 +397,27 @@ fn fold_response(
             messages.extend(round.iter().cloned());
             messages.extend(tail.iter().cloned());
 
-            match round_summary(&state, &model, system.as_ref(), &messages, max_output).await {
+            // Ping while the round is in flight, not merely before it. A round
+            // can run for minutes, and a stream that goes quiet that long is
+            // dropped by the client as idle.
+            let round = round_summary(&state, &model, system.as_ref(), &messages, max_output);
+            tokio::pin!(round);
+            let mut ping = tokio::time::interval(PING_INTERVAL);
+            // The first tick resolves immediately; the round has only just
+            // started, so spend it rather than emitting a redundant ping.
+            ping.tick().await;
+            let outcome = loop {
+                tokio::select! {
+                    outcome = &mut round => break outcome,
+                    _ = ping.tick() => {
+                        let _ = sender
+                            .send(Ok(sse("ping", &serde_json::json!({"type": "ping"}))))
+                            .await;
+                    }
+                }
+            };
+
+            match outcome {
                 Some(summary) => carry = Some(summary),
                 None => {
                     let _ = sender
@@ -747,6 +799,59 @@ mod tests {
     #[test]
     fn an_unarmed_session_is_never_folded() {
         assert!(!take_armed("never-armed-session"));
+    }
+
+    #[test]
+    fn peeking_at_an_arming_does_not_consume_it() {
+        let session = "peek-session";
+        {
+            let mut armed = armed_sessions().lock().unwrap();
+            armed.insert(session.to_string(), std::time::Instant::now());
+        }
+
+        // Planning can bail after this point, and a genuine compaction must
+        // still be foldable on the next attempt.
+        assert!(is_armed(session));
+        assert!(is_armed(session));
+        assert!(take_armed(session));
+        assert!(!is_armed(session));
+    }
+
+    #[tokio::test]
+    async fn a_request_that_cannot_be_planned_keeps_its_arming() {
+        let session = "unplannable-session";
+        {
+            let mut armed = armed_sessions().lock().unwrap();
+            armed.insert(session.to_string(), std::time::Instant::now());
+        }
+        let state = BridgeState {
+            upstream_port: 1,
+            client: reqwest::Client::new(),
+            hierarchical: true,
+            ceiling: 828_400,
+        };
+        // Carries the marker but has no conversation before it, so planning
+        // bails before any fold is committed.
+        let body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{
+                "role": "user",
+                "content": crate::compaction::COMPACTION_MARKER
+            }]
+        });
+
+        let response = hierarchical_compaction(
+            &state,
+            &headers(session, None),
+            &serde_json::to_vec(&body).unwrap(),
+        )
+        .await;
+
+        assert!(response.is_none());
+        assert!(
+            take_armed(session),
+            "a failed plan must not spend the arming"
+        );
     }
 
     #[tokio::test]

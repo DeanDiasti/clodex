@@ -207,8 +207,10 @@ fn precompact_hook(config: &AppConfig, bridge_port: Option<u16>) -> Option<serde
     let port = bridge_port?;
     // The hook payload arrives on stdin; forwarding it verbatim gives the
     // bridge the session id and the manual/auto trigger.
+    // No `exec`: it would replace the shell, leaving `|| true` unreachable and
+    // surfacing a failed arm as a failed hook.
     let command = format!(
-        "exec curl --silent --show-error --max-time 5          --header 'content-type: application/json'          --data @- http://127.0.0.1:{port}/__clodex/compaction/arm >/dev/null 2>&1 || true"
+        "curl --silent --show-error --max-time 5          --header 'content-type: application/json'          --data @- http://127.0.0.1:{port}/__clodex/compaction/arm >/dev/null 2>&1 || true"
     );
     Some(serde_json::json!({
         "PreCompact": [{

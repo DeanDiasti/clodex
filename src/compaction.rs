@@ -58,8 +58,12 @@ pub struct Budget {
 }
 
 impl Budget {
-    /// Tokens available for conversation content in a single round, after the
-    /// fixed overhead, the carried summary, and framing are accounted for.
+    /// Tokens available for prompt content in a single round, after the fixed
+    /// overhead, the round's own output allowance, and framing.
+    ///
+    /// `max_output` is subtracted here to leave the model room to generate;
+    /// a later round subtracts it a second time, separately, for the summary
+    /// it carries in as input. The two reservations are not the same tokens.
     pub fn per_round(&self) -> Option<u64> {
         self.ceiling
             .checked_sub(self.fixed_overhead)?
@@ -337,6 +341,34 @@ mod tests {
         assert!(plan.round_count() >= 16, "{}", plan.round_count());
         let flattened: usize = plan.rounds.iter().map(|r| r.messages.len()).sum();
         assert_eq!(flattened, 400);
+    }
+
+    #[test]
+    fn the_last_marker_is_the_split_point_not_the_first() {
+        // A prior compaction summary carried in history also contains the
+        // marker. Splitting on the first one would treat live conversation as
+        // instruction tail and drop it from the fold.
+        let quoted = serde_json::json!({
+            "role": "user",
+            "content": format!("Earlier summary: {COMPACTION_MARKER} ...")
+        });
+        let work = serde_json::json!({"role": "user", "content": "then we did more"});
+        let request = serde_json::json!({
+            "role": "user",
+            "content": format!("{COMPACTION_MARKER}, paying close attention.")
+        });
+        let messages = vec![quoted, work, request];
+
+        let first = messages
+            .iter()
+            .position(|m| message_text(m).is_some_and(|t| t.contains(COMPACTION_MARKER)));
+        let last = messages
+            .iter()
+            .rposition(|m| message_text(m).is_some_and(|t| t.contains(COMPACTION_MARKER)));
+
+        assert_eq!(first, Some(0));
+        assert_eq!(last, Some(2));
+        assert!(carries_summary_prompt(&messages));
     }
 
     #[test]
