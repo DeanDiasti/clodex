@@ -38,6 +38,7 @@ fn nested_command_help_documents_the_public_configuration_contract() {
         "context",
         "compact-at",
         "transport",
+        "hierarchical-compaction",
         "allow-tool",
         "forget-tool",
         "path",

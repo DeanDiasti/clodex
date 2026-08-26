@@ -9,7 +9,7 @@ use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use futures_util::TryStreamExt;
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -21,6 +21,15 @@ const SESSION_HEADER: &str = "x-claude-code-session-id";
 const AGENT_HEADER: &str = "x-claude-code-agent-id";
 const MAX_REQUEST_BYTES: usize = 128 * 1024 * 1024;
 const MAX_TRACKED_ROUTES: usize = 16_384;
+/// How long a `PreCompact` hook keeps a session armed. Long enough for Claude
+/// Code to assemble and send the compaction it just announced, short enough
+/// that a cancelled compaction does not leave a session armed indefinitely.
+const ARM_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+/// Concurrent token-count requests while planning a fold.
+const COUNT_CONCURRENCY: usize = 8;
+/// How often to ping while a round is in flight. A round can run for minutes,
+/// and Claude Code drops a stream that goes idle.
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConversationKey {
@@ -39,6 +48,8 @@ struct RouteState {
 struct BridgeState {
     upstream_port: u16,
     client: reqwest::Client,
+    hierarchical: bool,
+    ceiling: u64,
 }
 
 pub struct FastBridge {
@@ -48,7 +59,9 @@ pub struct FastBridge {
 }
 
 impl FastBridge {
-    pub fn start(upstream_port: u16) -> Result<Self> {
+    /// `ceiling` is the capacity a fold round must fit inside; zero, or
+    /// `hierarchical` unset, leaves every request forwarded untouched.
+    pub fn start(upstream_port: u16, hierarchical: bool, ceiling: u64) -> Result<Self> {
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).context("could not bind the Clodex fast bridge")?;
         listener.set_nonblocking(true)?;
@@ -69,9 +82,12 @@ impl FastBridge {
                     client: reqwest::Client::builder()
                         .build()
                         .context("could not create the Clodex fast bridge client")?,
+                    hierarchical,
+                    ceiling,
                 });
                 let app = Router::new()
                     .route("/__clodex/health", get(health))
+                    .route("/__clodex/compaction/arm", post(arm_compaction))
                     .fallback(proxy)
                     .with_state(state);
                 let _ = ready_tx.send(Ok::<(), String>(()));
@@ -119,6 +135,424 @@ async fn health() -> impl IntoResponse {
     }))
 }
 
+/// Records that Claude Code is about to compact this session.
+///
+/// Claude Code's `PreCompact` hook posts its payload here before it builds the
+/// compaction request, which is what lets the bridge recognise that request
+/// without inferring it from the prompt body.
+async fn arm_compaction(body: axum::body::Bytes) -> impl IntoResponse {
+    let session = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let Some(session) = session else {
+        return (StatusCode::BAD_REQUEST, "missing session_id");
+    };
+
+    let mut armed = armed_sessions().lock().expect("Clodex arm lock");
+    let now = std::time::Instant::now();
+    armed.retain(|_, at| now.duration_since(*at) < ARM_TTL);
+    armed.insert(session, now);
+    (StatusCode::OK, "armed")
+}
+
+fn armed_sessions() -> &'static Mutex<HashMap<String, std::time::Instant>> {
+    static ARMED: std::sync::OnceLock<Mutex<HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    ARMED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether this session has a live arming, without consuming it.
+fn is_armed(session: &str) -> bool {
+    let armed = armed_sessions().lock().expect("Clodex arm lock");
+    armed
+        .get(session)
+        .is_some_and(|at| std::time::Instant::now().duration_since(*at) < ARM_TTL)
+}
+
+/// Consumes the arming record, so one `PreCompact` arms exactly one fold.
+fn take_armed(session: &str) -> bool {
+    let mut armed = armed_sessions().lock().expect("Clodex arm lock");
+    match armed.remove(session) {
+        Some(at) => std::time::Instant::now().duration_since(at) < ARM_TTL,
+        None => false,
+    }
+}
+
+/// Default output bound for a fold round when the request does not set one.
+const DEFAULT_MAX_OUTPUT: u64 = 16_000;
+
+/// Runs the hierarchical fold, or returns `None` to leave the request alone.
+///
+/// Every uncertain path returns `None`. Folding a conversation that would have
+/// compacted normally is a regression, so this engages only once the request
+/// genuinely exceeds what the routed model accepts.
+async fn hierarchical_compaction(
+    state: &BridgeState,
+    headers: &HeaderMap,
+    bytes: &[u8],
+) -> Option<Response> {
+    if !state.hierarchical || state.ceiling == 0 {
+        return None;
+    }
+    let session = read_header(headers, SESSION_HEADER)?;
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let object = value.as_object()?;
+    let messages = object.get("messages")?.as_array()?;
+    if !crate::compaction::carries_summary_prompt(messages) {
+        return None;
+    }
+    // Only peek here. Consuming the arming before the plan is known would
+    // spend it on an attempt that may forward the request untouched, leaving a
+    // genuine compaction unarmed.
+    if !is_armed(&session) {
+        return None;
+    }
+
+    // Everything before the summary prompt is conversation; the prompt and
+    // anything after it is the instruction tail every round repeats.
+    // The last marker, not the first: an earlier compaction summary quoted in
+    // history also contains it, and cutting there would treat live
+    // conversation as instruction tail.
+    let marker_at = messages.iter().rposition(|message| {
+        crate::compaction::message_text(message)
+            .is_some_and(|text| text.contains(crate::compaction::COMPACTION_MARKER))
+    })?;
+    let conversation = &messages[..marker_at];
+    let tail: Vec<Value> = messages[marker_at..].to_vec();
+    if conversation.is_empty() {
+        return None;
+    }
+
+    let model = object.get("model").and_then(Value::as_str)?.to_string();
+    let system = object.get("system").cloned();
+    let max_output = object
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_MAX_OUTPUT);
+
+    // Fixed overhead is the system prompt and the instruction tail, which
+    // every round repeats.
+    let fixed_overhead = count_tokens(state, &model, system.as_ref(), &tail).await?;
+    // Counted concurrently: the client is still waiting on response headers at
+    // this point, so a long conversation counted one request at a time delays
+    // the stream that keeps Claude Code from timing out.
+    let owned: Vec<Value> = conversation.to_vec();
+    let mut counts: Vec<u64> = Vec::with_capacity(owned.len());
+    for group in owned.chunks(COUNT_CONCURRENCY) {
+        let counted = futures_util::future::join_all(
+            group
+                .iter()
+                .map(|message| count_tokens(state, &model, None, std::slice::from_ref(message))),
+        )
+        .await;
+        for count in counted {
+            counts.push(count?);
+        }
+    }
+
+    let total: u64 = counts.iter().sum::<u64>() + fixed_overhead;
+    if total <= state.ceiling {
+        // It fits. Claude Code's own compaction will succeed, so stay out of
+        // the way rather than spending extra rounds.
+        return None;
+    }
+
+    let can_open: Vec<bool> = conversation
+        .iter()
+        .map(crate::compaction::is_safe_boundary)
+        .collect();
+    let budget = crate::compaction::Budget {
+        ceiling: state.ceiling,
+        fixed_overhead,
+        max_output,
+    };
+    let plan = crate::compaction::plan(&counts, &can_open, budget)?;
+    if plan.round_count() < 2 {
+        return None;
+    }
+
+    let rounds: Vec<Vec<Value>> = plan
+        .rounds
+        .iter()
+        .map(|round| {
+            round
+                .messages
+                .iter()
+                .map(|index| conversation[*index].clone())
+                .collect()
+        })
+        .collect();
+
+    // Committed: from here the fold owns the response, so the arming is spent.
+    take_armed(&session);
+    Some(fold_response(
+        state.clone(),
+        model,
+        system,
+        tail,
+        rounds,
+        max_output,
+    ))
+}
+
+/// Asks the upstream what a set of messages costs. Local and fast, so the fold
+/// is sized against real counts rather than a character heuristic.
+async fn count_tokens(
+    state: &BridgeState,
+    model: &str,
+    system: Option<&Value>,
+    messages: &[Value],
+) -> Option<u64> {
+    let mut body = serde_json::json!({ "model": model, "messages": messages });
+    if let Some(system) = system {
+        body["system"] = system.clone();
+    }
+    let response = state
+        .client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/messages/count_tokens",
+            state.upstream_port
+        ))
+        .header(header::CONTENT_TYPE, "application/json")
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response
+        .json::<Value>()
+        .await
+        .ok()?
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+}
+
+/// Streams the fold back as one ordinary compaction response.
+///
+/// Claude Code enforces a stream idle timeout, and a deep fold runs for
+/// minutes, so the stream opens immediately and pings between rounds.
+fn fold_response(
+    state: BridgeState,
+    model: String,
+    system: Option<Value>,
+    tail: Vec<Value>,
+    rounds: Vec<Vec<Value>>,
+    max_output: u64,
+) -> Response {
+    let (sender, receiver) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(8);
+
+    tokio::spawn(async move {
+        let _ = sender
+            .send(Ok(sse(
+                "message_start",
+                &serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_clodex_fold",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model,
+                        "content": [],
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 0, "output_tokens": 0}
+                    }
+                }),
+            )))
+            .await;
+        let _ = sender
+            .send(Ok(sse(
+                "content_block_start",
+                &serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            )))
+            .await;
+
+        let mut carry: Option<String> = None;
+        for (index, round) in rounds.iter().enumerate() {
+            let _ = sender
+                .send(Ok(sse("ping", &serde_json::json!({"type": "ping"}))))
+                .await;
+
+            let mut messages: Vec<Value> = Vec::new();
+            if let Some(previous) = &carry {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!(
+                        "Summary of the earlier conversation, to be carried forward \
+                         and merged with what follows:\n\n{previous}"
+                    )
+                }));
+            }
+            messages.extend(round.iter().cloned());
+            messages.extend(tail.iter().cloned());
+
+            // Ping while the round is in flight, not merely before it. A round
+            // can run for minutes, and a stream that goes quiet that long is
+            // dropped by the client as idle.
+            let round = round_summary(&state, &model, system.as_ref(), &messages, max_output);
+            tokio::pin!(round);
+            let mut ping = tokio::time::interval(PING_INTERVAL);
+            // The first tick resolves immediately; the round has only just
+            // started, so spend it rather than emitting a redundant ping.
+            ping.tick().await;
+            let outcome = loop {
+                tokio::select! {
+                    outcome = &mut round => break outcome,
+                    _ = ping.tick() => {
+                        let _ = sender
+                            .send(Ok(sse("ping", &serde_json::json!({"type": "ping"}))))
+                            .await;
+                    }
+                }
+            };
+
+            match outcome {
+                Some(summary) => carry = Some(summary),
+                None => {
+                    let _ = sender
+                        .send(Ok(sse(
+                            "error",
+                            &serde_json::json!({
+                                "type": "error",
+                                "error": {
+                                    "type": "api_error",
+                                    "message": format!(
+                                        "Clodex hierarchical compaction failed on round {} of {}",
+                                        index + 1,
+                                        rounds.len()
+                                    )
+                                }
+                            }),
+                        )))
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        let summary = carry.unwrap_or_default();
+        let _ = sender
+            .send(Ok(sse(
+                "content_block_delta",
+                &serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": summary}
+                }),
+            )))
+            .await;
+        let _ = sender
+            .send(Ok(sse(
+                "content_block_stop",
+                &serde_json::json!({"type": "content_block_stop", "index": 0}),
+            )))
+            .await;
+        let _ = sender
+            .send(Ok(sse(
+                "message_delta",
+                &serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                    "usage": {"output_tokens": 0}
+                }),
+            )))
+            .await;
+        let _ = sender
+            .send(Ok(sse(
+                "message_stop",
+                &serde_json::json!({"type": "message_stop"}),
+            )))
+            .await;
+    });
+
+    let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    });
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/event-stream"),
+    );
+    response
+}
+
+/// Issues one fold round and returns its summary text.
+async fn round_summary(
+    state: &BridgeState,
+    model: &str,
+    system: Option<&Value>,
+    messages: &[Value],
+    max_output: u64,
+) -> Option<String> {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_output,
+        "stream": false,
+    });
+    if let Some(system) = system {
+        body["system"] = system.clone();
+    }
+
+    // Interrupted upstream responses are common on this path, and a failed
+    // round would sink the whole fold, so each round gets a bounded retry.
+    for attempt in 0..3 {
+        let response = state
+            .client
+            .post(format!(
+                "http://127.0.0.1:{}/v1/messages",
+                state.upstream_port
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await;
+        if let Ok(response) = response
+            && response.status().is_success()
+            && let Ok(parsed) = response.json::<Value>().await
+            && let Some(text) = assistant_text(&parsed)
+        {
+            return Some(text);
+        }
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_secs(2 << attempt)).await;
+        }
+    }
+    None
+}
+
+fn assistant_text(response: &Value) -> Option<String> {
+    let blocks = response.get("content")?.as_array()?;
+    let mut text = String::new();
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(part) = block.get("text").and_then(Value::as_str)
+        {
+            text.push_str(part);
+        }
+    }
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn sse(event: &str, data: &Value) -> Vec<u8> {
+    format!("event: {event}\ndata: {data}\n\n").into_bytes()
+}
+
 async fn proxy(State(state): State<std::sync::Arc<BridgeState>>, request: Request) -> Response {
     match proxy_inner(&state, request).await {
         Ok(response) => response,
@@ -148,7 +582,14 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         .get(BRIDGE_HEADER)
         .and_then(|value| value.to_str().ok())
         == Some(BRIDGE_HEADER_VALUE);
-    if marked && parts.method == axum::http::Method::POST && parts.uri.path() == "/v1/messages" {
+    let is_messages =
+        parts.method == axum::http::Method::POST && parts.uri.path() == "/v1/messages";
+    if is_messages
+        && let Some(response) = hierarchical_compaction(state, &parts.headers, &bytes).await
+    {
+        return Ok(response);
+    }
+    if marked && is_messages {
         bytes = rewrite_request(&parts.headers, &bytes)?;
     }
 
@@ -326,6 +767,152 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn arming_is_consumed_once_and_expires() {
+        let session = "arm-once-session";
+        {
+            let mut armed = armed_sessions().lock().unwrap();
+            armed.insert(session.to_string(), std::time::Instant::now());
+        }
+
+        assert!(take_armed(session), "the armed session was not recognized");
+        assert!(
+            !take_armed(session),
+            "one PreCompact must arm exactly one fold"
+        );
+    }
+
+    #[test]
+    fn a_stale_arming_does_not_trigger_a_fold() {
+        let session = "stale-arm-session";
+        {
+            let mut armed = armed_sessions().lock().unwrap();
+            armed.insert(
+                session.to_string(),
+                std::time::Instant::now() - (ARM_TTL + std::time::Duration::from_secs(1)),
+            );
+        }
+
+        assert!(!take_armed(session));
+    }
+
+    #[test]
+    fn an_unarmed_session_is_never_folded() {
+        assert!(!take_armed("never-armed-session"));
+    }
+
+    #[test]
+    fn peeking_at_an_arming_does_not_consume_it() {
+        let session = "peek-session";
+        {
+            let mut armed = armed_sessions().lock().unwrap();
+            armed.insert(session.to_string(), std::time::Instant::now());
+        }
+
+        // Planning can bail after this point, and a genuine compaction must
+        // still be foldable on the next attempt.
+        assert!(is_armed(session));
+        assert!(is_armed(session));
+        assert!(take_armed(session));
+        assert!(!is_armed(session));
+    }
+
+    #[tokio::test]
+    async fn a_request_that_cannot_be_planned_keeps_its_arming() {
+        let session = "unplannable-session";
+        {
+            let mut armed = armed_sessions().lock().unwrap();
+            armed.insert(session.to_string(), std::time::Instant::now());
+        }
+        let state = BridgeState {
+            upstream_port: 1,
+            client: reqwest::Client::new(),
+            hierarchical: true,
+            ceiling: 828_400,
+        };
+        // Carries the marker but has no conversation before it, so planning
+        // bails before any fold is committed.
+        let body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{
+                "role": "user",
+                "content": crate::compaction::COMPACTION_MARKER
+            }]
+        });
+
+        let response = hierarchical_compaction(
+            &state,
+            &headers(session, None),
+            &serde_json::to_vec(&body).unwrap(),
+        )
+        .await;
+
+        assert!(response.is_none());
+        assert!(
+            take_armed(session),
+            "a failed plan must not spend the arming"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_bridge_leaves_every_request_alone() {
+        let state = BridgeState {
+            upstream_port: 1,
+            client: reqwest::Client::new(),
+            hierarchical: false,
+            ceiling: 828_400,
+        };
+        let body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{
+                "role": "user",
+                "content": crate::compaction::COMPACTION_MARKER
+            }]
+        });
+
+        let response = hierarchical_compaction(
+            &state,
+            &headers("session", None),
+            &serde_json::to_vec(&body).unwrap(),
+        )
+        .await;
+
+        assert!(response.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_request_is_never_folded_even_when_armed() {
+        let session = "ordinary-request-session";
+        {
+            let mut armed = armed_sessions().lock().unwrap();
+            armed.insert(session.to_string(), std::time::Instant::now());
+        }
+        let state = BridgeState {
+            upstream_port: 1,
+            client: reqwest::Client::new(),
+            hierarchical: true,
+            ceiling: 828_400,
+        };
+        let body = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "what does this function do?"}]
+        });
+
+        let response = hierarchical_compaction(
+            &state,
+            &headers(session, None),
+            &serde_json::to_vec(&body).unwrap(),
+        )
+        .await;
+
+        assert!(response.is_none(), "an ordinary request was folded");
+        // The arming must survive, so the real compaction still folds.
+        assert!(
+            take_armed(session),
+            "arming was consumed by the wrong request"
+        );
+    }
+
     fn headers(session: &str, agent: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(SESSION_HEADER, HeaderValue::from_str(session).unwrap());
@@ -494,7 +1081,7 @@ mod tests {
             }
         });
 
-        let bridge = FastBridge::start(upstream_port).unwrap();
+        let bridge = FastBridge::start(upstream_port, false, 0).unwrap();
         let url = format!("http://127.0.0.1:{}/v1/messages", bridge.port());
         let client = reqwest::blocking::Client::new();
         let send = |marked: bool, model: &str, fast: bool| {

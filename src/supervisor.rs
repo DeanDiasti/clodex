@@ -172,7 +172,12 @@ pub fn run() -> Result<()> {
         upstream_port,
         &shutdown_requested,
     )?;
-    cleanup.bridge = Some(FastBridge::start(upstream_port)?);
+    let ceiling = hierarchical_ceiling(&app_config);
+    cleanup.bridge = Some(FastBridge::start(
+        upstream_port,
+        app_config.compaction.hierarchical,
+        ceiling,
+    )?);
     let proxy_port = cleanup
         .bridge
         .as_ref()
@@ -382,6 +387,21 @@ fn spawn_supervisor() -> Result<()> {
         .spawn()
         .context("could not start the clodex supervisor")?;
     Ok(())
+}
+
+/// The ceiling a fold round must fit inside. Resolved from the live catalog so
+/// the fold tracks the routed models rather than a fixed number; a catalog
+/// that cannot be read leaves the fold disabled rather than guessing.
+fn hierarchical_ceiling(app_config: &config::AppConfig) -> u64 {
+    if !app_config.compaction.hierarchical {
+        return 0;
+    }
+    crate::catalog::Catalog::load_from_codex()
+        .and_then(|catalog| {
+            let mapping = crate::mapping::ModelMapping::from_catalog(&catalog)?;
+            app_config.effective_context_capacity(&catalog, &mapping)
+        })
+        .unwrap_or(0)
 }
 
 fn spawn_proxy(

@@ -83,7 +83,7 @@ fn build_claude_command(
 ) -> Result<Command> {
     let mut command = Command::new("claude");
     command
-        .args(["--settings", &launch_settings(config)?])
+        .args(["--settings", &launch_settings(config, Some(proxy_port))?])
         .args(claude_args)
         .env(
             "ANTHROPIC_BASE_URL",
@@ -182,7 +182,7 @@ fn configure_model_context(
         );
 }
 
-fn launch_settings(config: &AppConfig) -> Result<String> {
+fn launch_settings(config: &AppConfig, bridge_port: Option<u16>) -> Result<String> {
     let mut settings = serde_json::json!({
         "theme": "custom:clodex",
     });
@@ -191,7 +191,32 @@ fn launch_settings(config: &AppConfig) -> Result<String> {
             "allow": config.permissions.trusted_tools,
         });
     }
+    if let Some(hooks) = precompact_hook(config, bridge_port) {
+        settings["hooks"] = hooks;
+    }
     Ok(serde_json::to_string(&settings)?)
+}
+
+/// Claude Code fires PreCompact before it builds a compaction request. Arming
+/// the bridge from that event is what lets it recognise the request that
+/// follows, rather than inferring it from the prompt body.
+fn precompact_hook(config: &AppConfig, bridge_port: Option<u16>) -> Option<serde_json::Value> {
+    if !config.compaction.hierarchical {
+        return None;
+    }
+    let port = bridge_port?;
+    // The hook payload arrives on stdin; forwarding it verbatim gives the
+    // bridge the session id and the manual/auto trigger.
+    // No `exec`: it would replace the shell, leaving `|| true` unreachable and
+    // surfacing a failed arm as a failed hook.
+    let command = format!(
+        "curl --silent --show-error --max-time 5          --header 'content-type: application/json'          --data @- http://127.0.0.1:{port}/__clodex/compaction/arm >/dev/null 2>&1 || true"
+    );
+    Some(serde_json::json!({
+        "PreCompact": [{
+            "hooks": [{ "type": "command", "command": command }]
+        }]
+    }))
 }
 
 fn ensure_clodex_theme() -> Result<()> {
@@ -305,7 +330,7 @@ mod tests {
             .unwrap();
 
         let settings: serde_json::Value =
-            serde_json::from_str(&launch_settings(&config).unwrap()).unwrap();
+            serde_json::from_str(&launch_settings(&config, None).unwrap()).unwrap();
 
         assert_eq!(settings["theme"], "custom:clodex");
         assert_eq!(
@@ -459,7 +484,7 @@ mod tests {
     #[test]
     fn launch_settings_omit_permissions_when_no_tools_are_trusted() {
         let settings: serde_json::Value =
-            serde_json::from_str(&launch_settings(&AppConfig::default()).unwrap()).unwrap();
+            serde_json::from_str(&launch_settings(&AppConfig::default(), None).unwrap()).unwrap();
         assert_eq!(settings["theme"], "custom:clodex");
         assert!(settings.get("permissions").is_none());
     }

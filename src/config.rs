@@ -18,6 +18,7 @@ pub struct AppConfig {
     pub version: u32,
     pub context: ContextConfig,
     pub codex: CodexConfig,
+    pub compaction: CompactionConfig,
     pub permissions: PermissionsConfig,
 }
 
@@ -33,6 +34,14 @@ pub struct ContextConfig {
 #[serde(default)]
 pub struct CodexConfig {
     pub transport: CodexTransport,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CompactionConfig {
+    /// Folds an oversized compaction request into successive rounds that each
+    /// fit the context window. Opt-in: it spends one model call per round.
+    pub hierarchical: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -57,6 +66,7 @@ impl Default for AppConfig {
             version: CONFIG_VERSION,
             context: ContextConfig::default(),
             codex: CodexConfig::default(),
+            compaction: CompactionConfig::default(),
             permissions: PermissionsConfig::default(),
         }
     }
@@ -145,10 +155,16 @@ impl AppConfig {
              Context ceiling: {}\n\
              Compact at:     {}%\n\
              Codex transport: {}\n\
+             Hierarchical compaction: {}\n\
              Trusted tools:  {}\n",
             self.context.render_limit(),
             self.context.compact_at_percent,
             self.codex.transport.as_str(),
+            if self.compaction.hierarchical {
+                "on"
+            } else {
+                "off"
+            },
             trusted_tools
         )
     }
