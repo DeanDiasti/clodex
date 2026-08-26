@@ -891,6 +891,7 @@ mod tests {
             client: reqwest::Client::new(),
             hierarchical: true,
             ceiling: 828_400,
+            report_usage: false,
         };
         // Carries the marker but has no conversation before it, so planning
         // bails before any fold is committed.
