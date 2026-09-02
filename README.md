@@ -136,6 +136,7 @@ configuration and logs are no longer wanted.
 | `clodex config context <auto\|tokens>` | Set context capacity |
 | `clodex config compact-at <1..95>` | Set the auto-compaction percentage |
 | `clodex config hierarchical-compaction <on\|off>` | Fold an oversized compaction into rounds |
+| `clodex config report-limits <on\|off>` | Report Codex limits to the status line |
 | `clodex config allow-tool <exact-name>` | Trust one tool for sessions and subagents |
 | `clodex config forget-tool <exact-name>` | Remove a trusted tool |
 | `clodex config path` | Print the configuration path |
@@ -238,6 +239,31 @@ Settings apply when a new Clodex process starts. Restart existing sessions
 after changing them. Subagents inherit the launch environment and therefore
 receive the same capacity and percentage, but each agent has its own context
 window.
+
+## Subscription limits in the status line
+
+Claude Code renders its `5h` and `7d` status bars from
+`anthropic-ratelimit-unified-*` response headers. Behind a custom base URL
+those headers never arrive, so the bars disappear even though the session is
+spending a real subscription quota — the Codex one.
+
+Clodex reads Codex usage and supplies those headers itself, so an existing
+status line keeps working with no changes to it:
+
+```sh
+clodex config report-limits on    # on by default
+clodex config report-limits off
+```
+
+Codex reports each limit as a `primary`/`secondary` pair, and which one is the
+weekly window depends on the plan — a Pro account reports weekly as its
+primary and has no secondary at all. Clodex classifies windows by length
+rather than position, and when several limits report the same window it shows
+the fullest, since that is the one that will bind first.
+
+Usage is read at most once a minute and cached, including failures, so a
+slow or unavailable endpoint never delays a request. If it cannot be read, the
+headers are simply omitted and the bars stay hidden.
 
 ## Hierarchical compaction
 

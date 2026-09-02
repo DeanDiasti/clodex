@@ -7,6 +7,7 @@ mod fast_bridge;
 mod launcher;
 mod mapping;
 mod supervisor;
+mod usage;
 
 use std::ffi::OsString;
 
@@ -102,6 +103,11 @@ enum ConfigCommand {
     },
     /// Fold an oversized compaction into rounds that each fit the window.
     HierarchicalCompaction {
+        /// One of: on or off.
+        value: String,
+    },
+    /// Report Codex subscription limits to Claude Code's status line.
+    ReportLimits {
         /// One of: on or off.
         value: String,
     },
@@ -257,6 +263,20 @@ fn run_config(args: ConfigArgs) -> Result<()> {
             config.save()?;
             println!(
                 "Hierarchical compaction {}. Start a new Clodex session to apply it.",
+                if enabled { "enabled" } else { "disabled" }
+            );
+        }
+        ConfigCommand::ReportLimits { value } => {
+            let enabled = match value.trim().to_ascii_lowercase().as_str() {
+                "on" | "true" | "enabled" => true,
+                "off" | "false" | "disabled" => false,
+                _ => anyhow::bail!("invalid value {value:?}; expected on or off"),
+            };
+            let mut config = config::AppConfig::load()?;
+            config.usage.report_limits = enabled;
+            config.save()?;
+            println!(
+                "Codex limit reporting {}. Start a new Clodex session to apply it.",
                 if enabled { "enabled" } else { "disabled" }
             );
         }

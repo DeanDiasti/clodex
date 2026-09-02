@@ -177,6 +177,7 @@ pub fn run() -> Result<()> {
         upstream_port,
         app_config.compaction.hierarchical,
         ceiling,
+        app_config.usage.report_limits,
     )?);
     let proxy_port = cleanup
         .bridge
