@@ -1181,7 +1181,7 @@ mod tests {
             }
         });
 
-        let bridge = FastBridge::start(upstream_port, false, 0).unwrap();
+        let bridge = FastBridge::start(upstream_port, false, 0, false).unwrap();
         let response = reqwest::blocking::Client::new()
             .post(format!("http://127.0.0.1:{}/v1/messages", bridge.port()))
             .header(SESSION_HEADER, "retry-session")
@@ -1224,7 +1224,7 @@ mod tests {
             }
         });
 
-        let bridge = FastBridge::start(upstream_port, false, 0).unwrap();
+        let bridge = FastBridge::start(upstream_port, false, 0, false).unwrap();
         let response = reqwest::blocking::Client::new()
             .post(format!("http://127.0.0.1:{}/v1/messages", bridge.port()))
             .header(SESSION_HEADER, "persistent-session")
