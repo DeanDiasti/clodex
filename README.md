@@ -155,12 +155,13 @@ catalog priority to Claude Code roles:
 | Fable | First |
 | Opus | Second |
 | Sonnet | Third |
-| Haiku compatibility | Same route as Sonnet |
+| Haiku compatibility | Fourth |
 
 The launched session defaults to the Opus route. Fable and Sonnet remain
 available from Claude Code's model picker. Haiku is hidden from the picker but
-Claude Code's background Haiku requests are supported through the Sonnet
-route. If fewer than three models are available, Clodex safely reuses the
+Claude Code's background Haiku requests use the fourth catalog model. With the
+current catalog, this maps Astra to Fable, Sol to Opus, Terra to Sonnet, and
+Luna to Haiku. If fewer than four models are available, Clodex safely reuses the
 closest available route.
 
 No model names are hard-coded. This allows the mapping to follow the live

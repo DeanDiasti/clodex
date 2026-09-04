@@ -395,6 +395,7 @@ fn routed_window(
         mapping.fable.model.as_str(),
         mapping.opus.model.as_str(),
         mapping.sonnet.model.as_str(),
+        mapping.haiku_compatibility.model.as_str(),
     ];
 
     routed
@@ -531,9 +532,10 @@ mod tests {
     fn extended_catalog() -> Catalog {
         Catalog {
             models: vec![
-                extended_model("sol", 1, 272_000, 872_000),
-                extended_model("terra", 2, 272_000, 872_000),
-                extended_model("luna", 3, 272_000, 872_000),
+                extended_model("astra", 1, 272_000, 872_000),
+                extended_model("sol", 2, 272_000, 872_000),
+                extended_model("terra", 3, 272_000, 872_000),
+                extended_model("luna", 4, 272_000, 872_000),
             ],
         }
     }
@@ -604,9 +606,10 @@ mod tests {
     fn the_ceiling_follows_the_smallest_routed_model() {
         let catalog = Catalog {
             models: vec![
-                extended_model("sol", 1, 272_000, 872_000),
-                extended_model("terra", 2, 272_000, 872_000),
-                extended_model("luna", 3, 128_000, 128_000),
+                extended_model("astra", 1, 272_000, 872_000),
+                extended_model("sol", 2, 272_000, 872_000),
+                extended_model("terra", 3, 272_000, 872_000),
+                extended_model("luna", 4, 128_000, 128_000),
             ],
         };
         let mapping = ModelMapping::from_catalog(&catalog).unwrap();
@@ -623,9 +626,10 @@ mod tests {
     fn a_catalog_without_an_extended_window_still_resolves() {
         let catalog = Catalog {
             models: vec![
-                model("sol", 1, 300_000),
-                model("terra", 2, 272_000),
-                model("luna", 3, 128_000),
+                model("astra", 1, 300_000),
+                model("sol", 2, 300_000),
+                model("terra", 3, 272_000),
+                model("luna", 4, 128_000),
             ],
         };
         let mapping = ModelMapping::from_catalog(&catalog).unwrap();

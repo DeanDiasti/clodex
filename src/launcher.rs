@@ -33,6 +33,7 @@ pub fn run(claude_args: Vec<OsString>) -> Result<()> {
         &mapping.fable.model,
         &mapping.opus.model,
         &mapping.sonnet.model,
+        &mapping.haiku_compatibility.model,
     ])?;
 
     let config = AppConfig::load()?;
@@ -352,7 +353,7 @@ mod tests {
             .collect();
         assert_eq!(
             environment.get(OsStr::new("ANTHROPIC_MODEL")),
-            Some(&OsStr::new("gpt-opus"))
+            Some(&OsStr::new("gpt-sol"))
         );
         assert_eq!(
             environment.get(OsStr::new("CLAUDE_CODE_MAX_CONTEXT_TOKENS")),
@@ -420,19 +421,19 @@ mod tests {
         );
         assert_eq!(
             value("ANTHROPIC_DEFAULT_FABLE_MODEL"),
-            Some(OsStr::new("gpt-fable"))
+            Some(OsStr::new("gpt-astra"))
         );
         assert_eq!(
             value("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-            Some(OsStr::new("gpt-opus"))
+            Some(OsStr::new("gpt-sol"))
         );
         assert_eq!(
             value("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-            Some(OsStr::new("gpt-sonnet"))
+            Some(OsStr::new("gpt-terra"))
         );
         assert_eq!(
             value("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-            Some(OsStr::new("gpt-sonnet"))
+            Some(OsStr::new("gpt-luna"))
         );
         assert_eq!(
             value("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"),
@@ -458,7 +459,7 @@ mod tests {
                 .and_then(OsStr::to_str)
                 .is_some_and(|headers| headers
                     .lines()
-                    .any(|line| line == "X-Clodex-Initial-Model: gpt-opus"))
+                    .any(|line| line == "X-Clodex-Initial-Model: gpt-sol"))
         );
     }
 
@@ -500,20 +501,20 @@ mod tests {
     fn mapping() -> ModelMapping {
         ModelMapping {
             fable: Route {
-                model: "gpt-fable".to_string(),
-                display_name: "Fable".to_string(),
+                model: "gpt-astra".to_string(),
+                display_name: "Astra".to_string(),
             },
             opus: Route {
-                model: "gpt-opus".to_string(),
-                display_name: "Opus".to_string(),
+                model: "gpt-sol".to_string(),
+                display_name: "Sol".to_string(),
             },
             sonnet: Route {
-                model: "gpt-sonnet".to_string(),
-                display_name: "Sonnet".to_string(),
+                model: "gpt-terra".to_string(),
+                display_name: "Terra".to_string(),
             },
             haiku_compatibility: Route {
-                model: "gpt-sonnet".to_string(),
-                display_name: "Sonnet".to_string(),
+                model: "gpt-luna".to_string(),
+                display_name: "Luna".to_string(),
             },
         }
     }

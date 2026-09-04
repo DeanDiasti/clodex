@@ -23,6 +23,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Haiku background requests now route to the fourth Codex catalog model, making
+  the current mapping Astra → Fable, Sol → Opus, Terra → Sonnet, and
+  Luna → Haiku.
 - `auto` context capacity now follows the catalog's extended
   `max_context_window` and `effective_context_window_percent` instead of the
   smaller standard usage threshold.
