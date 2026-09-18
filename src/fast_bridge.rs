@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 
 const BRIDGE_HEADER: &str = "x-clodex-fast-bridge";
 const BRIDGE_HEADER_VALUE: &str = "1";
+const SESSION_FAST_HEADER: &str = "x-clodex-session-fast";
 const INITIAL_MODEL_HEADER: &str = "x-clodex-initial-model";
 const SESSION_HEADER: &str = "x-claude-code-session-id";
 const AGENT_HEADER: &str = "x-claude-code-agent-id";
@@ -25,6 +26,9 @@ const MAX_TRACKED_ROUTES: usize = 16_384;
 /// Code to assemble and send the compaction it just announced, short enough
 /// that a cancelled compaction does not leave a session armed indefinitely.
 const ARM_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long a usage reading is reused before refetching. Claude Code redraws
+/// its status line far more often than a subscription window moves.
+const USAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Concurrent token-count requests while planning a fold.
 const COUNT_CONCURRENCY: usize = 8;
 /// How often to ping while a round is in flight. A round can run for minutes,
@@ -55,6 +59,7 @@ struct BridgeState {
     client: reqwest::Client,
     hierarchical: bool,
     ceiling: u64,
+    report_usage: bool,
 }
 
 pub struct FastBridge {
@@ -66,7 +71,12 @@ pub struct FastBridge {
 impl FastBridge {
     /// `ceiling` is the capacity a fold round must fit inside; zero, or
     /// `hierarchical` unset, leaves every request forwarded untouched.
-    pub fn start(upstream_port: u16, hierarchical: bool, ceiling: u64) -> Result<Self> {
+    pub fn start(
+        upstream_port: u16,
+        hierarchical: bool,
+        ceiling: u64,
+        report_usage: bool,
+    ) -> Result<Self> {
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).context("could not bind the Clodex fast bridge")?;
         listener.set_nonblocking(true)?;
@@ -89,6 +99,7 @@ impl FastBridge {
                         .context("could not create the Clodex fast bridge client")?,
                     hierarchical,
                     ceiling,
+                    report_usage,
                 });
                 let app = Router::new()
                     .route("/__clodex/health", get(health))
@@ -136,7 +147,8 @@ async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "ok": true,
         "service": "clodex-fast-bridge",
-        "version": 1
+        "version": 2,
+        "capabilities": ["session-fast"]
     }))
 }
 
@@ -558,6 +570,83 @@ fn sse(event: &str, data: &Value) -> Vec<u8> {
     format!("event: {event}\ndata: {data}\n\n").into_bytes()
 }
 
+/// Return cached usage immediately; status-bar telemetry must never hold up
+/// model output. A single background task refreshes an expired snapshot.
+fn cached_rate_limits(state: &BridgeState) -> Option<crate::usage::RateLimits> {
+    let client = state.client.clone();
+    cached_rate_limits_with(usage_cache().clone(), async move {
+        crate::usage::fetch(&client).await
+    })
+}
+
+#[derive(Default)]
+struct UsageCache {
+    limits: Option<crate::usage::RateLimits>,
+    checked_at: Option<std::time::Instant>,
+    refreshing: bool,
+}
+
+type SharedUsageCache = std::sync::Arc<Mutex<UsageCache>>;
+
+// Cancellation or a failed background task must not leave refresh stuck on.
+struct UsageRefresh(SharedUsageCache);
+impl Drop for UsageRefresh {
+    fn drop(&mut self) {
+        if let Ok(mut cache) = self.0.lock() {
+            cache.refreshing = false;
+        }
+    }
+}
+
+fn cached_rate_limits_with(
+    cache: SharedUsageCache,
+    fetch: impl std::future::Future<Output = Option<crate::usage::RateLimits>> + Send + 'static,
+) -> Option<crate::usage::RateLimits> {
+    let mut snapshot = cache.lock().expect("Clodex usage lock");
+    let limits = snapshot.limits;
+    if snapshot.refreshing
+        || snapshot
+            .checked_at
+            .is_some_and(|at| at.elapsed() < USAGE_TTL)
+    {
+        return limits;
+    }
+    snapshot.refreshing = true;
+    drop(snapshot);
+    let refresh = UsageRefresh(cache);
+    tokio::spawn(async move {
+        let fetched = fetch.await;
+        let mut snapshot = refresh.0.lock().expect("Clodex usage lock");
+        // Cache failures too, so an unavailable endpoint does not cause a storm.
+        snapshot.limits = fetched;
+        snapshot.checked_at = Some(std::time::Instant::now());
+        drop(snapshot);
+        drop(refresh);
+    });
+    limits
+}
+
+fn usage_cache() -> &'static SharedUsageCache {
+    static CACHE: std::sync::OnceLock<SharedUsageCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Arc::new(Mutex::new(UsageCache::default())))
+}
+
+/// Adds the rate-limit headers Claude Code renders its status bars from.
+///
+/// Behind a custom base URL these never arrive, so the bars vanish even though
+/// the session is spending a real Codex quota. Supplying them in the shape
+/// Claude Code already parses means an existing status line keeps working.
+fn apply_rate_limit_headers(response: &mut Response, limits: &crate::usage::RateLimits) {
+    for (name, value) in limits.headers() {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            axum::http::HeaderValue::from_str(&value),
+        ) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+}
+
 async fn proxy(State(state): State<std::sync::Arc<BridgeState>>, request: Request) -> Response {
     match proxy_inner(&state, request).await {
         Ok(response) => response,
@@ -589,12 +678,18 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         == Some(BRIDGE_HEADER_VALUE);
     let is_messages =
         parts.method == axum::http::Method::POST && parts.uri.path() == "/v1/messages";
+    let session_fast = marked && parts.headers.contains_key(SESSION_FAST_HEADER);
+    if session_fast && is_messages {
+        bytes = rewrite_request(&parts.headers, &bytes)?;
+    }
+    // Forced-fast fold rounds inherit the selected tier; ordinary sessions
+    // retain their existing compaction and interactive-toggle behavior.
     if is_messages
         && let Some(response) = hierarchical_compaction(state, &parts.headers, &bytes).await
     {
         return Ok(response);
     }
-    if marked && is_messages {
+    if marked && is_messages && !session_fast {
         bytes = rewrite_request(&parts.headers, &bytes)?;
     }
 
@@ -621,7 +716,13 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         let retryable =
             attempt < UPSTREAM_RETRIES && is_replayable(&parts.method, parts.uri.path());
         match sent {
-            Ok(response) if response.status() == StatusCode::BAD_GATEWAY && retryable => {}
+            Ok(response)
+                if response.status() == StatusCode::BAD_GATEWAY
+                    && retryable
+                    && response
+                        .headers()
+                        .get("x-should-retry")
+                        .is_none_or(|value| value != "false") => {}
             Ok(response) => break response,
             Err(_) if retryable => {}
             Err(error) => return Err(error).context("could not reach claude-code-proxy"),
@@ -629,6 +730,13 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
 
         attempt += 1;
         tokio::time::sleep(RETRY_BACKOFF * attempt).await;
+    };
+
+    // Refresh telemetry independently from delivery of the model response.
+    let rate_limits = if state.report_usage && is_messages {
+        cached_rate_limits(state)
+    } else {
+        None
     };
 
     let status = upstream.status();
@@ -640,6 +748,9 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         if should_forward_response_header(name) {
             response.headers_mut().append(name, value.clone());
         }
+    }
+    if let Some(limits) = &rate_limits {
+        apply_rate_limit_headers(&mut response, limits);
     }
     Ok(response)
 }
@@ -660,6 +771,7 @@ fn should_forward_request_header(name: &HeaderName) -> bool {
         && name != header::CONNECTION
         && name.as_str() != BRIDGE_HEADER
         && name.as_str() != INITIAL_MODEL_HEADER
+        && name.as_str() != SESSION_FAST_HEADER
 }
 
 fn should_forward_response_header(name: &HeaderName) -> bool {
@@ -680,6 +792,17 @@ fn rewrite_request(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>> {
     else {
         return Ok(body.to_vec());
     };
+    if let Some(routes) = headers.get(SESSION_FAST_HEADER) {
+        let routes: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(routes.to_str().context("invalid session-fast header")?)
+                .context("invalid session-fast routes")?;
+        let model = strip_fast_suffix(&incoming_model);
+        let routed = routes.get(model).map(String::as_str).unwrap_or(model);
+        object.insert("model".into(), Value::String(routed.to_owned()));
+        // Session policy owns the tier, including fallback for unsupported models.
+        object.remove("speed");
+        return serde_json::to_vec(&value).context("could not serialize Claude request");
+    }
     let fast = object.get("speed").and_then(Value::as_str) == Some("fast");
     let has_tools = object
         .get("tools")
@@ -768,6 +891,22 @@ pub fn custom_headers(initial_model: &str) -> String {
     format!("X-Clodex-Fast-Bridge: 1\nX-Clodex-Initial-Model: {initial_model}")
 }
 
+pub fn supports_session_fast(port: u16) -> bool {
+    reqwest::blocking::Client::new()
+        .get(format!("http://127.0.0.1:{port}/__clodex/health"))
+        .timeout(std::time::Duration::from_millis(500))
+        .send()
+        .ok()
+        .filter(|response| response.status().is_success())
+        .and_then(|response| response.json::<Value>().ok())
+        .is_some_and(|body| {
+            body["service"] == "clodex-fast-bridge"
+                && body["capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|cap| cap == "session-fast"))
+        })
+}
+
 pub fn healthcheck(port: u16) -> bool {
     let Ok(response) = reqwest::blocking::Client::new()
         .get(format!("http://127.0.0.1:{port}/__clodex/health"))
@@ -797,6 +936,47 @@ mod tests {
     use axum::http::HeaderValue;
 
     use super::*;
+
+    #[tokio::test]
+    async fn usage_refresh_does_not_block_or_duplicate_and_caches_failures() {
+        let stale = crate::usage::RateLimits::default();
+        let cache = std::sync::Arc::new(Mutex::new(UsageCache {
+            limits: Some(stale),
+            checked_at: Some(std::time::Instant::now() - USAGE_TTL),
+            refreshing: false,
+        }));
+        let (release, pending) = oneshot::channel();
+        assert_eq!(
+            cached_rate_limits_with(cache.clone(), async move { pending.await.unwrap() }),
+            Some(stale)
+        );
+        assert!(cache.lock().unwrap().refreshing);
+        // This future must not be polled while another lookup is in flight.
+        assert_eq!(
+            cached_rate_limits_with(cache.clone(), async { panic!("duplicate quota fetch") }),
+            Some(stale)
+        );
+        release.send(None).unwrap();
+        tokio::task::yield_now().await;
+        assert!(!cache.lock().unwrap().refreshing);
+        assert_eq!(
+            cached_rate_limits_with(cache.clone(), async {
+                panic!("failed lookup was not cached")
+            }),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_usage_refresh_can_be_started_again() {
+        let cache = std::sync::Arc::new(Mutex::new(UsageCache::default()));
+        cache.lock().unwrap().refreshing = true;
+        drop(UsageRefresh(cache.clone()));
+        assert!(!cache.lock().unwrap().refreshing);
+        assert_eq!(cached_rate_limits_with(cache.clone(), async { None }), None);
+        tokio::task::yield_now().await;
+        assert!(cache.lock().unwrap().checked_at.is_some());
+    }
 
     #[test]
     fn arming_is_consumed_once_and_expires() {
@@ -860,6 +1040,7 @@ mod tests {
             client: reqwest::Client::new(),
             hierarchical: true,
             ceiling: 828_400,
+            report_usage: false,
         };
         // Carries the marker but has no conversation before it, so planning
         // bails before any fold is committed.
@@ -892,6 +1073,7 @@ mod tests {
             client: reqwest::Client::new(),
             hierarchical: false,
             ceiling: 828_400,
+            report_usage: false,
         };
         let body = serde_json::json!({
             "model": "gpt-5.6-sol",
@@ -923,6 +1105,7 @@ mod tests {
             client: reqwest::Client::new(),
             hierarchical: true,
             ceiling: 828_400,
+            report_usage: false,
         };
         let body = serde_json::json!({
             "model": "gpt-5.6-sol",
@@ -966,6 +1149,39 @@ mod tests {
             &rewrite_request(headers, &serde_json::to_vec(&body).unwrap()).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn session_fast_follows_each_model_without_session_ids_or_tools() {
+        let mut forced = HeaderMap::new();
+        forced.insert(
+            SESSION_FAST_HEADER,
+            HeaderValue::from_static(
+                r#"{"gpt-astra":"gpt-astra-fast","gpt-luna":"gpt-luna-fast"}"#,
+            ),
+        );
+        for model in ["gpt-astra", "gpt-luna", "gpt-astra-fast", "unsupported"] {
+            let body = serde_json::json!({"model":model,"speed":"standard","messages":[]});
+            let rewritten: Value = serde_json::from_slice(
+                &rewrite_request(&forced, &serde_json::to_vec(&body).unwrap()).unwrap(),
+            )
+            .unwrap();
+            let expected = if model == "unsupported" {
+                "unsupported".to_string()
+            } else {
+                fast_model(model)
+            };
+            assert_eq!(rewritten["model"], expected);
+            assert!(rewritten.get("speed").is_none());
+        }
+        assert_eq!(
+            rewrite(&HeaderMap::new(), "gpt-astra", false)["model"],
+            "gpt-astra"
+        );
+        assert_eq!(
+            rewrite(&forced, "unsupported-fast", true)["model"],
+            "unsupported"
+        );
     }
 
     #[test]
@@ -1116,7 +1332,7 @@ mod tests {
             }
         });
 
-        let bridge = FastBridge::start(upstream_port, false, 0).unwrap();
+        let bridge = FastBridge::start(upstream_port, false, 0, false).unwrap();
         let response = reqwest::blocking::Client::new()
             .post(format!("http://127.0.0.1:{}/v1/messages", bridge.port()))
             .header(SESSION_HEADER, "retry-session")
@@ -1141,6 +1357,28 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_proxy_recovery_is_not_replayed_by_the_bridge() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let upstream = thread::spawn(move || {
+            let mut stream = listener.accept().unwrap().0;
+            drain_request(&mut stream);
+            stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 2\r\nx-should-retry: false\r\nConnection: close\r\n\r\n{}").unwrap();
+        });
+        let bridge = FastBridge::start(port, false, 0, false).unwrap();
+        let response = reqwest::blocking::Client::new()
+            .post(format!("http://127.0.0.1:{}/v1/messages", bridge.port()))
+            .json(&serde_json::json!({"model":"gpt-test","messages":[]}))
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), 502);
+        assert_eq!(response.headers()["x-should-retry"], "false");
+        assert_eq!(response.text().unwrap(), "{}");
+        drop(bridge);
+        upstream.join().unwrap();
+    }
+
+    #[test]
     fn a_persistent_upstream_502_is_surfaced_rather_than_retried_forever() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let upstream_port = listener.local_addr().unwrap().port();
@@ -1159,7 +1397,7 @@ mod tests {
             }
         });
 
-        let bridge = FastBridge::start(upstream_port, false, 0).unwrap();
+        let bridge = FastBridge::start(upstream_port, false, 0, false).unwrap();
         let response = reqwest::blocking::Client::new()
             .post(format!("http://127.0.0.1:{}/v1/messages", bridge.port()))
             .header(SESSION_HEADER, "persistent-session")
@@ -1183,7 +1421,7 @@ mod tests {
         let upstream_port = listener.local_addr().unwrap().port();
         let (captured_tx, captured_rx) = mpsc::channel();
         let upstream = thread::spawn(move || {
-            for _ in 0..3 {
+            for _ in 0..6 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = Vec::new();
                 let mut chunk = [0_u8; 4096];
@@ -1226,10 +1464,11 @@ mod tests {
             }
         });
 
-        let bridge = FastBridge::start(upstream_port, false, 0).unwrap();
+        let bridge = FastBridge::start(upstream_port, false, 0, false).unwrap();
         let url = format!("http://127.0.0.1:{}/v1/messages", bridge.port());
         let client = reqwest::blocking::Client::new();
-        let send = |marked: bool, model: &str, fast: bool| {
+        assert!(supports_session_fast(bridge.port()));
+        let send = |marked: bool, model: &str, fast: bool, forced: bool| {
             let mut body = serde_json::json!({
                 "model": model,
                 "messages": [{"role":"user","content":"test"}],
@@ -1242,6 +1481,10 @@ mod tests {
                 .post(&url)
                 .header(SESSION_HEADER, "http-bridge-session")
                 .json(&body);
+            if forced {
+                request =
+                    request.header(SESSION_FAST_HEADER, r#"{"gpt-6-astra":"gpt-6-astra-fast"}"#);
+            }
             if marked {
                 request = request
                     .header(BRIDGE_HEADER, BRIDGE_HEADER_VALUE)
@@ -1250,11 +1493,14 @@ mod tests {
             assert!(request.send().unwrap().status().is_success());
         };
 
-        send(false, "gpt-5.6-terra", true);
-        send(true, "gpt-5.6-terra", false);
-        send(true, "claude-opus-5", true);
+        send(false, "gpt-5.6-terra", true, false);
+        send(true, "gpt-5.6-terra", false, false);
+        send(true, "claude-opus-5", true, false);
+        send(true, "gpt-6-astra", false, true);
+        send(true, "gpt-unsupported", true, true);
+        send(false, "gpt-6-astra", false, true);
 
-        let captured: Vec<_> = (0..3)
+        let captured: Vec<_> = (0..6)
             .map(|_| {
                 captured_rx
                     .recv_timeout(std::time::Duration::from_secs(2))
@@ -1264,6 +1510,9 @@ mod tests {
         assert_eq!(captured[0].1["model"], "gpt-5.6-terra");
         assert_eq!(captured[1].1["model"], "gpt-5.6-terra");
         assert_eq!(captured[2].1["model"], "gpt-5.6-terra-fast");
+        assert_eq!(captured[3].1["model"], "gpt-6-astra-fast");
+        assert_eq!(captured[4].1["model"], "gpt-unsupported");
+        assert_eq!(captured[5].1["model"], "gpt-6-astra");
         assert!(
             captured
                 .iter()

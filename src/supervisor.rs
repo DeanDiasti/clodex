@@ -177,6 +177,7 @@ pub fn run() -> Result<()> {
         upstream_port,
         app_config.compaction.hierarchical,
         ceiling,
+        app_config.usage.report_limits,
     )?);
     let proxy_port = cleanup
         .bridge
@@ -300,7 +301,7 @@ fn accept_lease(stream: &mut UnixStream, proxy_port: u16) -> bool {
         .is_ok()
 }
 
-pub fn proxy_models_support(models: &[&str]) -> Result<()> {
+pub fn proxy_models_support(models: &[&str]) -> Result<Vec<String>> {
     let version = Command::new("claude-code-proxy")
         .arg("--version")
         .output()
@@ -329,7 +330,11 @@ pub fn proxy_models_support(models: &[&str]) -> Result<()> {
             unsupported.join(", ")
         );
     }
-    Ok(())
+    Ok(listed
+        .split([',', ':', ';', ' ', '\n', '\r', '\t'])
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 fn proxy_version_supports_fast(output: &str) -> bool {

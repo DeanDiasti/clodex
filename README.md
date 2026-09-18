@@ -128,6 +128,8 @@ configuration and logs are no longer wanted.
 | Command | Purpose |
 | --- | --- |
 | `clodex` | Start Claude Code through Clodex |
+| `clodex --fast [Claude arguments]` | Keep supported models on fast mode for this launch |
+| `clodex statusline-fast` | Print the session fast label from status-line JSON on stdin |
 | `clodex auth [status]` | Validate secure reuse of the Codex login |
 | `clodex models [list]` | Show visible, API-supported Codex models |
 | `clodex models map` | Show Claude-role-to-Codex routing |
@@ -136,6 +138,7 @@ configuration and logs are no longer wanted.
 | `clodex config context <auto\|tokens>` | Set context capacity |
 | `clodex config compact-at <1..95>` | Set the auto-compaction percentage |
 | `clodex config hierarchical-compaction <on\|off>` | Fold an oversized compaction into rounds |
+| `clodex config report-limits <on\|off>` | Report Codex limits to the status line |
 | `clodex config allow-tool <exact-name>` | Trust one tool for sessions and subagents |
 | `clodex config forget-tool <exact-name>` | Remove a trusted tool |
 | `clodex config path` | Print the configuration path |
@@ -155,19 +158,81 @@ catalog priority to Claude Code roles:
 | Fable | First |
 | Opus | Second |
 | Sonnet | Third |
-| Haiku compatibility | Same route as Sonnet |
+| Haiku compatibility | Fourth |
 
 The launched session defaults to the Opus route. Fable and Sonnet remain
 available from Claude Code's model picker. Haiku is hidden from the picker but
-Claude Code's background Haiku requests are supported through the Sonnet
-route. If fewer than three models are available, Clodex safely reuses the
+Claude Code's background Haiku requests use the fourth catalog model. With the
+current catalog, this maps Astra to Fable, Sol to Opus, Terra to Sonnet, and
+Luna to Haiku. If fewer than four models are available, Clodex safely reuses the
 closest available route.
 
 No model names are hard-coded. This allows the mapping to follow the live
 Codex catalog, while a preflight check ensures the installed translation proxy
 also understands every selected model.
 
+## Connection recovery
+
+Clodex reconnects after transient WebSocket resets, closures, timeouts, and
+retryable upstream failures when replay is safe. This includes a disconnect
+after thinking has streamed, as long as answer text or tool output has not
+started. Recovery is bounded to three reconnect attempts and a 60-second retry
+window; the initial generation has no new time limit.
+
+Connection notices appear on stderr, separately from the assistant's answer:
+
+```text
+[Clodex 1234abcd] Connection interrupted during thinking; reconnecting (1/3)
+[Clodex 1234abcd] Connection restored; continuing
+```
+
+Notices are scoped to the launch, including its subagents. They are also logged
+as `connection_recovery` events. Custom status lines can run
+`clodex statusline-connection` to display active recovery; it reads the
+child-only `CLODEX_NOTIFICATION_FILE` and makes no network requests.
+
+Once answer text or tool arguments have started, Clodex does not blindly
+replay them. Completed tool calls can be handed back normally; an unsafe or
+exhausted recovery produces an explicit error explaining that the turn needs
+to be retried. Replacing either binary requires closing all existing Clodex
+sessions so the shared supervisor and proxy can restart.
+
 ## Fast mode
+
+Start a session with fast mode locked on:
+
+```sh
+clodex --fast
+clodex --fast --resume
+clodex --fast --model gpt-6-astra
+```
+
+Put `--fast` before Claude arguments. It requests the Codex priority tier for
+models whose live catalog advertises fast support and whose proxy fast alias
+is available. It follows model switches, subagents, background requests, and
+compaction. Models without fast support use their normal tier. The setting is
+local to this launch; use `--fast` again when resuming a session.
+
+With `--fast`, Clodex owns the tier and disables Claude's native `/fast` toggle
+for that process, so it cannot switch your selected model or turn session fast
+mode off. Other sessions retain their own settings.
+
+For a custom status line, pass Claude's JSON to `clodex statusline-fast`:
+
+```sh
+input=$(cat)
+fast=$(printf '%s' "$input" | clodex statusline-fast)
+# Include "$fast" alongside your existing status-line segments.
+```
+
+The helper prints `FAST` for a supported current model, `FAST unavailable` for
+an unsupported model, and nothing in a launch without `--fast`. Before a model
+ID is available it prints `FAST (session)`. It uses the child-only environment
+variables `CLODEX_FAST` (`1` or `0`) and `CLODEX_FAST_ROUTES` (a JSON model-to-fast
+route map). The status line can also reference these directly. No network
+requests are made by the helper.
+
+Without the startup flag, the existing interactive toggle remains available:
 
 Inside a Clodex session, `/fast on` enables the Codex priority service tier for
 the model that is already selected. It does not switch the route to Fable,
@@ -238,6 +303,31 @@ Settings apply when a new Clodex process starts. Restart existing sessions
 after changing them. Subagents inherit the launch environment and therefore
 receive the same capacity and percentage, but each agent has its own context
 window.
+
+## Subscription limits in the status line
+
+Claude Code renders its `5h` and `7d` status bars from
+`anthropic-ratelimit-unified-*` response headers. Behind a custom base URL
+those headers never arrive, so the bars disappear even though the session is
+spending a real subscription quota — the Codex one.
+
+Clodex reads Codex usage and supplies those headers itself, so an existing
+status line keeps working with no changes to it:
+
+```sh
+clodex config report-limits on    # on by default
+clodex config report-limits off
+```
+
+Codex reports each limit as a `primary`/`secondary` pair, and which one is the
+weekly window depends on the plan — a Pro account reports weekly as its
+primary and has no secondary at all. Clodex classifies windows by length
+rather than position, and when several limits report the same window it shows
+the fullest, since that is the one that will bind first.
+
+Usage is read at most once a minute and cached, including failures, so a
+slow or unavailable endpoint never delays a request. If it cannot be read, the
+headers are simply omitted and the bars stay hidden.
 
 ## Hierarchical compaction
 
@@ -378,6 +468,11 @@ clodex auth sync
 clodex context
 ```
 
+- **Long waits followed by “Codex completed without producing output”:**
+  proxy 0.1.35 can spend over 157 seconds in empty-response retry backoff before
+  request time is counted. See the [local investigation and patch notes](docs/2026-09-17-clodex-latency.md).
+  The local patched build bounds recovery and prevents client retries from
+  multiplying it. Restart all Clodex sessions after replacing either binary.
 - **“Agent terminated early” with “error decoding response body”:** this is an
   interrupted upstream Codex response. The proxy retries failures that are
   still safe to replay, but it cannot safely replay a partially emitted tool

@@ -6,7 +6,10 @@ mod doctor;
 mod fast_bridge;
 mod launcher;
 mod mapping;
+mod notifications;
+mod statusline;
 mod supervisor;
+mod usage;
 
 use std::ffi::OsString;
 
@@ -20,9 +23,13 @@ use crate::mapping::ModelMapping;
 #[command(
     name = "clodex",
     version,
-    about = "Claude Code harness with Codex subscription models"
+    about = "Claude Code harness with Codex subscription models",
+    after_help = "Launch: clodex [--fast] [--] [CLAUDE_ARGS]\nPlace --fast before Claude arguments to keep supported models on the priority tier for this session."
 )]
 struct Cli {
+    /// Keep fast mode enabled for this session on models that support it.
+    #[arg(long)]
+    fast: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -39,6 +46,10 @@ enum Command {
     Context,
     /// Check the local Claude, Codex, and proxy prerequisites.
     Doctor,
+    /// Print this session's fast-mode label from Claude status-line JSON on stdin.
+    StatuslineFast,
+    /// Print any active connection recovery for this launch.
+    StatuslineConnection,
     #[command(name = "__supervisor", hide = true)]
     Supervisor,
 }
@@ -105,6 +116,11 @@ enum ConfigCommand {
         /// One of: on or off.
         value: String,
     },
+    /// Report Codex subscription limits to Claude Code's status line.
+    ReportLimits {
+        /// One of: on or off.
+        value: String,
+    },
     /// Trust an exact Claude tool name in every Clodex agent.
     AllowTool {
         /// Tool name, such as mcp__codebase-memory-mcp__search_code.
@@ -120,25 +136,37 @@ enum ConfigCommand {
 }
 
 fn main() -> Result<()> {
-    let mut passthrough: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let (fast, mut passthrough) = launch_arguments(std::env::args_os().skip(1).collect());
     if should_launch_claude(&passthrough) {
         if passthrough.first().is_some_and(|argument| argument == "--") {
             passthrough.remove(0);
         }
-        return launcher::run(passthrough);
+        return launcher::run(passthrough, fast);
     }
 
     let cli = Cli::parse();
 
     match cli.command {
-        None => launcher::run(Vec::new()),
+        None => launcher::run(Vec::new(), cli.fast),
         Some(Command::Auth(args)) => run_auth(args),
         Some(Command::Models(args)) => run_models(args),
         Some(Command::Config(args)) => run_config(args),
         Some(Command::Context) => run_context(),
         Some(Command::Doctor) => doctor::run(),
+        Some(Command::StatuslineFast) => statusline::run(),
+        Some(Command::StatuslineConnection) => notifications::statusline(),
         Some(Command::Supervisor) => supervisor::run(),
     }
+}
+
+// Only consume our leading option: `-p "--fast"` and everything after `--`
+// belong to Claude and must remain byte-for-byte unchanged.
+fn launch_arguments(mut arguments: Vec<OsString>) -> (bool, Vec<OsString>) {
+    let fast = arguments.first().is_some_and(|arg| arg == "--fast");
+    if fast {
+        arguments.remove(0);
+    }
+    (fast, arguments)
 }
 
 fn should_launch_claude(arguments: &[OsString]) -> bool {
@@ -152,6 +180,8 @@ fn should_launch_claude(arguments: &[OsString]) -> bool {
             | "config"
             | "context"
             | "doctor"
+            | "statusline-fast"
+            | "statusline-connection"
             | "__supervisor"
             | "-h"
             | "--help"
@@ -260,6 +290,20 @@ fn run_config(args: ConfigArgs) -> Result<()> {
                 if enabled { "enabled" } else { "disabled" }
             );
         }
+        ConfigCommand::ReportLimits { value } => {
+            let enabled = match value.trim().to_ascii_lowercase().as_str() {
+                "on" | "true" | "enabled" => true,
+                "off" | "false" | "disabled" => false,
+                _ => anyhow::bail!("invalid value {value:?}; expected on or off"),
+            };
+            let mut config = config::AppConfig::load()?;
+            config.usage.report_limits = enabled;
+            config.save()?;
+            println!(
+                "Codex limit reporting {}. Start a new Clodex session to apply it.",
+                if enabled { "enabled" } else { "disabled" }
+            );
+        }
         ConfigCommand::AllowTool { tool } => {
             let mut config = config::AppConfig::load()?;
             if config.permissions.trust(&tool)? {
@@ -328,6 +372,25 @@ mod tests {
         ] {
             assert!(should_launch_claude(&arguments(values)), "{values:?}");
         }
+    }
+
+    #[test]
+    fn session_fast_is_only_consumed_before_claude_arguments() {
+        assert_eq!(
+            launch_arguments(arguments(&["--fast", "--resume"])),
+            (true, arguments(&["--resume"]))
+        );
+        for args in [
+            &["-p", "--fast"][..],
+            &["--", "--fast"][..],
+            &["--resume", "--fast"][..],
+        ] {
+            assert_eq!(launch_arguments(arguments(args)), (false, arguments(args)));
+        }
+        assert_eq!(
+            launch_arguments(arguments(&["--fast", "--", "--fast"])),
+            (true, arguments(&["--", "--fast"]))
+        );
     }
 
     #[test]

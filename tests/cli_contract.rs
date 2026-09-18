@@ -12,7 +12,15 @@ fn top_level_help_and_version_are_available_without_runtime_dependencies() {
     let help = clodex(&["--help"]);
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).unwrap();
-    for command in ["auth", "models", "config", "context", "doctor"] {
+    for command in [
+        "auth",
+        "models",
+        "config",
+        "context",
+        "doctor",
+        "statusline-fast",
+        "--fast",
+    ] {
         assert!(
             help.contains(command),
             "{command} missing from help:\n{help}"
@@ -39,6 +47,7 @@ fn nested_command_help_documents_the_public_configuration_contract() {
         "compact-at",
         "transport",
         "hierarchical-compaction",
+        "report-limits",
         "allow-tool",
         "forget-tool",
         "path",
@@ -85,4 +94,16 @@ fn installer_is_valid_shell_and_has_standalone_help() {
     assert!(help.contains("--skip-prerequisite-checks"));
     assert!(help.contains("CLODEX_INSTALL_ROOT"));
     assert!(help.contains("update"));
+}
+
+#[test]
+fn fast_help_and_statusline_do_not_need_runtime_services() {
+    assert!(clodex(&["--fast", "--help"]).status.success());
+    let output = Command::new(env!("CARGO_BIN_EXE_clodex"))
+        .arg("statusline-fast")
+        .env("CLODEX_FAST", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
 }

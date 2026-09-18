@@ -103,6 +103,20 @@ impl Catalog {
         models
     }
 
+    pub fn fast_models(&self) -> Vec<String> {
+        self.models
+            .iter()
+            .filter(|model| {
+                model.supported_in_api
+                    && model
+                        .additional_speed_tiers
+                        .iter()
+                        .any(|tier| tier == "fast")
+            })
+            .map(|model| model.slug.clone())
+            .collect()
+    }
+
     pub fn render(&self) -> String {
         let models = self.routable_models();
         let mut output = String::from("Codex models available to clodex\n\n");

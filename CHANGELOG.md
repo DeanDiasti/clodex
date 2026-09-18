@@ -15,6 +15,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   interrupted Codex response streams.
 - Codex server-side compaction, enabled for every launched proxy, so Codex can
   compact upstream instead of rejecting a prompt near the model's limit.
+- Codex subscription limits reported to Claude Code's status line as
+  `anthropic-ratelimit-unified-*` headers, restoring the 5h and 7d bars that a
+  custom base URL otherwise hides (`clodex config report-limits`).
 - Opt-in hierarchical compaction (`clodex config hierarchical-compaction`),
   which folds an oversized compaction request into successive rounds that each
   fit the context window, so a conversation past the ceiling can still compact.
@@ -23,6 +26,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Haiku background requests now route to the fourth Codex catalog model, making
+  the current mapping Astra → Fable, Sol → Opus, Terra → Sonnet, and
+  Luna → Haiku.
 - `auto` context capacity now follows the catalog's extended
   `max_context_window` and `effective_context_window_percent` instead of the
   smaller standard usage threshold.
