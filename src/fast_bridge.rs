@@ -568,29 +568,65 @@ fn sse(event: &str, data: &Value) -> Vec<u8> {
     format!("event: {event}\ndata: {data}\n\n").into_bytes()
 }
 
-/// Current Codex usage, refetched at most once per `USAGE_TTL`.
-async fn cached_rate_limits(state: &BridgeState) -> Option<crate::usage::RateLimits> {
-    {
-        let cache = usage_cache().lock().expect("Clodex usage lock");
-        if let Some((limits, at)) = cache.as_ref()
-            && std::time::Instant::now().duration_since(*at) < USAGE_TTL
-        {
-            return *limits;
-        }
-    }
-
-    let fetched = crate::usage::fetch(&state.client).await;
-    let mut cache = usage_cache().lock().expect("Clodex usage lock");
-    // Cache misses too, so a failing endpoint is not retried on every request.
-    *cache = Some((fetched, std::time::Instant::now()));
-    fetched
+/// Return cached usage immediately; status-bar telemetry must never hold up
+/// model output. A single background task refreshes an expired snapshot.
+fn cached_rate_limits(state: &BridgeState) -> Option<crate::usage::RateLimits> {
+    let client = state.client.clone();
+    cached_rate_limits_with(usage_cache().clone(), async move {
+        crate::usage::fetch(&client).await
+    })
 }
 
-type UsageCache = Option<(Option<crate::usage::RateLimits>, std::time::Instant)>;
+#[derive(Default)]
+struct UsageCache {
+    limits: Option<crate::usage::RateLimits>,
+    checked_at: Option<std::time::Instant>,
+    refreshing: bool,
+}
 
-fn usage_cache() -> &'static Mutex<UsageCache> {
-    static CACHE: std::sync::OnceLock<Mutex<UsageCache>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
+type SharedUsageCache = std::sync::Arc<Mutex<UsageCache>>;
+
+// Cancellation or a failed background task must not leave refresh stuck on.
+struct UsageRefresh(SharedUsageCache);
+impl Drop for UsageRefresh {
+    fn drop(&mut self) {
+        if let Ok(mut cache) = self.0.lock() {
+            cache.refreshing = false;
+        }
+    }
+}
+
+fn cached_rate_limits_with(
+    cache: SharedUsageCache,
+    fetch: impl std::future::Future<Output = Option<crate::usage::RateLimits>> + Send + 'static,
+) -> Option<crate::usage::RateLimits> {
+    let mut snapshot = cache.lock().expect("Clodex usage lock");
+    let limits = snapshot.limits;
+    if snapshot.refreshing
+        || snapshot
+            .checked_at
+            .is_some_and(|at| at.elapsed() < USAGE_TTL)
+    {
+        return limits;
+    }
+    snapshot.refreshing = true;
+    drop(snapshot);
+    let refresh = UsageRefresh(cache);
+    tokio::spawn(async move {
+        let fetched = fetch.await;
+        let mut snapshot = refresh.0.lock().expect("Clodex usage lock");
+        // Cache failures too, so an unavailable endpoint does not cause a storm.
+        snapshot.limits = fetched;
+        snapshot.checked_at = Some(std::time::Instant::now());
+        drop(snapshot);
+        drop(refresh);
+    });
+    limits
+}
+
+fn usage_cache() -> &'static SharedUsageCache {
+    static CACHE: std::sync::OnceLock<SharedUsageCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Arc::new(Mutex::new(UsageCache::default())))
 }
 
 /// Adds the rate-limit headers Claude Code renders its status bars from.
@@ -682,10 +718,9 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         tokio::time::sleep(RETRY_BACKOFF * attempt).await;
     };
 
-    // Fetched before the response is built so the status line reflects the
-    // quota this very request is spending.
+    // Refresh telemetry independently from delivery of the model response.
     let rate_limits = if state.report_usage && is_messages {
-        cached_rate_limits(state).await
+        cached_rate_limits(state)
     } else {
         None
     };
@@ -859,6 +894,47 @@ mod tests {
     use axum::http::HeaderValue;
 
     use super::*;
+
+    #[tokio::test]
+    async fn usage_refresh_does_not_block_or_duplicate_and_caches_failures() {
+        let stale = crate::usage::RateLimits::default();
+        let cache = std::sync::Arc::new(Mutex::new(UsageCache {
+            limits: Some(stale),
+            checked_at: Some(std::time::Instant::now() - USAGE_TTL),
+            refreshing: false,
+        }));
+        let (release, pending) = oneshot::channel();
+        assert_eq!(
+            cached_rate_limits_with(cache.clone(), async move { pending.await.unwrap() }),
+            Some(stale)
+        );
+        assert!(cache.lock().unwrap().refreshing);
+        // This future must not be polled while another lookup is in flight.
+        assert_eq!(
+            cached_rate_limits_with(cache.clone(), async { panic!("duplicate quota fetch") }),
+            Some(stale)
+        );
+        release.send(None).unwrap();
+        tokio::task::yield_now().await;
+        assert!(!cache.lock().unwrap().refreshing);
+        assert_eq!(
+            cached_rate_limits_with(cache.clone(), async {
+                panic!("failed lookup was not cached")
+            }),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_usage_refresh_can_be_started_again() {
+        let cache = std::sync::Arc::new(Mutex::new(UsageCache::default()));
+        cache.lock().unwrap().refreshing = true;
+        drop(UsageRefresh(cache.clone()));
+        assert!(!cache.lock().unwrap().refreshing);
+        assert_eq!(cached_rate_limits_with(cache.clone(), async { None }), None);
+        tokio::task::yield_now().await;
+        assert!(cache.lock().unwrap().checked_at.is_some());
+    }
 
     #[test]
     fn arming_is_consumed_once_and_expires() {

@@ -405,6 +405,11 @@ clodex auth sync
 clodex context
 ```
 
+- **Long waits followed by “Codex completed without producing output”:**
+  proxy 0.1.35 can spend over 157 seconds in empty-response retry backoff before
+  request time is counted. See the [local investigation and patch notes](docs/2026-09-17-clodex-latency.md).
+  The local patched build bounds recovery and prevents client retries from
+  multiplying it. Restart all Clodex sessions after replacing either binary.
 - **“Agent terminated early” with “error decoding response body”:** this is an
   interrupted upstream Codex response. The proxy retries failures that are
   still safe to replay, but it cannot safely replay a partially emitted tool
