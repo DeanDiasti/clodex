@@ -128,6 +128,8 @@ configuration and logs are no longer wanted.
 | Command | Purpose |
 | --- | --- |
 | `clodex` | Start Claude Code through Clodex |
+| `clodex --fast [Claude arguments]` | Keep supported models on fast mode for this launch |
+| `clodex statusline-fast` | Print the session fast label from status-line JSON on stdin |
 | `clodex auth [status]` | Validate secure reuse of the Codex login |
 | `clodex models [list]` | Show visible, API-supported Codex models |
 | `clodex models map` | Show Claude-role-to-Codex routing |
@@ -169,7 +171,68 @@ No model names are hard-coded. This allows the mapping to follow the live
 Codex catalog, while a preflight check ensures the installed translation proxy
 also understands every selected model.
 
+## Connection recovery
+
+Clodex reconnects after transient WebSocket resets, closures, timeouts, and
+retryable upstream failures when replay is safe. This includes a disconnect
+after thinking has streamed, as long as answer text or tool output has not
+started. Recovery is bounded to three reconnect attempts and a 60-second retry
+window; the initial generation has no new time limit.
+
+Connection notices appear on stderr, separately from the assistant's answer:
+
+```text
+[Clodex 1234abcd] Connection interrupted during thinking; reconnecting (1/3)
+[Clodex 1234abcd] Connection restored; continuing
+```
+
+Notices are scoped to the launch, including its subagents. They are also logged
+as `connection_recovery` events. Custom status lines can run
+`clodex statusline-connection` to display active recovery; it reads the
+child-only `CLODEX_NOTIFICATION_FILE` and makes no network requests.
+
+Once answer text or tool arguments have started, Clodex does not blindly
+replay them. Completed tool calls can be handed back normally; an unsafe or
+exhausted recovery produces an explicit error explaining that the turn needs
+to be retried. Replacing either binary requires closing all existing Clodex
+sessions so the shared supervisor and proxy can restart.
+
 ## Fast mode
+
+Start a session with fast mode locked on:
+
+```sh
+clodex --fast
+clodex --fast --resume
+clodex --fast --model gpt-6-astra
+```
+
+Put `--fast` before Claude arguments. It requests the Codex priority tier for
+models whose live catalog advertises fast support and whose proxy fast alias
+is available. It follows model switches, subagents, background requests, and
+compaction. Models without fast support use their normal tier. The setting is
+local to this launch; use `--fast` again when resuming a session.
+
+With `--fast`, Clodex owns the tier and disables Claude's native `/fast` toggle
+for that process, so it cannot switch your selected model or turn session fast
+mode off. Other sessions retain their own settings.
+
+For a custom status line, pass Claude's JSON to `clodex statusline-fast`:
+
+```sh
+input=$(cat)
+fast=$(printf '%s' "$input" | clodex statusline-fast)
+# Include "$fast" alongside your existing status-line segments.
+```
+
+The helper prints `FAST` for a supported current model, `FAST unavailable` for
+an unsupported model, and nothing in a launch without `--fast`. Before a model
+ID is available it prints `FAST (session)`. It uses the child-only environment
+variables `CLODEX_FAST` (`1` or `0`) and `CLODEX_FAST_ROUTES` (a JSON model-to-fast
+route map). The status line can also reference these directly. No network
+requests are made by the helper.
+
+Without the startup flag, the existing interactive toggle remains available:
 
 Inside a Clodex session, `/fast on` enables the Codex priority service tier for
 the model that is already selected. It does not switch the route to Fable,
