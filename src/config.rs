@@ -517,7 +517,11 @@ fn routed_window(
 }
 
 fn claude_context_window(route: &Route) -> u64 {
-    if route.display_name.starts_with("claude-haiku") {
+    let model = route
+        .model
+        .strip_prefix(ANTHROPIC_PREFIX)
+        .unwrap_or(&route.model);
+    if model.starts_with("claude-haiku") {
         CLAUDE_HAIKU_CONTEXT_WINDOW
     } else {
         CLAUDE_CONTEXT_WINDOW

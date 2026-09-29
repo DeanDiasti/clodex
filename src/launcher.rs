@@ -196,7 +196,17 @@ fn read_claude_login() -> Result<ClaudeLogin> {
         .env_remove("ANTHROPIC_AUTH_TOKEN")
         .output()
         .context("could not run `claude auth status`; is Claude Code installed?")?;
-    serde_json::from_slice(&output.stdout).context("could not read `claude auth status`")
+    // A logged-out Claude Code may still report its status as JSON, which
+    // carries a clearer answer than the exit status alone.
+    match serde_json::from_slice(&output.stdout) {
+        Ok(status) => Ok(status),
+        Err(_) if !output.status.success() => bail!(
+            "`claude auth status` failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => Err(error).context("could not read `claude auth status`"),
+    }
 }
 
 fn configure_fast_bridge(command: &mut Command, supported: bool, initial_model: &str) {
