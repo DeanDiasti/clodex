@@ -6,11 +6,15 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::Catalog;
-use crate::mapping::ModelMapping;
+use crate::mapping::{ANTHROPIC_PREFIX, ModelMapping, Provider, Route};
 
 const CONFIG_VERSION: u32 = 1;
 const DEFAULT_COMPACT_AT_PERCENT: u8 = 90;
 const MAX_COMPACT_AT_PERCENT: u8 = 95;
+/// Context windows for Claude models reached through the subscription. Every
+/// current Fable, Opus, and Sonnet model accepts 1M tokens; Haiku accepts 200K.
+const CLAUDE_CONTEXT_WINDOW: u64 = 1_000_000;
+const CLAUDE_HAIKU_CONTEXT_WINDOW: u64 = 200_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
@@ -20,6 +24,27 @@ pub struct AppConfig {
     pub codex: CodexConfig,
     pub compaction: CompactionConfig,
     pub permissions: PermissionsConfig,
+    pub routes: RoutesConfig,
+}
+
+/// Claude models, reached through the user's own Claude subscription, that
+/// replace the automatic Codex model for a Claude Code role.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RoutesConfig {
+    pub fable: Option<String>,
+    pub opus: Option<String>,
+    pub sonnet: Option<String>,
+    /// The hidden role Claude Code uses for background requests.
+    pub haiku: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Fable,
+    Opus,
+    Sonnet,
+    Haiku,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -68,6 +93,7 @@ impl Default for AppConfig {
             codex: CodexConfig::default(),
             compaction: CompactionConfig::default(),
             permissions: PermissionsConfig::default(),
+            routes: RoutesConfig::default(),
         }
     }
 }
@@ -141,7 +167,8 @@ impl AppConfig {
             );
         }
         validate_compact_at_percent(self.context.compact_at_percent)?;
-        self.permissions.validate()
+        self.permissions.validate()?;
+        self.routes.validate()
     }
 
     pub fn render(&self) -> String {
@@ -156,7 +183,8 @@ impl AppConfig {
              Compact at:     {}%\n\
              Codex transport: {}\n\
              Hierarchical compaction: {}\n\
-             Trusted tools:  {}\n",
+             Trusted tools:  {}\n\
+             Claude routes:  {}\n",
             self.context.render_limit(),
             self.context.compact_at_percent,
             self.codex.transport.as_str(),
@@ -165,7 +193,8 @@ impl AppConfig {
             } else {
                 "off"
             },
-            trusted_tools
+            trusted_tools,
+            self.routes.render()
         )
     }
 
@@ -239,6 +268,87 @@ impl CodexTransport {
             Self::Http => "http",
             Self::Websocket => "websocket",
             Self::Auto => "auto",
+        }
+    }
+}
+
+impl Role {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fable" => Ok(Self::Fable),
+            "opus" => Ok(Self::Opus),
+            "sonnet" => Ok(Self::Sonnet),
+            "haiku" => Ok(Self::Haiku),
+            _ => bail!("invalid role {value:?}; expected fable, opus, sonnet, or haiku"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fable => "fable",
+            Self::Opus => "opus",
+            Self::Sonnet => "sonnet",
+            Self::Haiku => "haiku",
+        }
+    }
+}
+
+impl RoutesConfig {
+    /// Routes `role` to a Claude model, or back to Codex with `codex`.
+    pub fn set(&mut self, role: Role, value: &str) -> Result<()> {
+        let value = value.trim();
+        let model = if value.eq_ignore_ascii_case("codex") {
+            None
+        } else {
+            let model = value.strip_prefix(ANTHROPIC_PREFIX).unwrap_or(value);
+            validate_claude_model(model)?;
+            Some(model.to_string())
+        };
+        *self.slot(role) = model;
+        Ok(())
+    }
+
+    fn slot(&mut self, role: Role) -> &mut Option<String> {
+        match role {
+            Role::Fable => &mut self.fable,
+            Role::Opus => &mut self.opus,
+            Role::Sonnet => &mut self.sonnet,
+            Role::Haiku => &mut self.haiku,
+        }
+    }
+
+    fn entries(&self) -> [(Role, &Option<String>); 4] {
+        [
+            (Role::Fable, &self.fable),
+            (Role::Opus, &self.opus),
+            (Role::Sonnet, &self.sonnet),
+            (Role::Haiku, &self.haiku),
+        ]
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (_, model) in self.entries() {
+            if let Some(model) = model {
+                validate_claude_model(model)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn render(&self) -> String {
+        let configured: Vec<String> = self
+            .entries()
+            .into_iter()
+            .filter_map(|(role, model)| {
+                model
+                    .as_ref()
+                    .map(|model| format!("{} → {model}", role.as_str()))
+            })
+            .collect();
+        if configured.is_empty() {
+            "none".to_string()
+        } else {
+            configured.join(", ")
         }
     }
 }
@@ -376,14 +486,14 @@ fn legacy_config_path() -> Result<PathBuf> {
 
 fn smallest_mapped_context(catalog: &Catalog, mapping: &ModelMapping) -> Result<u64> {
     routed_window(catalog, mapping, |model| model.context_window)
-        .context("mapped Codex models did not report a context window")
+        .context("mapped models did not report a context window")
 }
 
 /// The largest capacity every routed model will actually accept. Claude Code
 /// must never be told it has more room than this.
 pub fn routed_context_ceiling(catalog: &Catalog, mapping: &ModelMapping) -> Result<u64> {
     routed_window(catalog, mapping, |model| model.usable_context_window())
-        .context("mapped Codex models did not report a context window")
+        .context("mapped models did not report a context window")
 }
 
 fn routed_window(
@@ -391,22 +501,38 @@ fn routed_window(
     mapping: &ModelMapping,
     window: impl Fn(&crate::catalog::Model) -> Option<u64>,
 ) -> Option<u64> {
-    let routed = [
-        mapping.fable.model.as_str(),
-        mapping.opus.model.as_str(),
-        mapping.sonnet.model.as_str(),
-    ];
-
-    routed
-        .iter()
-        .filter_map(|slug| {
-            catalog
+    // The hidden Haiku role only carries short background requests, so it
+    // does not constrain the window of the selectable roles.
+    [&mapping.fable, &mapping.opus, &mapping.sonnet]
+        .into_iter()
+        .filter_map(|route| match route.provider {
+            Provider::Codex => catalog
                 .models
                 .iter()
-                .find(|model| model.slug == *slug)
-                .and_then(&window)
+                .find(|model| model.slug == route.model)
+                .and_then(&window),
+            Provider::Anthropic => Some(claude_context_window(route)),
         })
         .min()
+}
+
+fn claude_context_window(route: &Route) -> u64 {
+    if route.display_name.starts_with("claude-haiku") {
+        CLAUDE_HAIKU_CONTEXT_WINDOW
+    } else {
+        CLAUDE_CONTEXT_WINDOW
+    }
+}
+
+fn validate_claude_model(model: &str) -> Result<()> {
+    let valid = model.starts_with("claude-")
+        && model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'));
+    if !valid {
+        bail!("invalid Claude model {model:?}; expected an ID such as claude-opus-5-5, or codex");
+    }
+    Ok(())
 }
 
 fn validate_compact_at_percent(percent: u8) -> Result<()> {
@@ -640,6 +766,61 @@ mod tests {
     }
 
     #[test]
+    fn claude_routes_contribute_their_own_window() {
+        let catalog = extended_catalog();
+        let routes = RoutesConfig {
+            opus: Some("claude-opus-5-5".to_string()),
+            ..RoutesConfig::default()
+        };
+        let mapping = ModelMapping::resolve(&catalog, &routes).unwrap();
+        // The Codex ceiling is below Claude's 1M window, so it still governs.
+        assert_eq!(
+            AppConfig::default()
+                .effective_context_capacity(&catalog, &mapping)
+                .unwrap(),
+            828_400
+        );
+
+        let all_claude = RoutesConfig {
+            fable: Some("claude-fable-5-1".to_string()),
+            opus: Some("claude-opus-5-5".to_string()),
+            sonnet: Some("claude-haiku-4-5".to_string()),
+            haiku: None,
+        };
+        let mapping = ModelMapping::resolve(&catalog, &all_claude).unwrap();
+        assert_eq!(
+            AppConfig::default()
+                .effective_context_capacity(&catalog, &mapping)
+                .unwrap(),
+            200_000
+        );
+    }
+
+    #[test]
+    fn routes_accept_claude_ids_and_reset_to_codex() {
+        let mut routes = RoutesConfig::default();
+        routes.set(Role::Opus, "claude-opus-5-5").unwrap();
+        routes
+            .set(Role::Haiku, "anthropic/claude-haiku-4-5")
+            .unwrap();
+        assert_eq!(routes.opus.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(routes.haiku.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(
+            routes.render(),
+            "opus → claude-opus-5-5, haiku → claude-haiku-4-5"
+        );
+
+        routes.set(Role::Opus, "codex").unwrap();
+        assert_eq!(routes.opus, None);
+
+        for invalid in ["gpt-5.6-sol", "", "claude-opus 5", "claude-x\ny"] {
+            assert!(routes.set(Role::Sonnet, invalid).is_err(), "{invalid:?}");
+        }
+        assert!(Role::parse("OPUS").is_ok());
+        assert!(Role::parse("gpt").is_err());
+    }
+
+    #[test]
     fn rejects_compaction_above_claude_codes_effective_maximum() {
         let mut context = ContextConfig::default();
         assert!(context.set_compact_at_percent(96).is_err());
@@ -731,6 +912,7 @@ mod tests {
         assert!(empty.contains("Context ceiling: auto"));
         assert!(empty.contains("Codex transport: http"));
         assert!(empty.contains("Trusted tools:  none"));
+        assert!(empty.contains("Claude routes:  none"));
 
         let mut configured = AppConfig::default();
         configured.context.max_tokens = Some(600_000);

@@ -136,6 +136,7 @@ configuration and logs are no longer wanted.
 | `clodex config context <auto\|tokens>` | Set context capacity |
 | `clodex config compact-at <1..95>` | Set the auto-compaction percentage |
 | `clodex config hierarchical-compaction <on\|off>` | Fold an oversized compaction into rounds |
+| `clodex config route <role> <claude-model\|codex>` | Route a role to a Claude model on your subscription |
 | `clodex config allow-tool <exact-name>` | Trust one tool for sessions and subagents |
 | `clodex config forget-tool <exact-name>` | Remove a trusted tool |
 | `clodex config path` | Print the configuration path |
@@ -166,6 +167,44 @@ closest available route.
 No model names are hard-coded. This allows the mapping to follow the live
 Codex catalog, while a preflight check ensures the installed translation proxy
 also understands every selected model.
+
+## Claude models on your Claude subscription
+
+Any role can use a real Claude model instead of its Codex model. Claude-routed
+requests reuse Claude Code's own subscription login and count against your
+Claude plan's usage limits, exactly as an ordinary `claude` session does:
+
+```sh
+clodex config route opus claude-opus-5-5
+clodex config route haiku claude-haiku-4-5
+clodex config route opus codex      # back to the automatic Codex model
+clodex models map
+```
+
+Roles are `fable`, `opus`, `sonnet`, and the hidden background `haiku` role.
+Unrouted roles keep their automatic Codex model, so a session can mix both
+providers and switch between them from the model picker.
+
+Clodex never reads, copies, or stores the Claude credential. When a Claude
+route is configured, the launched Claude Code process keeps its own login
+instead of the local placeholder token, and the bridge splits traffic by
+model:
+
+```text
+anthropic/claude-*  → prefix removed, forwarded unchanged → api.anthropic.com
+everything else     → Claude credential and OAuth beta removed → Codex proxy
+```
+
+Routed models appear to Claude Code as `anthropic/<model>`. Claude Code treats
+that exactly like the bare ID, and the prefix keeps a real Claude route
+distinct from the `claude-*` names fast mode uses while it shadows a Codex
+model. `/fast` on a Claude route uses Anthropic's own fast mode.
+
+`clodex` refuses to start a Claude route unless `claude auth status` reports
+a Claude subscription login. Context capacity follows the smallest routed
+window: 1M for current Fable, Opus, and Sonnet models, 200K for Haiku.
+Hierarchical compaction currently applies to Codex routes only; a
+Claude-routed compaction is forwarded unchanged.
 
 ## Fast mode
 

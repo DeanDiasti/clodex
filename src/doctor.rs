@@ -42,6 +42,7 @@ pub fn run() -> Result<()> {
         Err(error) => println!("  {:<20} unavailable ({error:#})", "Credential reuse"),
     }
 
+    print_claude_login(&app_config);
     println!(
         "  {:<20} {}",
         "Configured transport",
@@ -64,7 +65,7 @@ pub fn run() -> Result<()> {
 /// recover from.
 fn print_context_ceiling(app_config: &config::AppConfig) {
     let resolved = Catalog::load_from_codex().and_then(|catalog| {
-        let mapping = ModelMapping::from_catalog(&catalog)?;
+        let mapping = ModelMapping::resolve(&catalog, &app_config.routes)?;
         let ceiling = config::routed_context_ceiling(&catalog, &mapping)?;
         let capacity = app_config.effective_context_capacity(&catalog, &mapping)?;
         Ok((ceiling, capacity))
@@ -82,6 +83,22 @@ fn print_context_ceiling(app_config: &config::AppConfig) {
         }
         Err(error) => println!("  {:<20} unavailable ({error:#})", "Context capacity"),
     }
+}
+
+/// Claude routes reuse Claude Code's own subscription login, so only its
+/// presence matters; Clodex never reads the credential itself.
+fn print_claude_login(app_config: &config::AppConfig) {
+    let routed = app_config.routes != config::RoutesConfig::default();
+    let status = match crate::launcher::claude_login_status() {
+        Ok(status) => status,
+        Err(error) => format!("unavailable ({error:#})"),
+    };
+    let note = if routed {
+        ""
+    } else {
+        " (no Claude routes configured)"
+    };
+    println!("  {:<20} {status}{note}", "Claude login");
 }
 
 fn print_tool(label: &str, executable: &str, args: &[&str]) {

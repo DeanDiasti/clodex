@@ -110,6 +110,13 @@ enum ConfigCommand {
         /// Tool name, such as mcp__codebase-memory-mcp__search_code.
         tool: String,
     },
+    /// Route a Claude Code role to a Claude model on your Claude subscription.
+    Route {
+        /// One of: fable, opus, sonnet, or haiku.
+        role: String,
+        /// A Claude model ID, such as claude-opus-5-5, or "codex" to reset.
+        model: String,
+    },
     /// Remove a tool from Clodex's trusted allowlist.
     ForgetTool {
         /// Exact tool name to remove.
@@ -192,7 +199,8 @@ fn run_models(args: ModelsArgs) -> Result<()> {
             }
         }
         ModelsCommand::Map => {
-            let mapping = ModelMapping::from_catalog(&catalog)?;
+            let config = config::AppConfig::load()?;
+            let mapping = ModelMapping::resolve(&catalog, &config.routes)?;
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&mapping)?);
             } else {
@@ -216,11 +224,11 @@ fn run_config(args: ConfigArgs) -> Result<()> {
             config.context.max_tokens = config::parse_context_limit(&value)?;
             config.save()?;
             let catalog = Catalog::load_from_codex()?;
-            let mapping = ModelMapping::from_catalog(&catalog)?;
+            let mapping = ModelMapping::resolve(&catalog, &config.routes)?;
             let effective = config.effective_context_capacity(&catalog, &mapping)?;
             match config.context.max_tokens {
                 Some(requested) if effective < requested => println!(
-                    "Context ceiling set to {requested} tokens. The current Codex catalog caps Clodex at {effective} tokens."
+                    "Context ceiling set to {requested} tokens. The routed models cap Clodex at {effective} tokens."
                 ),
                 _ => println!(
                     "Default context window set to {} for all clodex instances.",
@@ -260,6 +268,21 @@ fn run_config(args: ConfigArgs) -> Result<()> {
                 if enabled { "enabled" } else { "disabled" }
             );
         }
+        ConfigCommand::Route { role, model } => {
+            let role = config::Role::parse(&role)?;
+            let mut config = config::AppConfig::load()?;
+            config.routes.set(role, &model)?;
+            config.save()?;
+            println!(
+                "{} now routes to {}. Start a new Clodex session to apply it.",
+                role.as_str(),
+                if model.trim().eq_ignore_ascii_case("codex") {
+                    "the automatic Codex model"
+                } else {
+                    "your Claude subscription"
+                }
+            );
+        }
         ConfigCommand::AllowTool { tool } => {
             let mut config = config::AppConfig::load()?;
             if config.permissions.trust(&tool)? {
@@ -287,7 +310,7 @@ fn run_config(args: ConfigArgs) -> Result<()> {
 fn run_context() -> Result<()> {
     let config = config::AppConfig::load()?;
     let catalog = Catalog::load_from_codex()?;
-    let mapping = ModelMapping::from_catalog(&catalog)?;
+    let mapping = ModelMapping::resolve(&catalog, &config.routes)?;
     print!("{}", config.render_effective_context(&catalog, &mapping)?);
     Ok(())
 }
