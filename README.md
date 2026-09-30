@@ -228,6 +228,14 @@ Code reads the cache without a credential, so its own subscription login is
 untouched. The bridge declines the discovery fetch itself, because a successful
 fetch would replace the list with one filtered to Claude-looking IDs.
 
+The same models are also passed as Claude Code's curated `modelPicker` rows
+for the launched process. Claude Code otherwise checks a model it does not
+recognise with a one-token request the first time `/model <name>` or `--model`
+names it in a session, which costs a full Codex round trip, about a second or
+more, before the switch completes. Listed models switch immediately. These rows
+take the place of a `modelPicker` in your own user settings for Clodex
+sessions.
+
 The Agent tool's `model` parameter only accepts the four role aliases, so
 Clodex also passes one `--agents` definition per listed model, such as
 `codex-gpt-6-luna` or `claude-sonnet-5-5`. Ask for a subagent on a specific

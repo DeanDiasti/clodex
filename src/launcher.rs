@@ -107,7 +107,10 @@ fn build_claude_command(
     models: &[picker::Entry],
 ) -> Result<Command> {
     let mut command = Command::new("claude");
-    command.args(["--settings", &launch_settings(config, Some(proxy_port))?]);
+    command.args([
+        "--settings",
+        &launch_settings(config, Some(proxy_port), models)?,
+    ]);
     // A user's own --agents takes precedence over the per-model agents.
     let user_agents = claude_args.iter().any(|argument| argument == "--agents");
     if !models.is_empty() && !user_agents {
@@ -294,10 +297,17 @@ fn configure_model_context(
         );
 }
 
-fn launch_settings(config: &AppConfig, bridge_port: Option<u16>) -> Result<String> {
+fn launch_settings(
+    config: &AppConfig,
+    bridge_port: Option<u16>,
+    models: &[picker::Entry],
+) -> Result<String> {
     let mut settings = serde_json::json!({
         "theme": "custom:clodex",
     });
+    if let Some(model_picker) = picker::model_picker(models) {
+        settings["modelPicker"] = model_picker;
+    }
     if !config.permissions.trusted_tools.is_empty() {
         settings["permissions"] = serde_json::json!({
             "allow": config.permissions.trusted_tools,
@@ -441,13 +451,39 @@ mod tests {
             .unwrap();
 
         let settings: serde_json::Value =
-            serde_json::from_str(&launch_settings(&config, None).unwrap()).unwrap();
+            serde_json::from_str(&launch_settings(&config, None, &[]).unwrap()).unwrap();
 
         assert_eq!(settings["theme"], "custom:clodex");
         assert_eq!(
             settings["permissions"]["allow"],
             serde_json::json!(["mcp__codebase-memory-mcp__search_code"])
         );
+    }
+
+    #[test]
+    fn launch_settings_list_every_model_as_a_curated_picker_row() {
+        let models = [picker::Entry {
+            id: "gpt-6-luna".to_string(),
+            display_name: "GPT-6-Luna".to_string(),
+            description: "Codex".to_string(),
+            agent: "codex-gpt-6-luna".to_string(),
+        }];
+        let settings: serde_json::Value =
+            serde_json::from_str(&launch_settings(&AppConfig::default(), None, &models).unwrap())
+                .unwrap();
+        assert_eq!(
+            settings["modelPicker"],
+            serde_json::json!({"options": [{
+                "model": "gpt-6-luna",
+                "label": "GPT-6-Luna",
+                "description": "Codex",
+            }]})
+        );
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&launch_settings(&AppConfig::default(), None, &[]).unwrap())
+                .unwrap();
+        assert!(settings.get("modelPicker").is_none());
     }
 
     #[test]
@@ -597,7 +633,8 @@ mod tests {
     #[test]
     fn launch_settings_omit_permissions_when_no_tools_are_trusted() {
         let settings: serde_json::Value =
-            serde_json::from_str(&launch_settings(&AppConfig::default(), None).unwrap()).unwrap();
+            serde_json::from_str(&launch_settings(&AppConfig::default(), None, &[]).unwrap())
+                .unwrap();
         assert_eq!(settings["theme"], "custom:clodex");
         assert!(settings.get("permissions").is_none());
     }
