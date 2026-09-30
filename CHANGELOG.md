@@ -13,6 +13,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The bridge forwards Claude-routed requests to Anthropic with Claude Code's
   own login, strips that credential from every Codex-bound request, and
   `clodex doctor` reports the Claude login.
+- Every routable Codex model, and with a subscription every current Claude
+  model, in the `/model` picker, plus one subagent type per model so subagents
+  can run on either provider.
 - Configurable Codex transport with `clodex config transport`, while retaining
   HTTP SSE as the concurrency-safe default.
 - Configured transport reporting in `clodex doctor` and recovery guidance for

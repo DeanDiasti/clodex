@@ -206,6 +206,30 @@ window: 1M for current Fable, Opus, and Sonnet models, 200K for Haiku.
 Hierarchical compaction currently applies to Codex routes only; a
 Claude-routed compaction is forwarded unchanged.
 
+## Every model in `/model` and in subagents
+
+Each launch lists every Codex model the installed proxy can route in Claude
+Code's `/model` picker, after the four roles. With a Claude subscription login,
+the current Claude models are listed as well, even when no role is routed to
+one.
+
+Clodex writes that list into Claude Code's model-discovery cache
+(`~/.claude/cache/gateway-models.json`, or under `CLAUDE_CONFIG_DIR`) for the
+bridge's address, and enables discovery for the launched process only. Claude
+Code reads the cache without a credential, so its own subscription login is
+untouched. The bridge declines the discovery fetch itself, because a successful
+fetch would replace the list with one filtered to Claude-looking IDs.
+
+The Agent tool's `model` parameter only accepts the four role aliases, so
+Clodex also passes one `--agents` definition per listed model, such as
+`codex-gpt-6-luna` or `claude-sonnet-5-5`. Ask for a subagent on a specific
+model and Claude Code can delegate to either provider. Passing your own
+`--agents` replaces these definitions.
+
+The context capacity still follows the four roles. A model listed only in the
+picker keeps its own limit, so a conversation larger than that model accepts
+must compact before switching to it.
+
 ## Fast mode
 
 Inside a Clodex session, `/fast on` enables the Codex priority service tier for

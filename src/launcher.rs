@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use crate::catalog::Catalog;
 use crate::config::AppConfig;
 use crate::mapping::{ModelMapping, Provider, Route};
-use crate::supervisor;
+use crate::{picker, supervisor};
 
 const CLODEX_THEME: &str = r##"{
   "name": "Clodex",
@@ -33,7 +33,8 @@ pub fn run(claude_args: Vec<OsString>) -> Result<()> {
     }
     let catalog = Catalog::load_from_codex()?;
     let mapping = ModelMapping::resolve(&catalog, &config.routes)?;
-    supervisor::proxy_models_support(&mapping.codex_models())?;
+    let proxy_listing = supervisor::proxy_listed_models()?;
+    supervisor::proxy_models_support(&proxy_listing, &mapping.codex_models())?;
     if mapping.uses_anthropic() {
         require_claude_subscription()?;
     }
@@ -51,6 +52,18 @@ pub fn run(claude_args: Vec<OsString>) -> Result<()> {
             "Claude routes need the current Clodex supervisor. Close every active Clodex session, then start a new one"
         );
     }
+    // With a subscription login, Claude models are offered even when no role
+    // is routed to one, so Claude Code keeps that login for every request.
+    let claude = supports_fast_bridge && has_claude_subscription();
+    let models = picker::entries(&catalog, &proxy_listing, claude);
+    if let Err(error) =
+        picker::write_gateway_cache(&format!("http://127.0.0.1:{proxy_port}"), &models, &mapping)
+    {
+        // The picker is a convenience; routing works without it.
+        if io::stderr().is_terminal() {
+            eprintln!("\x1b[33m!\x1b[0m Could not list every model in /model: {error:#}");
+        }
+    }
     ensure_clodex_theme()?;
 
     print_banner(
@@ -66,6 +79,8 @@ pub fn run(claude_args: Vec<OsString>) -> Result<()> {
         context_capacity,
         proxy_port,
         supports_fast_bridge,
+        claude,
+        &models,
     )?;
 
     let status = command
@@ -80,6 +95,7 @@ pub fn run(claude_args: Vec<OsString>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_claude_command(
     claude_args: Vec<OsString>,
     mapping: &ModelMapping,
@@ -87,17 +103,28 @@ fn build_claude_command(
     context_capacity: u64,
     proxy_port: u16,
     supports_fast_bridge: bool,
+    claude: bool,
+    models: &[picker::Entry],
 ) -> Result<Command> {
     let mut command = Command::new("claude");
+    command.args(["--settings", &launch_settings(config, Some(proxy_port))?]);
+    // A user's own --agents takes precedence over the per-model agents.
+    let user_agents = claude_args.iter().any(|argument| argument == "--agents");
+    if !models.is_empty() && !user_agents {
+        command.args(["--agents", &picker::agents_json(models)]);
+    }
     command
-        .args(["--settings", &launch_settings(config, Some(proxy_port))?])
         .args(claude_args)
         .env(
             "ANTHROPIC_BASE_URL",
             format!("http://127.0.0.1:{proxy_port}"),
         )
         .env_remove("ANTHROPIC_API_KEY");
-    if mapping.uses_anthropic() {
+    if !models.is_empty() {
+        // Reads the model list Clodex wrote into the discovery cache.
+        command.env("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1");
+    }
+    if claude {
         // Claude Code then authenticates with its own subscription login. The
         // bridge forwards that credential to Anthropic only, and strips it
         // from every request bound for Codex.
@@ -167,6 +194,11 @@ pub fn claude_login_status() -> Result<String> {
         (true, None) => "logged in".to_string(),
         (false, _) => "not logged in".to_string(),
     })
+}
+
+fn has_claude_subscription() -> bool {
+    read_claude_login()
+        .is_ok_and(|status| status.logged_in && status.auth_method.as_deref() == Some("claude.ai"))
 }
 
 fn require_claude_subscription() -> Result<()> {
@@ -452,6 +484,8 @@ mod tests {
             600_000,
             41_234,
             true,
+            false,
+            &[],
         )
         .unwrap();
 
@@ -589,6 +623,8 @@ mod tests {
             600_000,
             41_234,
             true,
+            true,
+            &[],
         )
         .unwrap();
 
@@ -610,6 +646,58 @@ mod tests {
         assert_eq!(
             value("ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION"),
             Some(Some("Top available Codex model".into()))
+        );
+    }
+
+    #[test]
+    fn listed_models_enable_the_picker_and_a_subagent_per_model() {
+        let models = vec![picker::Entry {
+            id: "gpt-6-luna".to_string(),
+            display_name: "GPT-6-Luna".to_string(),
+            description: "Codex".to_string(),
+            agent: "codex-gpt-6-luna".to_string(),
+        }];
+        let command = build_claude_command(
+            vec![OsString::from("--resume")],
+            &mapping(),
+            &AppConfig::default(),
+            600_000,
+            41_234,
+            true,
+            true,
+            &models,
+        )
+        .unwrap();
+
+        let arguments: Vec<_> = command.get_args().collect();
+        assert_eq!(arguments[2], "--agents");
+        let agents: serde_json::Value =
+            serde_json::from_str(arguments[3].to_str().unwrap()).unwrap();
+        assert_eq!(agents["codex-gpt-6-luna"]["model"], "gpt-6-luna");
+        assert_eq!(arguments[4], "--resume");
+        assert!(command.get_envs().any(|(name, value)| {
+            name == "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" && value == Some(OsStr::new("1"))
+        }));
+
+        // A user's own --agents is left in charge.
+        let command = build_claude_command(
+            vec![OsString::from("--agents"), OsString::from("{}")],
+            &mapping(),
+            &AppConfig::default(),
+            600_000,
+            41_234,
+            true,
+            true,
+            &models,
+        )
+        .unwrap();
+        let arguments: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            arguments
+                .iter()
+                .filter(|argument| **argument == "--agents")
+                .count(),
+            1
         );
     }
 

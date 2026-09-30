@@ -6,6 +6,7 @@ mod doctor;
 mod fast_bridge;
 mod launcher;
 mod mapping;
+mod picker;
 mod supervisor;
 
 use std::ffi::OsString;

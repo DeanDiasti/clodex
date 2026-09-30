@@ -300,7 +300,28 @@ fn accept_lease(stream: &mut UnixStream, proxy_port: u16) -> bool {
         .is_ok()
 }
 
-pub fn proxy_models_support(models: &[&str]) -> Result<()> {
+/// Fails unless the proxy, as described by [`proxy_listed_models`], can route
+/// every one of `models`.
+pub fn proxy_models_support(listed: &str, models: &[&str]) -> Result<()> {
+    let unsupported = unsupported_proxy_models(listed, models);
+    if !unsupported.is_empty() {
+        bail!(
+            "the installed translation proxy does not support the current Codex model(s): {}. Upgrade `claude-code-proxy` and try again",
+            unsupported.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Whether the installed translation proxy can route `model`, given the
+/// output of [`proxy_listed_models`].
+pub fn proxy_lists_model(listed: &str, model: &str) -> bool {
+    unsupported_proxy_models(listed, &[model]).is_empty()
+}
+
+/// The raw `claude-code-proxy models` listing, after confirming the proxy is
+/// new enough for the fast bridge.
+pub fn proxy_listed_models() -> Result<String> {
     let version = Command::new("claude-code-proxy")
         .arg("--version")
         .output()
@@ -321,15 +342,7 @@ pub fn proxy_models_support(models: &[&str]) -> Result<()> {
         bail!("claude-code-proxy could not list its supported models");
     }
 
-    let listed = String::from_utf8_lossy(&output.stdout);
-    let unsupported = unsupported_proxy_models(&listed, models);
-    if !unsupported.is_empty() {
-        bail!(
-            "the installed translation proxy does not support the current Codex model(s): {}. Upgrade `claude-code-proxy` and try again",
-            unsupported.join(", ")
-        );
-    }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn proxy_version_supports_fast(output: &str) -> bool {

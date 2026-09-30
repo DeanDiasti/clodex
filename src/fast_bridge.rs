@@ -117,6 +117,7 @@ impl FastBridge {
                 let app = Router::new()
                     .route("/__clodex/health", get(health))
                     .route("/__clodex/compaction/arm", post(arm_compaction))
+                    .route("/v1/models", get(decline_model_discovery))
                     .fallback(proxy)
                     .with_state(state);
                 let _ = ready_tx.send(Ok::<(), String>(()));
@@ -162,6 +163,14 @@ async fn health() -> impl IntoResponse {
         "service": "clodex-fast-bridge",
         "version": 1
     }))
+}
+
+/// Declines Claude Code's gateway model discovery. The launcher writes the
+/// full model list into Claude Code's discovery cache; a successful fetch
+/// would replace it with a list filtered to Claude-looking IDs, which drops
+/// every Codex model. A non-OK status leaves the cache untouched.
+async fn decline_model_discovery() -> impl IntoResponse {
+    StatusCode::NOT_FOUND
 }
 
 /// Records that Claude Code is about to compact this session.
@@ -1346,6 +1355,19 @@ mod tests {
         drop(bridge);
         codex.join().unwrap();
         anthropic.join().unwrap();
+    }
+
+    #[test]
+    fn model_discovery_is_declined_so_the_launch_list_survives() {
+        let bridge = FastBridge::start(1, false, 0).unwrap();
+        let response = reqwest::blocking::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{}/v1/models?limit=1000",
+                bridge.port()
+            ))
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
