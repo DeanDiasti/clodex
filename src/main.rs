@@ -6,6 +6,7 @@ mod doctor;
 mod fast_bridge;
 mod launcher;
 mod mapping;
+mod picker;
 mod supervisor;
 
 use std::ffi::OsString;
@@ -29,7 +30,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Inspect reuse of the existing Codex CLI login.
+    /// Sign in to Codex with your ChatGPT account, or inspect the sign-in.
     Auth(AuthArgs),
     /// Inspect the live model catalog exposed by Codex.
     Models(ModelsArgs),
@@ -37,7 +38,7 @@ enum Command {
     Config(ConfigArgs),
     /// Show the effective context settings for the current model catalog.
     Context,
-    /// Check the local Claude, Codex, and proxy prerequisites.
+    /// Check the local Claude, Codex sign-in, and backend prerequisites.
     Doctor,
     #[command(name = "__supervisor", hide = true)]
     Supervisor,
@@ -51,9 +52,18 @@ struct AuthArgs {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
-    /// Verify that the existing Codex login can be reused securely.
+    /// Show which Codex sign-in Clodex uses and verify it can be read securely.
     Status,
-    /// Ask Codex to refresh its managed login and sync the active proxy.
+    /// Sign in to Codex with your ChatGPT account. No Codex CLI is needed.
+    Login {
+        /// Sign in with a one-time code instead of a local browser, such as
+        /// over SSH.
+        #[arg(long)]
+        device: bool,
+    },
+    /// Remove Clodex's own Codex sign-in.
+    Logout,
+    /// Refresh the Codex sign-in and sync the running backend.
     Sync,
 }
 
@@ -100,6 +110,11 @@ enum ConfigCommand {
         /// One of: http, websocket, or auto.
         value: String,
     },
+    /// Select the built-in Codex translator or the external claude-code-proxy.
+    Backend {
+        /// One of: builtin or proxy.
+        value: String,
+    },
     /// Fold an oversized compaction into rounds that each fit the window.
     HierarchicalCompaction {
         /// One of: on or off.
@@ -109,6 +124,13 @@ enum ConfigCommand {
     AllowTool {
         /// Tool name, such as mcp__codebase-memory-mcp__search_code.
         tool: String,
+    },
+    /// Route a Claude Code role to a Claude model on your Claude subscription.
+    Route {
+        /// One of: fable, opus, sonnet, or haiku.
+        role: String,
+        /// A Claude model ID, such as claude-opus-5-5, or "codex" to reset.
+        model: String,
     },
     /// Remove a tool from Clodex's trusted allowlist.
     ForgetTool {
@@ -164,21 +186,42 @@ fn run_auth(args: AuthArgs) -> Result<()> {
     match args.command.unwrap_or(AuthCommand::Status) {
         AuthCommand::Status => {
             let status = auth::prepare_codex_credentials()?;
-            println!("Codex credential reuse is ready.");
-            println!("  Authentication: {}", status.auth_mode);
-            println!("  Source: {}", status.source.display());
+            println!("Codex sign-in is ready.");
+            println!("  Source: {}", status.source.describe());
+            if let Some(account) = status.account {
+                println!("  Account: {account}");
+            }
+            println!("  File: {}", status.path.display());
             println!("  Token: loaded securely in memory and not displayed");
+        }
+        AuthCommand::Login { device } => {
+            let summary = auth::login(device)?;
+            match summary.account {
+                Some(account) => println!("Signed in to Codex as {account}."),
+                None => println!("Signed in to Codex."),
+            }
+            println!("  Saved to {}", summary.path.display());
+        }
+        AuthCommand::Logout => {
+            if auth::logout()? {
+                println!("Removed Clodex's Codex sign-in.");
+            } else {
+                println!("Clodex had no Codex sign-in of its own.");
+            }
+            if auth::codex_auth_path()?.exists() {
+                println!("Clodex will fall back to the Codex CLI's login.");
+            }
         }
         AuthCommand::Sync => {
             supervisor::sync_active_credentials()?;
-            println!("Codex refreshed its managed login and Clodex synchronized the proxy.");
+            println!("Refreshed the Codex sign-in and synchronized the running backend.");
         }
     }
     Ok(())
 }
 
 fn run_models(args: ModelsArgs) -> Result<()> {
-    let catalog = Catalog::load_from_codex()?;
+    let catalog = Catalog::load()?;
 
     match args.command.unwrap_or(ModelsCommand::List) {
         ModelsCommand::List => {
@@ -192,7 +235,8 @@ fn run_models(args: ModelsArgs) -> Result<()> {
             }
         }
         ModelsCommand::Map => {
-            let mapping = ModelMapping::from_catalog(&catalog)?;
+            let config = config::AppConfig::load()?;
+            let mapping = ModelMapping::resolve(&catalog, &config.routes)?;
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&mapping)?);
             } else {
@@ -215,12 +259,12 @@ fn run_config(args: ConfigArgs) -> Result<()> {
             let mut config = config::AppConfig::load()?;
             config.context.max_tokens = config::parse_context_limit(&value)?;
             config.save()?;
-            let catalog = Catalog::load_from_codex()?;
-            let mapping = ModelMapping::from_catalog(&catalog)?;
+            let catalog = Catalog::load()?;
+            let mapping = ModelMapping::resolve(&catalog, &config.routes)?;
             let effective = config.effective_context_capacity(&catalog, &mapping)?;
             match config.context.max_tokens {
                 Some(requested) if effective < requested => println!(
-                    "Context ceiling set to {requested} tokens. The current Codex catalog caps Clodex at {effective} tokens."
+                    "Context ceiling set to {requested} tokens. The routed models cap Clodex at {effective} tokens."
                 ),
                 _ => println!(
                     "Default context window set to {} for all clodex instances.",
@@ -246,6 +290,15 @@ fn run_config(args: ConfigArgs) -> Result<()> {
                 config.codex.transport.as_str()
             );
         }
+        ConfigCommand::Backend { value } => {
+            let mut config = config::AppConfig::load()?;
+            config.codex.backend = config::CodexBackend::parse(&value)?;
+            config.save()?;
+            println!(
+                "Codex backend set to {}. Close every active Clodex session, then start a new one to apply it.",
+                config.codex.backend.as_str()
+            );
+        }
         ConfigCommand::HierarchicalCompaction { value } => {
             let enabled = match value.trim().to_ascii_lowercase().as_str() {
                 "on" | "true" | "enabled" => true,
@@ -258,6 +311,21 @@ fn run_config(args: ConfigArgs) -> Result<()> {
             println!(
                 "Hierarchical compaction {}. Start a new Clodex session to apply it.",
                 if enabled { "enabled" } else { "disabled" }
+            );
+        }
+        ConfigCommand::Route { role, model } => {
+            let role = config::Role::parse(&role)?;
+            let mut config = config::AppConfig::load()?;
+            config.routes.set(role, &model)?;
+            config.save()?;
+            println!(
+                "{} now routes to {}. Start a new Clodex session to apply it.",
+                role.as_str(),
+                if model.trim().eq_ignore_ascii_case("codex") {
+                    "the automatic Codex model"
+                } else {
+                    "your Claude subscription"
+                }
             );
         }
         ConfigCommand::AllowTool { tool } => {
@@ -286,8 +354,8 @@ fn run_config(args: ConfigArgs) -> Result<()> {
 
 fn run_context() -> Result<()> {
     let config = config::AppConfig::load()?;
-    let catalog = Catalog::load_from_codex()?;
-    let mapping = ModelMapping::from_catalog(&catalog)?;
+    let catalog = Catalog::load()?;
+    let mapping = ModelMapping::resolve(&catalog, &config.routes)?;
     print!("{}", config.render_effective_context(&catalog, &mapping)?);
     Ok(())
 }

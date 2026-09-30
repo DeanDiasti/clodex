@@ -20,8 +20,9 @@ Usage:
 
 Options:
   --root <directory>           Install under this directory (default: ~/.local).
-  --install-proxy              Install claude-code-proxy with Homebrew if absent.
-  --skip-prerequisite-checks   Skip checks for Claude, Codex, and the proxy.
+  --install-proxy              Install claude-code-proxy with Homebrew if absent,
+                               for `clodex config backend proxy`.
+  --skip-prerequisite-checks   Skip the check for Claude Code.
   -h, --help                   Show this help.
 
 Environment:
@@ -112,10 +113,7 @@ fi
 
 if [[ "${skip_prerequisite_checks}" == false ]]; then
   missing=()
-  command_exists codex || missing+=("Codex CLI (https://developers.openai.com/codex/cli)")
   command_exists claude || missing+=("Claude Code (https://code.claude.com/docs/en/setup)")
-  command_exists claude-code-proxy ||
-    missing+=("claude-code-proxy (rerun with --install-proxy, or install it separately)")
 
   if ((${#missing[@]} > 0)); then
     printf 'Missing required runtime prerequisites:\n' >&2
@@ -150,6 +148,6 @@ case ":${PATH}:" in
     ;;
 esac
 
-printf '\nNext checks:\n'
+printf '\nNext steps:\n'
+printf '  clodex auth login     # sign in to Codex with your ChatGPT account\n'
 printf '  clodex doctor\n'
-printf '  clodex auth status\n'

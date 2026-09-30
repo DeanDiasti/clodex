@@ -14,6 +14,8 @@ use futures_util::TryStreamExt;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+use crate::mapping::ANTHROPIC_PREFIX;
+
 const BRIDGE_HEADER: &str = "x-clodex-fast-bridge";
 const BRIDGE_HEADER_VALUE: &str = "1";
 const INITIAL_MODEL_HEADER: &str = "x-clodex-initial-model";
@@ -35,6 +37,12 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 const UPSTREAM_RETRIES: u32 = 2;
 /// Base backoff between those attempts, scaled by attempt number.
 const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
+/// Where Claude-routed requests go. Claude Code's own subscription credential
+/// travels with them unchanged.
+const ANTHROPIC_API: &str = "https://api.anthropic.com";
+/// The subscription beta Claude Code attaches to OAuth requests. It means
+/// nothing to Codex and is removed from the Codex route with the credential.
+const OAUTH_BETA_PREFIX: &str = "oauth-";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConversationKey {
@@ -52,6 +60,7 @@ struct RouteState {
 #[derive(Clone)]
 struct BridgeState {
     upstream_port: u16,
+    anthropic_base: String,
     client: reqwest::Client,
     hierarchical: bool,
     ceiling: u64,
@@ -67,6 +76,20 @@ impl FastBridge {
     /// `ceiling` is the capacity a fold round must fit inside; zero, or
     /// `hierarchical` unset, leaves every request forwarded untouched.
     pub fn start(upstream_port: u16, hierarchical: bool, ceiling: u64) -> Result<Self> {
+        Self::start_with(
+            upstream_port,
+            ANTHROPIC_API.to_string(),
+            hierarchical,
+            ceiling,
+        )
+    }
+
+    fn start_with(
+        upstream_port: u16,
+        anthropic_base: String,
+        hierarchical: bool,
+        ceiling: u64,
+    ) -> Result<Self> {
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).context("could not bind the Clodex fast bridge")?;
         listener.set_nonblocking(true)?;
@@ -84,6 +107,7 @@ impl FastBridge {
                     .context("could not adopt the Clodex fast bridge listener")?;
                 let state = std::sync::Arc::new(BridgeState {
                     upstream_port,
+                    anthropic_base,
                     client: reqwest::Client::builder()
                         .build()
                         .context("could not create the Clodex fast bridge client")?,
@@ -93,6 +117,7 @@ impl FastBridge {
                 let app = Router::new()
                     .route("/__clodex/health", get(health))
                     .route("/__clodex/compaction/arm", post(arm_compaction))
+                    .route("/v1/models", get(decline_model_discovery))
                     .fallback(proxy)
                     .with_state(state);
                 let _ = ready_tx.send(Ok::<(), String>(()));
@@ -138,6 +163,14 @@ async fn health() -> impl IntoResponse {
         "service": "clodex-fast-bridge",
         "version": 1
     }))
+}
+
+/// Declines Claude Code's gateway model discovery. The launcher writes the
+/// full model list into Claude Code's discovery cache; a successful fetch
+/// would replace it with a list filtered to Claude-looking IDs, which drops
+/// every Codex model. A non-OK status leaves the cache untouched.
+async fn decline_model_discovery() -> impl IntoResponse {
+    StatusCode::NOT_FOUND
 }
 
 /// Records that Claude Code is about to compact this session.
@@ -234,6 +267,11 @@ async fn hierarchical_compaction(
     }
 
     let model = object.get("model").and_then(Value::as_str)?.to_string();
+    // Folding runs against the Codex proxy. A Claude-routed compaction is
+    // forwarded to Anthropic untouched.
+    if model.starts_with(ANTHROPIC_PREFIX) {
+        return None;
+    }
     let system = object.get("system").cloned();
     let max_output = object
         .get("max_tokens")
@@ -597,12 +635,19 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
     if marked && is_messages {
         bytes = rewrite_request(&parts.headers, &bytes)?;
     }
+    let is_count =
+        parts.method == axum::http::Method::POST && parts.uri.path() == "/v1/messages/count_tokens";
+    let to_anthropic = (is_messages || is_count) && route_to_anthropic(&mut bytes)?;
 
     let query = parts
         .uri
         .path_and_query()
         .map_or("/", axum::http::uri::PathAndQuery::as_str);
-    let url = format!("http://127.0.0.1:{}{query}", state.upstream_port);
+    let url = if to_anthropic {
+        format!("{}{query}", state.anthropic_base)
+    } else {
+        format!("http://127.0.0.1:{}{query}", state.upstream_port)
+    };
 
     // Codex intermittently drops a pooled connection, which surfaces as a 502
     // that fails in tens of milliseconds -- before the request was ever sent.
@@ -612,18 +657,27 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
     let upstream = loop {
         let mut request = state.client.request(parts.method.clone(), &url);
         for (name, value) in &parts.headers {
-            if should_forward_request_header(name) {
+            if !should_forward_request_header(name) {
+                continue;
+            }
+            if to_anthropic {
+                request = request.header(name, value);
+            } else if let Some(value) = codex_header_value(name, value) {
                 request = request.header(name, value);
             }
         }
         let sent = request.body(bytes.clone()).send().await;
 
-        let retryable =
-            attempt < UPSTREAM_RETRIES && is_replayable(&parts.method, parts.uri.path());
+        // The replay rule covers the local proxy's dropped Codex connection.
+        // Claude Code retries Anthropic errors itself.
+        let retryable = !to_anthropic
+            && attempt < UPSTREAM_RETRIES
+            && is_replayable(&parts.method, parts.uri.path());
         match sent {
             Ok(response) if response.status() == StatusCode::BAD_GATEWAY && retryable => {}
             Ok(response) => break response,
             Err(_) if retryable => {}
+            Err(error) if to_anthropic => return Err(error).context("could not reach Anthropic"),
             Err(error) => return Err(error).context("could not reach claude-code-proxy"),
         }
 
@@ -662,6 +716,62 @@ fn should_forward_request_header(name: &HeaderName) -> bool {
         && name.as_str() != INITIAL_MODEL_HEADER
 }
 
+/// Returns the value to send to the Codex proxy, or `None` to drop the header.
+///
+/// Claude Code sends its Claude subscription credential with every request
+/// once a Claude route is configured. The Codex proxy authenticates with its
+/// own credential, so this one never leaves for the Codex route.
+fn codex_header_value(
+    name: &HeaderName,
+    value: &axum::http::HeaderValue,
+) -> Option<axum::http::HeaderValue> {
+    if name == header::AUTHORIZATION || name.as_str() == "x-api-key" {
+        return None;
+    }
+    if name.as_str() != "anthropic-beta" {
+        return Some(value.clone());
+    }
+    let betas: Vec<&str> = value
+        .to_str()
+        .ok()?
+        .split(',')
+        .map(str::trim)
+        .filter(|beta| !beta.is_empty() && !beta.starts_with(OAUTH_BETA_PREFIX))
+        .collect();
+    if betas.is_empty() {
+        return None;
+    }
+    axum::http::HeaderValue::from_str(&betas.join(",")).ok()
+}
+
+/// Whether a message request is bound for Anthropic. If it is, the routing
+/// prefix is removed so Anthropic receives the bare Claude model ID.
+fn route_to_anthropic(bytes: &mut Vec<u8>) -> Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        model: Option<String>,
+    }
+    // Peeking avoids building the whole document for every Codex request.
+    let routed = serde_json::from_slice::<Peek>(bytes)
+        .ok()
+        .and_then(|peek| peek.model)
+        .is_some_and(|model| model.starts_with(ANTHROPIC_PREFIX));
+    if !routed {
+        return Ok(false);
+    }
+
+    let mut value: Value = serde_json::from_slice(bytes).context("invalid Claude request JSON")?;
+    if let Some(model) = value.get("model").and_then(Value::as_str) {
+        let bare = model
+            .strip_prefix(ANTHROPIC_PREFIX)
+            .unwrap_or(model)
+            .to_string();
+        value["model"] = Value::String(bare);
+    }
+    *bytes = serde_json::to_vec(&value).context("could not serialize Claude request")?;
+    Ok(true)
+}
+
 fn should_forward_response_header(name: &HeaderName) -> bool {
     name != header::CONTENT_LENGTH
         && name != header::CONNECTION
@@ -698,13 +808,13 @@ fn rewrite_request(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>> {
     }
     let route = routes.entry(key).or_insert_with(|| RouteState {
         selected_model: read_header(headers, INITIAL_MODEL_HEADER)
-            .filter(|model| is_codex_model(strip_fast_suffix(model))),
+            .filter(|model| is_routed_model(strip_fast_suffix(model))),
         ..RouteState::default()
     });
     let normalized = strip_fast_suffix(&incoming_model);
 
     if fast {
-        if route.selected_model.is_none() && is_codex_model(normalized) {
+        if route.selected_model.is_none() && is_routed_model(normalized) {
             route.selected_model = Some(normalized.to_string());
         }
         route.claude_fast_model = Some(incoming_model);
@@ -719,7 +829,7 @@ fn rewrite_request(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>> {
             if let Some(selected) = route.selected_model.as_deref() {
                 object.insert("model".into(), Value::String(selected.to_string()));
             }
-        } else if is_codex_model(normalized) {
+        } else if is_routed_model(normalized) {
             route.selected_model = Some(normalized.to_string());
             route.claude_fast_model = None;
             route.fast_was_enabled = false;
@@ -756,11 +866,21 @@ fn is_codex_model(model: &str) -> bool {
     model.starts_with("gpt-")
 }
 
+/// A model Clodex routed to a Claude Code role, on either provider.
+fn is_routed_model(model: &str) -> bool {
+    is_codex_model(model) || model.starts_with(ANTHROPIC_PREFIX)
+}
+
 fn strip_fast_suffix(model: &str) -> &str {
     model.strip_suffix("-fast").unwrap_or(model)
 }
 
+/// Codex selects its priority tier by model suffix. Anthropic reads the
+/// request's own `speed` field, so a Claude route keeps its model ID.
 fn fast_model(model: &str) -> String {
+    if model.starts_with(ANTHROPIC_PREFIX) {
+        return model.to_string();
+    }
     format!("{}-fast", strip_fast_suffix(model))
 }
 
@@ -857,6 +977,7 @@ mod tests {
         }
         let state = BridgeState {
             upstream_port: 1,
+            anthropic_base: String::new(),
             client: reqwest::Client::new(),
             hierarchical: true,
             ceiling: 828_400,
@@ -889,6 +1010,7 @@ mod tests {
     async fn a_disabled_bridge_leaves_every_request_alone() {
         let state = BridgeState {
             upstream_port: 1,
+            anthropic_base: String::new(),
             client: reqwest::Client::new(),
             hierarchical: false,
             ceiling: 828_400,
@@ -920,6 +1042,7 @@ mod tests {
         }
         let state = BridgeState {
             upstream_port: 1,
+            anthropic_base: String::new(),
             client: reqwest::Client::new(),
             hierarchical: true,
             ceiling: 828_400,
@@ -1052,6 +1175,199 @@ mod tests {
             rewrite(&headers, "claude-opus-5", true)["model"],
             "gpt-5.6-terra-fast"
         );
+    }
+
+    #[test]
+    fn fast_mode_on_a_claude_route_stays_on_that_route() {
+        let mut headers = headers("session-claude-fast", None);
+        headers.insert(
+            INITIAL_MODEL_HEADER,
+            HeaderValue::from_static("anthropic/claude-opus-5-5"),
+        );
+        // Claude Code sends the bare Claude ID while fast mode is on; the
+        // selected Claude route must not fall through to Codex.
+        let fast = rewrite(&headers, "claude-opus-5-5", true);
+        assert_eq!(fast["model"], "anthropic/claude-opus-5-5");
+        assert_eq!(fast["speed"], "fast");
+        assert_eq!(
+            rewrite(&headers, "claude-opus-5-5", false)["model"],
+            "anthropic/claude-opus-5-5"
+        );
+        // An explicit switch to Codex still takes effect.
+        let _ = rewrite(&headers, "gpt-5.6-sol", false);
+        assert_eq!(
+            rewrite(&headers, "claude-opus-5-5", true)["model"],
+            "gpt-5.6-sol-fast"
+        );
+    }
+
+    #[test]
+    fn the_codex_route_never_receives_the_claude_credential() {
+        let value = |value: &'static str| HeaderValue::from_static(value);
+        assert_eq!(
+            codex_header_value(&header::AUTHORIZATION, &value("Bearer sk-ant-oat01-secret")),
+            None
+        );
+        assert_eq!(
+            codex_header_value(&HeaderName::from_static("x-api-key"), &value("sk-ant-api")),
+            None
+        );
+        assert_eq!(
+            codex_header_value(
+                &HeaderName::from_static("anthropic-beta"),
+                &value("claude-code-20250219,oauth-2025-04-20, effort-2025-11-24")
+            ),
+            Some(value("claude-code-20250219,effort-2025-11-24"))
+        );
+        assert_eq!(
+            codex_header_value(
+                &HeaderName::from_static("anthropic-beta"),
+                &value("oauth-2025-04-20")
+            ),
+            None
+        );
+        assert_eq!(
+            codex_header_value(&header::CONTENT_TYPE, &value("application/json")),
+            Some(value("application/json"))
+        );
+    }
+
+    #[test]
+    fn only_prefixed_models_are_routed_to_anthropic() {
+        let mut claude =
+            serde_json::to_vec(&serde_json::json!({"model": "anthropic/claude-opus-5-5"})).unwrap();
+        assert!(route_to_anthropic(&mut claude).unwrap());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&claude).unwrap()["model"],
+            "claude-opus-5-5"
+        );
+
+        for model in ["gpt-5.6-sol", "claude-opus-5-5"] {
+            let original = serde_json::to_vec(&serde_json::json!({"model": model})).unwrap();
+            let mut bytes = original.clone();
+            assert!(!route_to_anthropic(&mut bytes).unwrap(), "{model}");
+            assert_eq!(bytes, original);
+        }
+    }
+
+    /// Accepts `count` requests, capturing each one's headers and JSON body.
+    fn capture_upstream(
+        count: usize,
+    ) -> (u16, mpsc::Receiver<(String, Value)>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let header_end = loop {
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(position) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).to_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request.len() < header_end + length {
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let body = serde_json::from_slice(&request[header_end..header_end + length])
+                    .unwrap_or(Value::Null);
+                captured_tx.send((headers, body)).unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                    )
+                    .unwrap();
+            }
+        });
+        (port, captured_rx, handle)
+    }
+
+    #[test]
+    fn http_bridge_splits_traffic_between_codex_and_anthropic() {
+        let (codex_port, codex_rx, codex) = capture_upstream(2);
+        let (anthropic_port, anthropic_rx, anthropic) = capture_upstream(2);
+        let bridge = FastBridge::start_with(
+            codex_port,
+            format!("http://127.0.0.1:{anthropic_port}"),
+            false,
+            0,
+        )
+        .unwrap();
+        let client = reqwest::blocking::Client::new();
+        let send = |path: &str, model: &str| {
+            let response = client
+                .post(format!("http://127.0.0.1:{}{path}", bridge.port()))
+                .header(SESSION_HEADER, "split-session")
+                .header(BRIDGE_HEADER, BRIDGE_HEADER_VALUE)
+                .header(INITIAL_MODEL_HEADER, "anthropic/claude-opus-5-5")
+                .header(header::AUTHORIZATION, "Bearer sk-ant-oat01-secret")
+                .header("anthropic-beta", "oauth-2025-04-20,effort-2025-11-24")
+                .json(&serde_json::json!({
+                    "model": model,
+                    "messages": [{"role":"user","content":"test"}],
+                    "tools": [{"name":"Bash","input_schema":{"type":"object"}}]
+                }))
+                .send()
+                .unwrap();
+            assert!(response.status().is_success());
+        };
+
+        send("/v1/messages?beta=true", "anthropic/claude-opus-5-5");
+        send(
+            "/v1/messages/count_tokens?beta=true",
+            "anthropic/claude-opus-5-5",
+        );
+        send("/v1/messages?beta=true", "gpt-5.6-sol");
+        send("/v1/messages/count_tokens?beta=true", "gpt-5.6-sol");
+
+        for _ in 0..2 {
+            let (headers, body) = anthropic_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+            assert_eq!(body["model"], "claude-opus-5-5");
+            assert!(headers.contains("authorization: bearer sk-ant-oat01-secret"));
+            assert!(headers.contains("anthropic-beta: oauth-2025-04-20,effort-2025-11-24"));
+            assert!(!headers.contains("x-clodex-"));
+        }
+        for _ in 0..2 {
+            let (headers, body) = codex_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+            assert_eq!(body["model"], "gpt-5.6-sol");
+            assert!(
+                !headers.contains("sk-ant-"),
+                "Claude credential reached Codex"
+            );
+            assert!(!headers.contains("authorization:"));
+            assert!(!headers.contains("oauth-2025-04-20"));
+            assert!(headers.contains("anthropic-beta: effort-2025-11-24"));
+        }
+
+        drop(bridge);
+        codex.join().unwrap();
+        anthropic.join().unwrap();
+    }
+
+    #[test]
+    fn model_discovery_is_declined_so_the_launch_list_survives() {
+        let bridge = FastBridge::start(1, false, 0).unwrap();
+        let response = reqwest::blocking::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{}/v1/models?limit=1000",
+                bridge.port()
+            ))
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

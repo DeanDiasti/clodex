@@ -7,8 +7,30 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The Codex CLI is optional. `clodex auth login` signs in to Codex with a
+  ChatGPT account (`--device` for machines without a browser), Clodex
+  refreshes that sign-in itself, and the model catalog is fetched from Codex
+  directly and cached. An existing Codex CLI login is still reused when
+  Clodex has no sign-in of its own.
+- The built-in Codex backend is the default. `claude-code-proxy` is no longer
+  required; `clodex config backend proxy` selects it.
+- The minimum supported Rust version is now 1.88.
+
 ### Added
 
+- A built-in Codex backend (`clodex config backend builtin`), vendored from
+  claude-code-proxy v0.1.42's Codex path, that runs inside the supervisor so
+  no external proxy is needed. It routes every model in the live Codex
+  catalog.
+- Claude models on your own Claude subscription with `clodex config route`.
+  The bridge forwards Claude-routed requests to Anthropic with Claude Code's
+  own login, strips that credential from every Codex-bound request, and
+  `clodex doctor` reports the Claude login.
+- Every routable Codex model, and with a subscription every current Claude
+  model, in the `/model` picker, plus one subagent type per model so subagents
+  can run on either provider.
 - Configurable Codex transport with `clodex config transport`, while retaining
   HTTP SSE as the concurrency-safe default.
 - Configured transport reporting in `clodex doctor` and recovery guidance for

@@ -13,11 +13,11 @@ Thanks for helping make Clodex more reliable and easier to use.
 
 ## Development setup
 
-Clodex requires Rust 1.85 or newer. Clone the repository and run:
+Clodex requires Rust 1.88 or newer. Clone the repository and run:
 
 ```sh
 cargo build --locked
-cargo test --all-targets --locked
+cargo test --workspace --all-targets --locked
 ```
 
 Real Claude, Codex, and proxy credentials are not needed for the automated test
@@ -30,8 +30,8 @@ Run the same checks as CI:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
 ```
 
 Keep pull requests focused, explain user-visible behavior changes, and add or

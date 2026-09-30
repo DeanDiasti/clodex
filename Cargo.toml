@@ -2,7 +2,7 @@
 name = "clodex"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Use Claude Code's agentic interface with subscription-backed Codex models"
 license = "MIT"
 repository = "https://github.com/DeanDiasti/clodex"
@@ -11,14 +11,18 @@ readme = "README.md"
 keywords = ["claude-code", "codex", "cli", "ai", "developer-tools"]
 categories = ["command-line-utilities", "development-tools"]
 
+[workspace]
+members = ["crates/codex-backend"]
+
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
+codex-backend = { path = "crates/codex-backend" }
 fs2 = "0.4"
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 signal-hook = "0.3"
