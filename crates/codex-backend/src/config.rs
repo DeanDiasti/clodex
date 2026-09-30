@@ -130,10 +130,32 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
     }
 }
 
+/// A missing config.json means no file settings. One that cannot be read or
+/// parsed is ignored too, but reported once so its settings do not vanish
+/// silently.
 fn read_file_config(config_dir: &Path) -> Option<FileConfig> {
     let path = config_dir.join("config.json");
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            warn_config_once(&path, &err);
+            return None;
+        }
+    };
+    serde_json::from_str(&raw)
+        .inspect_err(|err| warn_config_once(&path, err))
+        .ok()
+}
+
+fn warn_config_once(path: &Path, err: &dyn std::fmt::Display) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "warning: ignoring {}: {err}; using default settings",
+            path.display()
+        );
+    });
 }
 
 pub fn load_config() -> LoadedConfig {

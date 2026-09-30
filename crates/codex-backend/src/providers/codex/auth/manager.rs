@@ -130,7 +130,11 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             {
                 return Ok(latest);
             }
-            self.store.clear_auth()?;
+            // Only 401 says the refresh token itself is dead. A 403 can come
+            // from an edge block or policy, so the credentials are kept.
+            if status == 401 {
+                self.store.clear_auth()?;
+            }
             let err_msg = resp
                 .text()
                 .await
@@ -339,6 +343,39 @@ mod tests {
         assert_eq!(auth.access, "same-access");
         assert_eq!(auth.refresh, "replacement-refresh");
         assert_eq!(manager.store.load_auth().unwrap(), Some(auth));
+    }
+
+    #[tokio::test]
+    async fn forbidden_refresh_keeps_stored_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            let body = b"blocked";
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        let store = test_store();
+        let stored = StoredAuth {
+            access: "expired".into(),
+            refresh: "still-valid".into(),
+            expires: 0,
+            account_id: Some("acct_1".into()),
+        };
+        store.save_auth(stored.clone()).unwrap();
+        let manager =
+            CodexAuthManager::new_with_token_endpoint(store, format!("http://{addr}/oauth/token"));
+
+        assert!(manager.get_auth().await.is_err());
+        server.join().unwrap();
+        assert_eq!(manager.store.load_auth().unwrap(), Some(stored));
     }
 
     #[tokio::test]

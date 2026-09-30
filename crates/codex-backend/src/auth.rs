@@ -161,14 +161,13 @@ where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
 {
     fn load(&self) -> Result<Option<T>> {
-        let parsed = load_auth_file::<T>(&self.file);
-        if parsed.is_some() {
-            return Ok(parsed);
+        if let Some(parsed) = load_auth_file::<T>(&self.file)? {
+            return Ok(Some(parsed));
         }
         if self.file == self.legacy_file {
             return Ok(None);
         }
-        Ok(load_auth_file::<T>(&self.legacy_file))
+        load_auth_file::<T>(&self.legacy_file)
     }
 
     fn save(&self, value: T) -> Result<()> {
@@ -279,7 +278,8 @@ where
     }
 
     fn path(&self) -> String {
-        if self.use_keychain {
+        // `load` prefers the file whenever it exists.
+        if self.use_keychain && !std::path::Path::new(&self.file_store.file).exists() {
             self.keychain_path.clone()
         } else {
             self.file_store.path()
@@ -287,11 +287,20 @@ where
     }
 }
 
-pub fn load_auth_file<T: DeserializeOwned>(path: &str) -> Option<T> {
-    let mut file = File::open(path).ok()?;
+/// Only a missing file is absent. A file that cannot be read or parsed is an
+/// error, so a corrupt credential never silently falls back to another one.
+pub fn load_auth_file<T: DeserializeOwned>(path: &str) -> Result<Option<T>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(anyhow::anyhow!("Failed to open {path}: {err}")),
+    };
     let mut raw = String::new();
-    file.read_to_string(&mut raw).ok()?;
-    serde_json::from_str::<T>(&raw).ok()
+    file.read_to_string(&mut raw)
+        .map_err(|err| anyhow::anyhow!("Failed to read {path}: {err}"))?;
+    serde_json::from_str::<T>(&raw)
+        .map(Some)
+        .map_err(|err| anyhow::anyhow!("Failed to parse {path}: {err}"))
 }
 
 pub fn load_auth_file_value(path: &std::path::Path) -> Option<serde_json::Value> {
@@ -537,11 +546,27 @@ mod tests {
         keychain.set_raw("svc", "acct", json!({"source": "keychain"}));
 
         let store: KeychainFileAuthStore<serde_json::Value, _> =
-            KeychainFileAuthStore::new(file, legacy, "svc", "acct", true, keychain);
+            KeychainFileAuthStore::new(file.clone(), legacy, "svc", "acct", true, keychain);
 
         let loaded = store.load().unwrap().unwrap();
         assert_eq!(loaded["source"], json!("file"));
-        assert_eq!(store.path(), "macOS Keychain");
+        assert_eq!(store.path(), file);
+    }
+
+    #[test]
+    fn a_corrupt_auth_file_is_an_error_not_a_fallback() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        std::fs::write(&file, "{not json").unwrap();
+        write_atomically(&legacy, &json!({"source": "legacy"})).unwrap();
+        let keychain = MockKeychain::default();
+        keychain.set_raw("svc", "acct", json!({"source": "keychain"}));
+
+        let store: KeychainFileAuthStore<serde_json::Value, _> =
+            KeychainFileAuthStore::new(file, legacy, "svc", "acct", true, keychain);
+
+        assert!(store.load().is_err());
     }
 
     #[test]
@@ -557,6 +582,7 @@ mod tests {
 
         let loaded = store.load().unwrap().unwrap();
         assert_eq!(loaded["source"], json!("keychain"));
+        assert_eq!(store.path(), "macOS Keychain");
     }
 
     #[test]

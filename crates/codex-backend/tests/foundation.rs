@@ -48,6 +48,10 @@ fn messages_fixture_and_sse_parsing() {
     let first_line: serde_json::Value =
         serde_json::from_str(reparsed[0].data.lines().next().unwrap()).unwrap();
     assert_eq!(first_line["a"], json!(1));
+
+    // Only the single space after the colon belongs to the syntax.
+    let indented = parse_sse_events(b"data:   indented\n\n");
+    assert_eq!(indented[0].data, "  indented");
 }
 
 #[test]
@@ -92,6 +96,26 @@ fn path_resolvers_cover_platform_rules() {
     assert_eq!(
         paths::resolve_config_dir(&deps).to_string_lossy(),
         "C:/Users/u/AppData/Roaming/claude-code-proxy"
+    );
+
+    // `std::env::consts::OS` names, which the default resolver passes.
+    let deps = DirResolverEnv {
+        platform: "macos".to_string(),
+        home: "/home/u".into(),
+        env: HashMap::from([("XDG_CONFIG_HOME".into(), "/x".into())]),
+    };
+    assert_eq!(
+        paths::resolve_config_dir(&deps).to_string_lossy(),
+        "/home/u/.config/claude-code-proxy"
+    );
+    let deps = DirResolverEnv {
+        platform: "windows".to_string(),
+        home: "C:/Users/u".into(),
+        env: HashMap::from([("LOCALAPPDATA".into(), "C:/Users/u/AppData/Local".into())]),
+    };
+    assert_eq!(
+        paths::resolve_state_dir(&deps).to_string_lossy(),
+        "C:/Users/u/AppData/Local/claude-code-proxy"
     );
 }
 
@@ -209,6 +233,29 @@ fn retry_backoff_decisions() {
 
     let too_long = compute_backoff_delay(0, Some("120"));
     assert!(too_long.exceeds_budget);
+
+    // Negative, non-finite, and past-date values fall back to backoff
+    // instead of retrying immediately.
+    let exponential = compute_backoff_delay(0, None).wait_ms;
+    for raw in ["-5", "NaN", "inf", "Sun, 06 Nov 1994 08:49:37 GMT", "soon"] {
+        let outcome = compute_backoff_delay(0, Some(raw));
+        assert_eq!(outcome.wait_ms, exponential, "{raw}");
+        assert!(!outcome.exceeds_budget, "{raw}");
+    }
+
+    // A future HTTP-date waits out the remaining time, within the cap.
+    let soon = (time::OffsetDateTime::now_utc() + time::Duration::seconds(10))
+        .format(&time::format_description::well_known::Rfc2822)
+        .unwrap();
+    let dated = compute_backoff_delay(0, Some(&soon));
+    assert!(
+        (5_000..=10_000).contains(&dated.wait_ms),
+        "{}",
+        dated.wait_ms
+    );
+    let far = compute_backoff_delay(0, Some("Fri, 01 Jan 2100 00:00:00 GMT"));
+    assert_eq!(far.wait_ms, RETRY_MAX_DELAY_MS);
+    assert!(far.exceeds_budget);
 }
 
 #[tokio::test]
