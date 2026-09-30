@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal};
@@ -26,7 +27,7 @@ const CLODEX_THEME: &str = r##"{
 }
 "##;
 
-pub fn run(claude_args: Vec<OsString>) -> Result<()> {
+pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
     let config = AppConfig::load()?;
     if !crate::config::config_path()?.exists() {
         config.save()?;
@@ -44,6 +45,13 @@ pub fn run(claude_args: Vec<OsString>) -> Result<()> {
     let lease = supervisor::acquire()?;
     let proxy_port = lease.proxy_port();
     let supports_fast_bridge = lease.supports_fast_bridge();
+    if fast && !crate::fast_bridge::supports_session_fast(proxy_port) {
+        lease.close();
+        bail!(
+            "clodex --fast requires the session-fast bridge. Close every active Clodex session, then start a new one"
+        );
+    }
+    let fast_routes = fast.then(|| session_fast_routes(&catalog, &mapping, &support));
     // Only the bridge separates the two providers; without it, Claude-routed
     // requests and the subscription credential would reach the Codex proxy.
     if mapping.uses_anthropic() && !supports_fast_bridge {
@@ -70,6 +78,7 @@ pub fn run(claude_args: Vec<OsString>) -> Result<()> {
         &mapping,
         context_capacity,
         config.context.compact_at_percent,
+        fast,
     );
 
     let mut command = build_claude_command(
@@ -81,6 +90,7 @@ pub fn run(claude_args: Vec<OsString>) -> Result<()> {
         supports_fast_bridge,
         claude,
         &models,
+        fast_routes.as_ref(),
     )?;
 
     let status = command
@@ -105,6 +115,7 @@ fn build_claude_command(
     supports_fast_bridge: bool,
     claude: bool,
     models: &[picker::Entry],
+    fast_routes: Option<&BTreeMap<String, String>>,
 ) -> Result<Command> {
     let mut command = Command::new("claude");
     command.args([
@@ -136,6 +147,7 @@ fn build_claude_command(
         command.env("ANTHROPIC_AUTH_TOKEN", "clodex-local-proxy");
     }
     configure_fast_bridge(&mut command, supports_fast_bridge, &mapping.opus.model);
+    configure_session_fast(&mut command, fast_routes)?;
     configure_model_context(
         &mut command,
         mapping,
@@ -255,6 +267,17 @@ fn configure_fast_bridge(command: &mut Command, supported: bool, initial_model: 
         let marker = crate::fast_bridge::custom_headers(initial_model);
         let headers = std::env::var("ANTHROPIC_CUSTOM_HEADERS")
             .ok()
+            .map(|headers| {
+                headers
+                    .lines()
+                    .filter(|line| {
+                        !line.split_once(':').is_some_and(|(name, _)| {
+                            name.trim().to_ascii_lowercase().starts_with("x-clodex-")
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
             .filter(|headers| !headers.trim().is_empty())
             .map_or(marker.clone(), |headers| format!("{headers}\n{marker}"));
         command
@@ -270,6 +293,93 @@ fn configure_fast_bridge(command: &mut Command, supported: bool, initial_model: 
             .env_remove("CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK")
             .env_remove("CLAUDE_CODE_SKIP_FAST_MODE_NETWORK_ERRORS");
     }
+}
+
+fn session_fast_routes(
+    catalog: &Catalog,
+    mapping: &ModelMapping,
+    support: &supervisor::CodexSupport,
+) -> BTreeMap<String, String> {
+    let mut routes: BTreeMap<_, _> = catalog
+        .models
+        .iter()
+        .filter(|model| {
+            model.supported_in_api
+                && model.slug.starts_with("gpt-")
+                && model
+                    .additional_speed_tiers
+                    .iter()
+                    .any(|tier| tier == "fast")
+        })
+        .map(|model| (model.slug.clone(), format!("{}-fast", model.slug)))
+        .filter(|(_, target)| support.supports(target))
+        .collect();
+    // Older Claude Code versions may send a bare Claude alias for a role.
+    // Only Codex roles get aliases here; real Claude routes keep their IDs.
+    for (aliases, route) in [
+        (
+            &["fable", "claude-fable-5", "claude-fable-5-1"][..],
+            &mapping.fable,
+        ),
+        (
+            &[
+                "opus",
+                "claude-opus-5",
+                "claude-opus-5-5",
+                "claude-opus-4-8",
+                "claude-opus-4-7",
+            ][..],
+            &mapping.opus,
+        ),
+        (
+            &[
+                "sonnet",
+                "claude-sonnet-5",
+                "claude-sonnet-5-5",
+                "claude-sonnet-4-6",
+            ][..],
+            &mapping.sonnet,
+        ),
+        (
+            &["haiku", "claude-haiku-4-5", "claude-haiku-4-5-20251001"][..],
+            &mapping.haiku_compatibility,
+        ),
+    ] {
+        if route.is_codex()
+            && let Some(target) = routes.get(&route.model).cloned()
+        {
+            for alias in aliases {
+                routes.insert((*alias).to_string(), target.clone());
+            }
+        }
+    }
+    routes
+}
+
+fn configure_session_fast(
+    command: &mut Command,
+    routes: Option<&BTreeMap<String, String>>,
+) -> Result<()> {
+    command.env("CLODEX_FAST", if routes.is_some() { "1" } else { "0" });
+    let Some(routes) = routes else {
+        command.env_remove("CLODEX_FAST_ROUTES");
+        return Ok(());
+    };
+    let routes = serde_json::to_string(routes)?;
+    let headers = command
+        .get_envs()
+        .find(|(key, _)| *key == "ANTHROPIC_CUSTOM_HEADERS")
+        .and_then(|(_, value)| value)
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let headers = format!("{headers}\nX-Clodex-Session-Fast: {routes}");
+    command
+        .env("ANTHROPIC_CUSTOM_HEADERS", headers)
+        .env("CLODEX_FAST_ROUTES", routes)
+        // Clodex owns the tier. Claude's Opus-only toggle must not switch the
+        // selected model or enable Anthropic fast mode from saved preferences.
+        .env("CLAUDE_CODE_DISABLE_FAST_MODE", "1");
+    Ok(())
 }
 
 fn configure_model_context(
@@ -382,14 +492,19 @@ fn warn_if_context_was_clamped(configured: Option<u64>, capacity: u64) {
     }
 }
 
-fn print_banner(mapping: &ModelMapping, context_capacity: u64, compact_at: u8) {
+fn print_banner(mapping: &ModelMapping, context_capacity: u64, compact_at: u8, fast: bool) {
     if io::stderr().is_terminal() {
         eprint!("\x1b]0;Clodex · Claude Code + Codex\x07");
         eprintln!(
-            "\x1b[38;5;141m◆ Clodex\x1b[0m  Opus: {}  ·  context: {}  ·  compact: {}%",
+            "\x1b[38;5;141m◆ Clodex\x1b[0m  Opus: {}  ·  context: {}  ·  compact: {}%{}",
             mapping.opus.display_name,
             format_tokens(context_capacity),
-            compact_at
+            compact_at,
+            if fast {
+                "  ·  FAST (Codex session)"
+            } else {
+                ""
+            }
         );
     }
 }
@@ -528,6 +643,7 @@ mod tests {
             true,
             false,
             &[],
+            None,
         )
         .unwrap();
 
@@ -612,6 +728,80 @@ mod tests {
     }
 
     #[test]
+    fn session_fast_is_exported_without_native_model_switching() {
+        let routes = BTreeMap::from([("gpt-opus".into(), "gpt-opus-fast".into())]);
+        let command = build_claude_command(
+            vec![OsString::from("--resume"), OsString::from("session-id")],
+            &mapping(),
+            &AppConfig::default(),
+            600_000,
+            41_234,
+            true,
+            true,
+            &[],
+            Some(&routes),
+        )
+        .unwrap();
+        let environment: HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(name, value)| value.map(|value| (name, value)))
+            .collect();
+        assert_eq!(environment[OsStr::new("CLODEX_FAST")], "1");
+        assert_eq!(
+            environment[OsStr::new("CLAUDE_CODE_DISABLE_FAST_MODE")],
+            "1"
+        );
+        assert_eq!(environment[OsStr::new("ANTHROPIC_MODEL")], "gpt-opus");
+        let exported: BTreeMap<String, String> = serde_json::from_str(
+            environment[OsStr::new("CLODEX_FAST_ROUTES")]
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(exported, routes);
+        assert!(
+            environment[OsStr::new("ANTHROPIC_CUSTOM_HEADERS")]
+                .to_str()
+                .unwrap()
+                .contains("X-Clodex-Session-Fast:")
+        );
+        let arguments: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            &arguments[2..],
+            [OsStr::new("--resume"), OsStr::new("session-id")]
+        );
+    }
+
+    #[test]
+    fn session_fast_routes_follow_catalog_backend_and_provider() {
+        let catalog: Catalog = serde_json::from_value(serde_json::json!({"models":[
+            {"slug":"gpt-opus","display_name":"Opus","supported_in_api":true,"additional_speed_tiers":["fast"]},
+            {"slug":"gpt-fable","display_name":"Fable","supported_in_api":true,"additional_speed_tiers":["fast"]},
+            {"slug":"gpt-sonnet","display_name":"Sonnet","supported_in_api":true},
+            {"slug":"gpt-private","display_name":"Private","supported_in_api":false,"additional_speed_tiers":["fast"]}
+        ]})).unwrap();
+        let routes = session_fast_routes(&catalog, &mapping(), &supervisor::CodexSupport::Builtin);
+        assert_eq!(routes["gpt-opus"], "gpt-opus-fast");
+        assert_eq!(routes["opus"], "gpt-opus-fast");
+        assert_eq!(routes["fable"], "gpt-fable-fast");
+        for model in ["gpt-sonnet", "sonnet", "haiku", "gpt-private"] {
+            assert!(!routes.contains_key(model));
+        }
+        let mut mixed = mapping();
+        mixed.opus = Route::anthropic("claude-opus-5-5");
+        let routes = session_fast_routes(&catalog, &mixed, &supervisor::CodexSupport::Builtin);
+        assert_eq!(routes["gpt-opus"], "gpt-opus-fast");
+        for model in ["opus", "claude-opus-5-5", "anthropic/claude-opus-5-5"] {
+            assert!(!routes.contains_key(model));
+        }
+        let support = supervisor::CodexSupport::Proxy("gpt-opus, gpt-opus-fast, gpt-fable".into());
+        let routes = session_fast_routes(&catalog, &mapping(), &support);
+        assert_eq!(routes["gpt-opus"], "gpt-opus-fast");
+        assert!(!routes.contains_key("gpt-fable"));
+        assert!(!routes.contains_key("fable"));
+    }
+
+    #[test]
     fn old_supervisors_cannot_enable_a_false_fast_toggle() {
         let mut command = Command::new("claude");
         configure_fast_bridge(&mut command, false, "gpt-5.6-terra");
@@ -668,6 +858,7 @@ mod tests {
             true,
             true,
             &[],
+            None,
         )
         .unwrap();
 
@@ -711,6 +902,7 @@ mod tests {
             true,
             true,
             &models,
+            None,
         )
         .unwrap();
 
@@ -734,6 +926,7 @@ mod tests {
             true,
             true,
             &models,
+            None,
         )
         .unwrap();
         let arguments: Vec<_> = command.get_args().collect();

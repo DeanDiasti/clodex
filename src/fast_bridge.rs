@@ -18,6 +18,7 @@ use crate::mapping::ANTHROPIC_PREFIX;
 
 const BRIDGE_HEADER: &str = "x-clodex-fast-bridge";
 const BRIDGE_HEADER_VALUE: &str = "1";
+const SESSION_FAST_HEADER: &str = "x-clodex-session-fast";
 const INITIAL_MODEL_HEADER: &str = "x-clodex-initial-model";
 const SESSION_HEADER: &str = "x-claude-code-session-id";
 const AGENT_HEADER: &str = "x-claude-code-agent-id";
@@ -161,7 +162,8 @@ async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "ok": true,
         "service": "clodex-fast-bridge",
-        "version": 1
+        "version": 2,
+        "capabilities": ["session-fast"]
     }))
 }
 
@@ -627,12 +629,17 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         == Some(BRIDGE_HEADER_VALUE);
     let is_messages =
         parts.method == axum::http::Method::POST && parts.uri.path() == "/v1/messages";
+    let session_fast = marked && parts.headers.contains_key(SESSION_FAST_HEADER);
+    if session_fast && is_messages {
+        bytes = rewrite_request(&parts.headers, &bytes)?;
+    }
+    // Fold rounds use the same session tier as ordinary Codex requests.
     if is_messages
         && let Some(response) = hierarchical_compaction(state, &parts.headers, &bytes).await
     {
         return Ok(response);
     }
-    if marked && is_messages {
+    if marked && is_messages && !session_fast {
         bytes = rewrite_request(&parts.headers, &bytes)?;
     }
     let is_count =
@@ -714,6 +721,7 @@ fn should_forward_request_header(name: &HeaderName) -> bool {
         && name != header::CONNECTION
         && name.as_str() != BRIDGE_HEADER
         && name.as_str() != INITIAL_MODEL_HEADER
+        && name.as_str() != SESSION_FAST_HEADER
 }
 
 /// Returns the value to send to the Codex proxy, or `None` to drop the header.
@@ -790,6 +798,22 @@ fn rewrite_request(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>> {
     else {
         return Ok(body.to_vec());
     };
+    if let Some(routes) = headers.get(SESSION_FAST_HEADER) {
+        // Claude routes bypass the Codex-only session policy entirely.
+        if incoming_model.starts_with(ANTHROPIC_PREFIX) {
+            return Ok(body.to_vec());
+        }
+        let routes: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(routes.to_str().context("invalid session-fast header")?)
+                .context("invalid session-fast routes")?;
+        let model = strip_fast_suffix(&incoming_model);
+        let routed = routes.get(model).map(String::as_str).unwrap_or(model);
+        object.insert("model".into(), Value::String(routed.to_string()));
+        // Unsupported models fall back to standard; Claude's toggle does not
+        // control a session launched with --fast.
+        object.remove("speed");
+        return serde_json::to_vec(&value).context("could not serialize Claude request");
+    }
     let fast = object.get("speed").and_then(Value::as_str) == Some("fast");
     let has_tools = object
         .get("tools")
@@ -886,6 +910,22 @@ fn fast_model(model: &str) -> String {
 
 pub fn custom_headers(initial_model: &str) -> String {
     format!("X-Clodex-Fast-Bridge: 1\nX-Clodex-Initial-Model: {initial_model}")
+}
+
+pub fn supports_session_fast(port: u16) -> bool {
+    reqwest::blocking::Client::new()
+        .get(format!("http://127.0.0.1:{port}/__clodex/health"))
+        .timeout(std::time::Duration::from_millis(500))
+        .send()
+        .ok()
+        .filter(|response| response.status().is_success())
+        .and_then(|response| response.json::<Value>().ok())
+        .is_some_and(|body| {
+            body["service"] == "clodex-fast-bridge"
+                && body["capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|cap| cap == "session-fast"))
+        })
 }
 
 pub fn healthcheck(port: u16) -> bool {
@@ -1089,6 +1129,58 @@ mod tests {
             &rewrite_request(headers, &serde_json::to_vec(&body).unwrap()).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn session_fast_follows_models_and_agents_without_native_fast_flags() {
+        for agent in [None, Some("codex-agent-a"), Some("codex-agent-b")] {
+            let mut forced = headers("forced-session", agent);
+            forced.insert(
+                SESSION_FAST_HEADER,
+                HeaderValue::from_static(
+                    r#"{"gpt-astra":"gpt-astra-fast","gpt-luna":"gpt-luna-fast"}"#,
+                ),
+            );
+            // A parent's initial model must not pin a child's chosen model.
+            forced.insert(INITIAL_MODEL_HEADER, HeaderValue::from_static("gpt-astra"));
+            for model in [
+                "gpt-astra",
+                "gpt-luna",
+                "gpt-astra-fast",
+                "gpt-unsupported-fast",
+            ] {
+                let body = serde_json::json!({"model":model,"speed":"standard","messages":[]});
+                let rewritten: Value = serde_json::from_slice(
+                    &rewrite_request(&forced, &serde_json::to_vec(&body).unwrap()).unwrap(),
+                )
+                .unwrap();
+                let expected = if model == "gpt-unsupported-fast" {
+                    "gpt-unsupported".to_string()
+                } else {
+                    fast_model(model)
+                };
+                assert_eq!(rewritten["model"], expected);
+                assert!(rewritten.get("speed").is_none());
+            }
+            let claude = serde_json::to_vec(&serde_json::json!({
+                "model":"anthropic/claude-opus-5-5", "speed":"fast", "messages":[]
+            }))
+            .unwrap();
+            assert_eq!(rewrite_request(&forced, &claude).unwrap(), claude);
+        }
+        let mut forced = HeaderMap::new();
+        forced.insert(
+            SESSION_FAST_HEADER,
+            HeaderValue::from_static(r#"{"gpt-luna":"gpt-luna-fast"}"#),
+        );
+        assert_eq!(
+            rewrite(&forced, "gpt-luna", false)["model"],
+            "gpt-luna-fast"
+        );
+        assert_eq!(
+            rewrite(&HeaderMap::new(), "gpt-luna", false)["model"],
+            "gpt-luna"
+        );
     }
 
     #[test]
@@ -1352,6 +1444,99 @@ mod tests {
             assert!(headers.contains("anthropic-beta: effort-2025-11-24"));
         }
 
+        drop(bridge);
+        codex.join().unwrap();
+        anthropic.join().unwrap();
+    }
+
+    #[test]
+    fn http_session_fast_covers_subagents_and_keeps_other_sessions_isolated() {
+        let (codex_port, codex_rx, codex) = capture_upstream(6);
+        let (anthropic_port, anthropic_rx, anthropic) = capture_upstream(1);
+        let bridge = FastBridge::start_with(
+            codex_port,
+            format!("http://127.0.0.1:{anthropic_port}"),
+            false,
+            0,
+        )
+        .unwrap();
+        assert!(supports_session_fast(bridge.port()));
+        let url = format!("http://127.0.0.1:{}/v1/messages", bridge.port());
+        let client = reqwest::blocking::Client::new();
+        for (session, agent, marked, forced, model, expected) in [
+            ("fast-http", None, true, true, "gpt-astra", "gpt-astra-fast"),
+            (
+                "fast-http",
+                Some("agent-a"),
+                true,
+                true,
+                "gpt-luna",
+                "gpt-luna-fast",
+            ),
+            (
+                "fast-http",
+                Some("agent-a"),
+                true,
+                true,
+                "gpt-astra",
+                "gpt-astra-fast",
+            ),
+            (
+                "fast-http",
+                Some("agent-b"),
+                true,
+                true,
+                "gpt-unsupported",
+                "gpt-unsupported",
+            ),
+            (
+                "standard-http",
+                Some("agent-a"),
+                true,
+                false,
+                "gpt-luna",
+                "gpt-luna",
+            ),
+            ("unmarked-http", None, false, true, "gpt-astra", "gpt-astra"),
+            (
+                "fast-http",
+                Some("claude-agent"),
+                true,
+                true,
+                "anthropic/claude-opus-5-5",
+                "claude-opus-5-5",
+            ),
+        ] {
+            // Claude Code doesn't send speed:fast for an explicit Codex agent.
+            let mut request = client
+                .post(&url)
+                .header(SESSION_HEADER, session)
+                .json(&serde_json::json!({"model":model,"messages":[]}));
+            if marked {
+                request = request
+                    .header(BRIDGE_HEADER, BRIDGE_HEADER_VALUE)
+                    .header(INITIAL_MODEL_HEADER, "gpt-astra");
+            }
+            if forced {
+                request = request.header(
+                    SESSION_FAST_HEADER,
+                    r#"{"gpt-astra":"gpt-astra-fast","gpt-luna":"gpt-luna-fast"}"#,
+                );
+            }
+            if let Some(agent) = agent {
+                request = request.header(AGENT_HEADER, agent);
+            }
+            assert!(request.send().unwrap().status().is_success());
+            let receiver = if model.starts_with(ANTHROPIC_PREFIX) {
+                &anthropic_rx
+            } else {
+                &codex_rx
+            };
+            let (headers, body) = receiver.recv_timeout(TEST_TIMEOUT).unwrap();
+            assert_eq!(body["model"], expected);
+            assert!(body.get("speed").is_none());
+            assert!(!headers.contains("x-clodex-"));
+        }
         drop(bridge);
         codex.join().unwrap();
         anthropic.join().unwrap();

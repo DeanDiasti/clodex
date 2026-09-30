@@ -264,10 +264,29 @@ must compact before switching to it.
 
 ## Fast mode
 
+Launch with `clodex --fast` to keep supported Codex models on the priority
+service tier for the entire session, including subagents and compaction.
+The policy follows model switches and each subagent's own model, without
+depending on Claude Code's Opus-only `/fast` toggle. Claude routes run at
+their normal speed. Codex models without the catalog's `fast` capability,
+or without fast support in the external proxy, run at standard speed.
+
+Place `--fast` before Claude Code arguments:
+
+```sh
+clodex --fast
+clodex --fast --resume
+clodex --fast -p "Review this repository"
+```
+
+The launch banner shows `FAST (Codex session)`. The policy lasts for that
+launch; Claude Code's `/fast` toggle is disabled in a `--fast` session.
+
 Inside a Clodex session, `/fast on` enables the Codex priority service tier for
 the model that is already selected. It does not switch the route to Fable,
 Opus, Sonnet, or another model. `/fast off` returns that same model to the
-standard service tier.
+standard service tier. This interactive toggle applies to sessions launched
+without `--fast`.
 
 Clodex implements this with a loopback-only bridge owned by the shared
 supervisor. Requests are tracked independently by Claude session and subagent,

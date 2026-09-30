@@ -21,9 +21,13 @@ use crate::mapping::ModelMapping;
 #[command(
     name = "clodex",
     version,
-    about = "Claude Code harness with Codex subscription models"
+    about = "Claude Code harness with Codex subscription models",
+    after_help = "Launch: clodex [--fast] [--] [CLAUDE_ARGS]\nPlace --fast before Claude arguments to keep supported Codex models on the priority tier for this session, including subagents."
 )]
 struct Cli {
+    /// Use the priority tier for supported Codex models in this session.
+    #[arg(long)]
+    fast: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -142,18 +146,18 @@ enum ConfigCommand {
 }
 
 fn main() -> Result<()> {
-    let mut passthrough: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let (fast, mut passthrough) = launch_arguments(std::env::args_os().skip(1).collect());
     if should_launch_claude(&passthrough) {
         if passthrough.first().is_some_and(|argument| argument == "--") {
             passthrough.remove(0);
         }
-        return launcher::run(passthrough);
+        return launcher::run(passthrough, fast);
     }
 
     let cli = Cli::parse();
 
     match cli.command {
-        None => launcher::run(Vec::new()),
+        None => launcher::run(Vec::new(), cli.fast),
         Some(Command::Auth(args)) => run_auth(args),
         Some(Command::Models(args)) => run_models(args),
         Some(Command::Config(args)) => run_config(args),
@@ -161,6 +165,18 @@ fn main() -> Result<()> {
         Some(Command::Doctor) => doctor::run(),
         Some(Command::Supervisor) => supervisor::run(),
     }
+}
+
+// Only the leading flag belongs to Clodex. Prompt text and everything after
+// `--` remain Claude arguments, including a literal `--fast`.
+fn launch_arguments(mut arguments: Vec<OsString>) -> (bool, Vec<OsString>) {
+    let fast = arguments
+        .first()
+        .is_some_and(|argument| argument == "--fast");
+    if fast {
+        arguments.remove(0);
+    }
+    (fast, arguments)
 }
 
 fn should_launch_claude(arguments: &[OsString]) -> bool {
@@ -396,6 +412,25 @@ mod tests {
         ] {
             assert!(should_launch_claude(&arguments(values)), "{values:?}");
         }
+    }
+
+    #[test]
+    fn session_fast_is_only_consumed_before_claude_arguments() {
+        assert_eq!(
+            launch_arguments(arguments(&["--fast", "--resume"])),
+            (true, arguments(&["--resume"]))
+        );
+        for args in [
+            &["-p", "--fast"][..],
+            &["--", "--fast"][..],
+            &["--resume", "--fast"][..],
+        ] {
+            assert_eq!(launch_arguments(arguments(args)), (false, arguments(args)));
+        }
+        assert_eq!(
+            launch_arguments(arguments(&["--fast", "--", "--fast"])),
+            (true, arguments(&["--", "--fast"]))
+        );
     }
 
     #[test]
