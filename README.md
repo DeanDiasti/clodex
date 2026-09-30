@@ -171,9 +171,10 @@ Claude Code's background Haiku requests are supported through the Sonnet
 route. If fewer than three models are available, Clodex safely reuses the
 closest available route.
 
-No model names are hard-coded. This allows the mapping to follow the live
-Codex catalog, while a preflight check ensures the installed translation proxy
-also understands every selected model.
+No model names are hard-coded, so the mapping follows the live Codex catalog.
+The built-in backend routes every model in that catalog. With the external
+proxy backend, a preflight check also ensures the installed
+`claude-code-proxy` understands every selected model.
 
 ## Claude models on your Claude subscription
 
