@@ -48,6 +48,13 @@ fn concurrent_supervisors_share_one_proxy_until_the_final_lease_closes() {
     let test_binary = std::env::current_exe().unwrap();
     fs::create_dir_all(&codex_home).unwrap();
     fs::create_dir_all(&fake_bin).unwrap();
+    // The built-in backend is the default; this test covers the external one.
+    fs::create_dir_all(&clodex_home).unwrap();
+    fs::write(
+        clodex_home.join("config.json"),
+        r#"{"version":1,"codex":{"backend":"proxy"}}"#,
+    )
+    .unwrap();
 
     let auth_path = codex_home.join("auth.json");
     fs::write(
@@ -143,7 +150,7 @@ exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocaptur
 
     fs::write(
         clodex_home.join("config.json"),
-        r#"{"version":1,"codex":{"transport":"websocket"}}"#,
+        r#"{"version":1,"codex":{"transport":"websocket","backend":"proxy"}}"#,
     )
     .unwrap();
 

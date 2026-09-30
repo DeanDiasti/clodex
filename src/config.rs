@@ -67,9 +67,9 @@ pub struct CodexConfig {
 #[serde(rename_all = "lowercase")]
 pub enum CodexBackend {
     /// The external `claude-code-proxy` executable.
-    #[default]
     Proxy,
     /// The translator built into Clodex, running inside the supervisor.
+    #[default]
     Builtin,
 }
 
@@ -667,18 +667,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_backend_names_and_defaults_to_the_proxy() {
+    fn parses_codex_backend_names_and_defaults_to_builtin() {
         assert_eq!(
             CodexBackend::parse(" Builtin ").unwrap(),
             CodexBackend::Builtin
         );
         assert_eq!(CodexBackend::parse("proxy").unwrap(), CodexBackend::Proxy);
         assert!(CodexBackend::parse("native").is_err());
-        assert_eq!(AppConfig::default().codex.backend, CodexBackend::Proxy);
+        assert_eq!(AppConfig::default().codex.backend, CodexBackend::Builtin);
         assert!(
             AppConfig::default()
                 .render()
-                .contains("Codex backend:  proxy")
+                .contains("Codex backend:  builtin")
         );
     }
 

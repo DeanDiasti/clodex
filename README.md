@@ -42,8 +42,9 @@ owned by the Codex CLI.
 - macOS or Linux
 - [Codex CLI](https://developers.openai.com/codex/cli), logged in with ChatGPT
 - [Claude Code](https://code.claude.com/docs/en/setup)
-- [`claude-code-proxy`](https://github.com/raine/claude-code-proxy), unless
-  you use the [built-in Codex backend](#built-in-codex-backend)
+- Optionally, [`claude-code-proxy`](https://github.com/raine/claude-code-proxy),
+  only if you switch from the [built-in Codex backend](#built-in-codex-backend)
+  to the external one
 
 Clodex currently relies on Unix domain sockets and does not support native
 Windows.
@@ -67,15 +68,11 @@ To build from source instead, install Rust 1.88 or newer and run:
 ```sh
 git clone https://github.com/DeanDiasti/clodex.git
 cd clodex
-./scripts/install.sh --install-proxy
-```
-
-`--install-proxy` uses Homebrew only when the translation proxy is missing.
-If every prerequisite is already present, use:
-
-```sh
 ./scripts/install.sh
 ```
+
+Add `--install-proxy` to also install `claude-code-proxy` with Homebrew, for
+the optional external backend.
 
 The source installer uses `~/.local` by default, producing
 `~/.local/bin/clodex`.
@@ -244,7 +241,8 @@ supervisor. Requests are tracked independently by Claude session and subagent,
 so concurrent sessions can use different models and fast-mode settings. The
 bridge marker and Claude fast-mode override are injected only into the child
 process launched by `clodex`; normal `claude` sessions and global Claude
-settings are not changed. This requires `claude-code-proxy` 0.1.32 or newer.
+settings are not changed. With the external proxy backend, this requires
+`claude-code-proxy` 0.1.32 or newer.
 
 After installing or upgrading Clodex, close all older Clodex sessions once so
 their old supervisor can exit. The first new `clodex` process will start the
@@ -365,12 +363,12 @@ execution permissions and allow only tools you understand.
 
 ## Built-in Codex backend
 
-Clodex can translate Claude Code's requests for Codex itself, with no
-external proxy installed:
+Clodex translates Claude Code's requests for Codex itself, with no external
+proxy installed. This is the default. The external proxy remains available:
 
 ```sh
-clodex config backend builtin
-clodex config backend proxy     # back to claude-code-proxy
+clodex config backend proxy     # use claude-code-proxy
+clodex config backend builtin   # back to the built-in backend (default)
 ```
 
 The built-in backend is the Codex path of `claude-code-proxy` v0.1.42,
@@ -384,8 +382,7 @@ It follows the live Codex catalog rather than a fixed model list: a model
 Codex adds is routable immediately, on the Responses lane the catalog names.
 The external proxy only routes the models its release lists.
 
-The default is still `proxy` while the built-in backend is proven on real
-traffic. Close every active Clodex session after switching so the supervisor
+Close every active Clodex session after switching so the supervisor
 restarts. The backend writes its log to
 `~/.clodex/logs/claude-code-proxy/proxy.log`, like the external proxy.
 
@@ -498,9 +495,10 @@ clodex context
 - **“No refresh token stored” after a 401:** run `clodex auth sync`. This asks
   Codex to refresh its managed login, then replaces the active proxy's stale
   access-token adapter without copying the refresh token.
-- **A newly released model is unsupported:** update
-  `claude-code-proxy`; Clodex refuses to start with a translator that cannot
-  route the live mapping.
+- **A newly released model is unsupported:** with the external proxy backend,
+  update `claude-code-proxy` or switch back with `clodex config backend builtin`;
+  Clodex refuses to start with a translator that cannot route the live mapping.
+  The built-in backend routes every model in the live Codex catalog.
 - **A proxy appears to remain after all sessions close:** wait for the
   one-second grace period, then inspect `~/.clodex/logs/supervisor.log` and
   `proxy.log`. A new session can safely remove a stale control socket while

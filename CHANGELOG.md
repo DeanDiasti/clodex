@@ -9,6 +9,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The built-in Codex backend is the default. `claude-code-proxy` is no longer
+  required; `clodex config backend proxy` selects it.
 - The minimum supported Rust version is now 1.88.
 
 ### Added
@@ -16,7 +18,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A built-in Codex backend (`clodex config backend builtin`), vendored from
   claude-code-proxy v0.1.42's Codex path, that runs inside the supervisor so
   no external proxy is needed. It routes every model in the live Codex
-  catalog. The external proxy remains the default for now.
+  catalog.
 - Claude models on your own Claude subscription with `clodex config route`.
   The bridge forwards Claude-routed requests to Anthropic with Claude Code's
   own login, strips that credential from every Codex-bound request, and
