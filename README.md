@@ -129,9 +129,9 @@ Useful installer options:
 ```
 
 `CLODEX_INSTALL_ROOT` supplies the default for `--root`. To uninstall, run
-`clodex auth logout`, then remove `<install-root>/bin/clodex`. Remove
-`~/.clodex` as well only if the saved configuration, sign-in, cache, and logs
-are no longer wanted.
+`clodex auth logout`, then remove `<install-root>/bin/clodex`. Remove the
+Clodex home as well, `$CLODEX_HOME` when it is set and `~/.clodex` otherwise,
+only if the saved configuration, sign-in, cache, and logs are no longer wanted.
 
 ## Commands
 
