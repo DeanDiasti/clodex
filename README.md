@@ -282,6 +282,12 @@ clodex --fast -p "Review this repository"
 The launch banner shows `FAST (Codex session)`. The policy lasts for that
 launch; Claude Code's `/fast` toggle is disabled in a `--fast` session.
 
+Custom status-line scripts can pipe Claude Code's JSON to
+`clodex statusline-fast`. It prints `FAST` for the current supported model,
+`FAST unavailable` for an unsupported model, and nothing in a launch without
+`--fast`. The helper reads only the launch environment and stdin; it never
+starts Claude Code or makes a network request.
+
 Inside a Clodex session, `/fast on` enables the Codex priority service tier for
 the model that is already selected. It does not switch the route to Fable,
 Opus, Sonnet, or another model. `/fast off` returns that same model to the

@@ -7,6 +7,7 @@ mod fast_bridge;
 mod launcher;
 mod mapping;
 mod picker;
+mod statusline;
 mod supervisor;
 
 use std::ffi::OsString;
@@ -44,6 +45,8 @@ enum Command {
     Context,
     /// Check the local Claude, Codex sign-in, and backend prerequisites.
     Doctor,
+    /// Print this launch's fast label from Claude status-line JSON on stdin.
+    StatuslineFast,
     #[command(name = "__supervisor", hide = true)]
     Supervisor,
 }
@@ -163,6 +166,7 @@ fn main() -> Result<()> {
         Some(Command::Config(args)) => run_config(args),
         Some(Command::Context) => run_context(),
         Some(Command::Doctor) => doctor::run(),
+        Some(Command::StatuslineFast) => statusline::run(),
         Some(Command::Supervisor) => supervisor::run(),
     }
 }
@@ -190,6 +194,7 @@ fn should_launch_claude(arguments: &[OsString]) -> bool {
             | "config"
             | "context"
             | "doctor"
+            | "statusline-fast"
             | "__supervisor"
             | "-h"
             | "--help"
@@ -392,6 +397,7 @@ mod tests {
             "config",
             "context",
             "doctor",
+            "statusline-fast",
             "__supervisor",
             "-h",
             "--help",
