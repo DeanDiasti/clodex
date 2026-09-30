@@ -7,6 +7,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Switching to a Codex model with `/model <name>` no longer waits a second or
+  more on the first switch. Clodex lists its models as Claude Code's curated
+  `modelPicker` rows, so Claude Code no longer checks each one with a
+  one-token request to Codex.
+
 ### Changed
 
 - The Codex CLI is optional. `clodex auth login` signs in to Codex with a

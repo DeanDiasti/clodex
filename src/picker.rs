@@ -118,6 +118,27 @@ fn gateway_cache(base_url: &str, entries: &[Entry], mapping: &ModelMapping) -> R
     }))?)
 }
 
+/// The `modelPicker` setting that names every entry as a curated picker row.
+/// Claude Code probes a model it does not recognise with a one-token request
+/// before switching to it, which costs a full Codex round trip; a model in the
+/// curated rows is trusted without that probe.
+pub fn model_picker(entries: &[Entry]) -> Option<Value> {
+    if entries.is_empty() {
+        return None;
+    }
+    let options: Vec<Value> = entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "model": entry.id,
+                "label": entry.display_name,
+                "description": entry.description,
+            })
+        })
+        .collect();
+    Some(json!({ "options": options }))
+}
+
 /// One subagent type per model, so a subagent can run on either provider.
 /// The Agent tool's own `model` parameter only accepts the four role aliases.
 pub fn agents_json(entries: &[Entry]) -> String {
@@ -304,6 +325,22 @@ mod tests {
         );
         assert_eq!(agents["claude-sonnet-5-5"]["prompt"], AGENT_PROMPT);
         assert_eq!(agents.as_object().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn every_model_is_a_curated_picker_row() {
+        let picker = model_picker(&entries(&catalog(), &listing(), true)).unwrap();
+        let models: Vec<_> = picker["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["model"].as_str().unwrap())
+            .collect();
+        assert_eq!(models.len(), 6);
+        assert!(models.contains(&"gpt-6-luna"));
+        assert!(models.contains(&"anthropic/claude-opus-5-5"));
+        assert_eq!(picker["options"][0]["label"], "GPT-6-SOL");
+        assert!(model_picker(&[]).is_none());
     }
 
     #[test]
