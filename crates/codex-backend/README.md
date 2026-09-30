@@ -7,14 +7,14 @@ its supervisor when `clodex config backend builtin` is selected.
 
 This crate is vendored from
 [claude-code-proxy](https://github.com/raine/claude-code-proxy) at tag
-`v0.1.42` (commit `1e30e30`), copyright Claude Code Proxy contributors, under
+`v0.1.42` (commit `1e30e30`), copyright Raine Virta, under
 the MIT License reproduced in [LICENSE](LICENSE).
 
 ## Changes from upstream
 
 - Only the Codex provider is kept. The Cursor, Grok, Kimi, and OpenCode
-  providers, the terminal UI, and the executable are removed, along with the
-  tests that covered them.
+  providers, the terminal UI and its dependencies, and the executable are
+  removed, along with the tests that covered them.
 - The registry and model table accept every model in the live Codex catalog
   that Clodex installs at startup (`embedded::install_catalog`), and take each
   model's Responses lane from that catalog. The vendored model lists remain

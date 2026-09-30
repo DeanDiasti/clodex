@@ -262,7 +262,9 @@ where
                 .write(&self.service, &self.account, &raw)
                 .is_ok()
             {
-                return Ok(());
+                // `load` prefers the file, so a stale copy would shadow the
+                // value just written to the Keychain.
+                return self.file_store.clear();
             }
             return self.file_store.save(value);
         }
@@ -569,6 +571,8 @@ mod tests {
             KeychainFileAuthStore::new(file.clone(), legacy, "svc", "acct", true, keychain.clone());
 
         store.save(json!({"source": "saved"})).unwrap();
+        assert!(!std::path::Path::new(&file).exists());
+        assert_eq!(store.load().unwrap().unwrap()["source"], json!("saved"));
         let raw = keychain.raw("svc", "acct").unwrap();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&raw).unwrap()["source"],

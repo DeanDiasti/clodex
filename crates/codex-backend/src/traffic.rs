@@ -406,7 +406,8 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
                             | "sub"
                     )
                 {
-                    out.insert(key.clone(), redact_traffic_value(value));
+                    // A credential is never kept, whatever its shape.
+                    out.insert(key.clone(), redact_credential_value(value));
                 } else {
                     out.insert(key.clone(), redact_traffic_with_depth(value, depth + 1));
                 }
@@ -456,6 +457,13 @@ fn redact_traffic_value(value: &Value) -> Value {
         // Structured values (e.g. Kimi's `{url: ...}` image_url) keep their
         // shape so captures stay parseable; only the payload leaves.
         Value::Object(_) | Value::Array(_) => redact_traffic(value),
+        _ => Value::String("[redacted]".to_string()),
+    }
+}
+
+fn redact_credential_value(value: &Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(format!("[redacted len={}]", s.len())),
         _ => Value::String("[redacted]".to_string()),
     }
 }
@@ -825,6 +833,24 @@ mod tests {
             !rendered.contains("iVBORw0KGgo"),
             "nested payload leaked: {rendered}"
         );
+    }
+
+    #[test]
+    fn traffic_redacts_structured_credentials_entirely() {
+        let redacted = redact_traffic(&serde_json::json!({
+            "authorization": {"scheme": "Bearer", "value": "secret-token"},
+            "token": ["secret-a", "secret-b"],
+            "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg"}
+        }));
+        let rendered = redacted.to_string();
+        assert!(
+            !rendered.contains("secret"),
+            "credential leaked: {rendered}"
+        );
+        assert_eq!(redacted["authorization"], "[redacted]");
+        assert_eq!(redacted["token"], "[redacted]");
+        // Image payloads keep their shape.
+        assert!(redacted["image_url"].is_object());
     }
 
     #[test]

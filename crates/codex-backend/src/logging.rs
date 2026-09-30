@@ -11,7 +11,7 @@ pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
 
 static STDERR_SUPPRESSION_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
-pub const REDACT_KEYS: [&str; 15] = [
+pub const REDACT_KEYS: [&str; 23] = [
     "authorization",
     "proxy-authorization",
     "access",
@@ -27,7 +27,17 @@ pub const REDACT_KEYS: [&str; 15] = [
     "x-api-key",
     "apikey",
     "api_key",
+    "token",
+    "bearer_token",
+    "oauth_token",
+    "oauth_access_token",
+    "oauth_refresh_token",
+    "client_secret",
+    "secret",
+    "password",
 ];
+
+const MAX_LOGGED_STRING_BYTES: usize = 4000;
 
 pub fn log_file() -> std::path::PathBuf {
     paths::log_file()
@@ -188,8 +198,14 @@ fn redact_with_depth(value: Value, depth: u8) -> Value {
         Value::String(s) => {
             if config::log_verbose() {
                 Value::String(s)
-            } else if s.len() > 4000 {
-                Value::String(format!("{}…[{} more]", &s[..4000], s.len() - 4000))
+            } else if s.len() > MAX_LOGGED_STRING_BYTES {
+                // Slicing at a fixed byte offset panics inside a multi-byte
+                // character, so cut at the nearest boundary before it.
+                let mut cut = MAX_LOGGED_STRING_BYTES;
+                while !s.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                Value::String(format!("{}…[{} more]", &s[..cut], s.len() - cut))
             } else {
                 Value::String(s)
             }
@@ -259,6 +275,31 @@ mod tests {
 
         drop(outer);
         assert!(should_mirror_to_stderr("warn"));
+    }
+
+    #[test]
+    fn long_strings_truncate_at_a_character_boundary() {
+        let _lock = STDERR_TEST_LOCK.lock().unwrap();
+        // 3999 ASCII bytes put the 4000-byte cut inside a two-byte character.
+        let text = format!("{}é tail", "a".repeat(3999));
+        let redacted = redact_value(serde_json::json!({ "text": text }));
+        let rendered = redacted["text"].as_str().unwrap();
+        assert!(rendered.starts_with(&"a".repeat(3999)));
+        assert!(rendered.ends_with(&format!("…[{} more]", text.len() - 3999)));
+    }
+
+    #[test]
+    fn redacts_generic_secret_keys() {
+        let redacted = redact_value(serde_json::json!({
+            "token": "abc",
+            "client_secret": "def",
+            "Password": "ghi",
+            "safe": "kept"
+        }));
+        assert_eq!(redacted["token"], "[redacted len=3]");
+        assert_eq!(redacted["client_secret"], "[redacted len=3]");
+        assert_eq!(redacted["Password"], "[redacted len=3]");
+        assert_eq!(redacted["safe"], "kept");
     }
 
     #[test]

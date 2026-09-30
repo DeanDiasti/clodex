@@ -7,14 +7,19 @@
 
 use std::net::TcpListener as StdTcpListener;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::sync::oneshot;
 
 pub use crate::providers::codex::translate::model_allowlist::{CatalogModel, install_catalog};
 
-/// A running embedded server. Dropping it shuts the server down and waits for
-/// in-flight connections to finish draining.
+/// How long dropping the server waits for in-flight connections to drain. A
+/// stalled upstream stream must not keep the embedding process from exiting.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// A running embedded server. Dropping it shuts the server down and waits up
+/// to [`DRAIN_DEADLINE`] for in-flight connections to drain.
 pub struct EmbeddedServer {
     port: u16,
     shutdown: Option<oneshot::Sender<()>>,
@@ -79,7 +84,14 @@ impl Drop for EmbeddedServer {
             let _ = shutdown.send(());
         }
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            let deadline = Instant::now() + DRAIN_DEADLINE;
+            while !thread.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+            // Otherwise the thread is detached and ends with the process.
         }
     }
 }
@@ -105,5 +117,23 @@ mod tests {
 
         drop(server);
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    }
+
+    #[test]
+    fn a_stalled_connection_cannot_hold_shutdown_past_the_deadline() {
+        let server = EmbeddedServer::start().unwrap();
+        // A request whose body never arrives keeps a connection in flight.
+        let mut stalled = std::net::TcpStream::connect(("127.0.0.1", server.port())).unwrap();
+        stalled
+            .write_all(
+                b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 100\r\n\r\n{",
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        drop(server);
+        assert!(started.elapsed() < DRAIN_DEADLINE + Duration::from_secs(2));
+        drop(stalled);
     }
 }

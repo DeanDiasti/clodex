@@ -14,9 +14,11 @@ use tokio_tungstenite::{WebSocketStream, accept_async, accept_hdr_async, connect
 
 /// Spawn a WebSocket mock server that accepts one connection, captures
 /// handshake headers, reads one text message, and calls `handler` with
-/// headers and the stream. Returns the listener address as `http://addr/...`.
+/// headers and the stream. Returns the listener address as `http://addr/...`
+/// and the handler's task, which a test awaits so the handler's assertions
+/// count.
 #[allow(clippy::result_large_err)]
-async fn websocket_mock<F, Fut>(handler: F) -> String
+async fn websocket_mock<F, Fut>(handler: F) -> (String, tokio::task::JoinHandle<()>)
 where
     F: Fn(http::HeaderMap, WebSocketStream<TcpStream>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -26,22 +28,21 @@ where
     let captured_headers: Arc<Mutex<Option<http::HeaderMap>>> = Arc::new(Mutex::new(None));
     let ch = captured_headers.clone();
 
-    tokio::spawn(async move {
-        if let Ok((stream, _)) = listener.accept().await {
-            let ch = ch.clone();
-            let ws = accept_hdr_async(stream, |req: &http::Request<()>, resp| {
-                let mut guard = ch.try_lock().unwrap();
-                *guard = Some(req.headers().clone());
-                Ok(resp)
-            })
-            .await
-            .unwrap();
-            let headers = captured_headers.lock().await.clone().unwrap_or_default();
-            tokio::spawn(handler(headers, ws));
-        }
+    let task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let ch = ch.clone();
+        let ws = accept_hdr_async(stream, |req: &http::Request<()>, resp| {
+            let mut guard = ch.try_lock().unwrap();
+            *guard = Some(req.headers().clone());
+            Ok(resp)
+        })
+        .await
+        .unwrap();
+        let headers = captured_headers.lock().await.clone().unwrap_or_default();
+        handler(headers, ws).await;
     });
 
-    format!("http://{addr}/backend-api/codex/responses")
+    (format!("http://{addr}/backend-api/codex/responses"), task)
 }
 
 /// Build a simple SSE event string
@@ -105,7 +106,7 @@ async fn websocket_concurrent_requests() {
 
 #[tokio::test]
 async fn websocket_request_serializes_response_create() {
-    let url = websocket_mock(|_headers, mut ws| async move {
+    let (url, handler) = websocket_mock(|_headers, mut ws| async move {
         let msg = ws.next().await.unwrap().unwrap().into_text().unwrap();
         let value: serde_json::Value = serde_json::from_str(&msg).unwrap();
         // Must have type: response.create
@@ -145,6 +146,7 @@ async fn websocket_request_serializes_response_create() {
         .send(Message::Text(serde_json::to_string(&req).unwrap()))
         .await
         .unwrap();
+    handler.await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +155,7 @@ async fn websocket_request_serializes_response_create() {
 
 #[tokio::test]
 async fn websocket_collects_sse_events_until_terminal() {
-    let url = websocket_mock(|_headers, mut ws| async move {
+    let (url, handler) = websocket_mock(|_headers, mut ws| async move {
         let _msg = ws.next().await.unwrap().unwrap();
         ws.send(Message::Text(
             r#"{"type":"response.output_text.delta","delta":"hello"}"#.into(),
@@ -198,6 +200,7 @@ async fn websocket_collects_sse_events_until_terminal() {
     assert!(body_str.contains("output_text.delta"), "missing delta");
     assert!(body_str.contains("response.completed"), "missing completed");
     assert!(body_str.contains("hello"), "missing delta content");
+    handler.await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -223,8 +226,10 @@ async fn websocket_connect_timeout_on_unreachable() {
 
 #[tokio::test]
 async fn websocket_idle_timeout_no_events() {
-    let url = websocket_mock(|_headers, _ws| async move {
-        // Accept connection but never send anything
+    let (url, handler) = websocket_mock(|_headers, ws| async move {
+        // Hold the connection open but never send anything. Binding it here
+        // matters: an unused capture would drop the socket immediately.
+        let _ws = ws;
         futures_util::future::pending::<()>().await;
     })
     .await;
@@ -245,7 +250,12 @@ async fn websocket_idle_timeout_no_events() {
     })
     .await;
 
-    assert!(timeout.is_err() || timeout.is_ok());
+    assert!(
+        timeout.is_err(),
+        "the idle connection produced a frame or closed"
+    );
+    // The handler waits forever by design.
+    handler.abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -254,7 +264,7 @@ async fn websocket_idle_timeout_no_events() {
 
 #[tokio::test]
 async fn websocket_invalidation_on_error() {
-    let url = websocket_mock(|_headers, mut ws| async move {
+    let (url, handler) = websocket_mock(|_headers, mut ws| async move {
         let _msg = ws.next().await.unwrap();
         ws.send(Message::Text(
             r#"{"type":"response.failed","response":{"id":"resp_e"}}"#.into(),
@@ -287,6 +297,7 @@ async fn websocket_invalidation_on_error() {
         }
     }
     assert!(got_error, "expected response.failed event");
+    handler.await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
