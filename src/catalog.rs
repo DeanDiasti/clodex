@@ -1,8 +1,29 @@
 use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+/// Where Codex publishes the model catalog for a signed-in ChatGPT account.
+const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+/// The Codex client version the catalog is requested for. The service hides
+/// models that need a newer client, so this moves with the vendored backend.
+pub const CODEX_CLIENT_VERSION: &str = "0.159.0";
+/// How long a fetched catalog is reused before it is checked again.
+const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// A fetched catalog as cached under the Clodex home.
+#[derive(Deserialize, Serialize)]
+struct CachedCatalog {
+    fetched_at_ms: u64,
+    client_version: String,
+    #[serde(default)]
+    etag: Option<String>,
+    catalog: serde_json::Value,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Catalog {
@@ -68,6 +89,41 @@ impl Model {
 }
 
 impl Catalog {
+    /// The live catalog for the signed-in account. A catalog fetched in the
+    /// last few minutes is reused. When the fetch fails, the last cached
+    /// catalog is used, then the Codex CLI's, if it is installed.
+    pub fn load() -> Result<Self> {
+        let path = cache_path()?;
+        let cached = read_cache(&path);
+        if let Some(cached) = cached.as_ref().filter(|cached| is_fresh(cached)) {
+            return parse(&cached.catalog);
+        }
+        match fetch(cached.as_ref().and_then(|cached| cached.etag.as_deref())) {
+            Ok(Fetched::Changed { catalog, etag }) => {
+                let parsed = parse(&catalog)?;
+                write_cache(&path, catalog, etag);
+                Ok(parsed)
+            }
+            Ok(Fetched::Unchanged) => {
+                let cached = cached.context("the catalog was unchanged but not cached")?;
+                let parsed = parse(&cached.catalog)?;
+                write_cache(&path, cached.catalog, cached.etag);
+                Ok(parsed)
+            }
+            Err(error) => match cached {
+                Some(cached) => parse(&cached.catalog),
+                None => Self::load_from_codex().map_err(|_| error),
+            },
+        }
+    }
+
+    /// The last catalog `load` cached, without contacting the network.
+    pub fn load_cached() -> Result<Self> {
+        let cached =
+            read_cache(&cache_path()?).context("no Codex model catalog has been cached yet")?;
+        parse(&cached.catalog)
+    }
+
     pub fn load_from_codex() -> Result<Self> {
         let output = Command::new("codex")
             .args(["debug", "models"])
@@ -135,6 +191,110 @@ impl Catalog {
     }
 }
 
+enum Fetched {
+    Changed {
+        catalog: serde_json::Value,
+        etag: Option<String>,
+    },
+    Unchanged,
+}
+
+fn fetch(etag: Option<&str>) -> Result<Fetched> {
+    let credentials = crate::auth::load_codex_credentials(false)?;
+    let credentials = if crate::auth::needs_refresh(&credentials) {
+        crate::auth::load_codex_credentials(true).unwrap_or(credentials)
+    } else {
+        credentials
+    };
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let mut request = client
+        .get(MODELS_URL)
+        .query(&[("client_version", CODEX_CLIENT_VERSION)])
+        .bearer_auth(credentials.access_token())
+        .header("originator", "codex_cli_rs")
+        .header(
+            reqwest::header::USER_AGENT,
+            format!("codex_cli_rs/{CODEX_CLIENT_VERSION}"),
+        );
+    if let Some(account_id) = credentials.account_id() {
+        request = request.header("chatgpt-account-id", account_id);
+    }
+    if let Some(etag) = etag {
+        request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+    }
+    let response = request
+        .send()
+        .context("could not reach the Codex model catalog")?;
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(Fetched::Unchanged);
+    }
+    if !response.status().is_success() {
+        bail!(
+            "the Codex model catalog returned HTTP {}",
+            response.status().as_u16()
+        );
+    }
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let catalog = response
+        .json()
+        .context("the Codex model catalog was not valid JSON")?;
+    Ok(Fetched::Changed { catalog, etag })
+}
+
+fn parse(catalog: &serde_json::Value) -> Result<Catalog> {
+    Catalog::deserialize(catalog)
+        .context("Codex returned a model catalog that clodex could not parse")
+}
+
+fn cache_path() -> Result<PathBuf> {
+    Ok(crate::config::clodex_home()?
+        .join("cache")
+        .join("codex-models.json"))
+}
+
+fn read_cache(path: &Path) -> Option<CachedCatalog> {
+    let cached: CachedCatalog = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    // A catalog requested for another client version may list other models.
+    (cached.client_version == CODEX_CLIENT_VERSION).then_some(cached)
+}
+
+fn is_fresh(cached: &CachedCatalog) -> bool {
+    now_ms().saturating_sub(cached.fetched_at_ms) < CACHE_TTL.as_millis() as u64
+}
+
+/// Caching is best effort; a catalog that cannot be saved is still used.
+fn write_cache(path: &Path, catalog: serde_json::Value, etag: Option<String>) {
+    let cached = CachedCatalog {
+        fetched_at_ms: now_ms(),
+        client_version: CODEX_CLIENT_VERSION.to_string(),
+        etag,
+        catalog,
+    };
+    let Some(directory) = path.parent() else {
+        return;
+    };
+    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let saved = fs::create_dir_all(directory)
+        .and_then(|()| fs::write(&temporary, serde_json::to_vec(&cached)?))
+        .and_then(|()| fs::rename(&temporary, path));
+    if saved.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 fn format_context_window(tokens: u64) -> String {
     if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
         format!("{}m context", tokens / 1_000_000)
@@ -164,6 +324,38 @@ mod tests {
             additional_speed_tiers: Vec::new(),
             use_responses_lite: None,
         }
+    }
+
+    #[test]
+    fn cache_is_fresh_for_a_few_minutes_and_bound_to_the_client_version() {
+        let directory = std::env::temp_dir().join(format!(
+            "clodex-catalog-cache-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let path = directory.join("codex-models.json");
+        let catalog =
+            serde_json::json!({"models": [{"slug": "gpt-6-luna", "display_name": "GPT-6 Luna"}]});
+
+        write_cache(&path, catalog, Some("W/\"tag\"".to_string()));
+        let cached = read_cache(&path).unwrap();
+        assert!(is_fresh(&cached));
+        assert_eq!(cached.etag.as_deref(), Some("W/\"tag\""));
+        assert_eq!(parse(&cached.catalog).unwrap().models[0].slug, "gpt-6-luna");
+
+        let stale = CachedCatalog {
+            fetched_at_ms: now_ms() - CACHE_TTL.as_millis() as u64 - 1,
+            ..cached
+        };
+        assert!(!is_fresh(&stale));
+
+        let other_version = CachedCatalog {
+            client_version: "0.1.0".to_string(),
+            ..stale
+        };
+        fs::write(&path, serde_json::to_vec(&other_version).unwrap()).unwrap();
+        assert!(read_cache(&path).is_none());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

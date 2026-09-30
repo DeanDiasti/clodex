@@ -86,12 +86,25 @@ fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body:
 // ---------------------------------------------------------------------------
 
 pub fn run_browser_login() -> Result<TokenResponse, anyhow::Error> {
+    run_browser_login_opening(&|_| {})
+}
+
+/// Runs the login, passing the authorization URL to `open` once the callback
+/// listener is ready, for example to launch a browser.
+pub fn run_browser_login_opening(open: &dyn Fn(&str)) -> Result<TokenResponse, anyhow::Error> {
     let config = BrowserLoginConfig::new(ISSUER);
-    run_browser_login_with_config(&config)
+    run_browser_login_with(&config, open)
 }
 
 pub fn run_browser_login_with_config(
     config: &BrowserLoginConfig,
+) -> Result<TokenResponse, anyhow::Error> {
+    run_browser_login_with(config, &|_| {})
+}
+
+fn run_browser_login_with(
+    config: &BrowserLoginConfig,
+    open: &dyn Fn(&str),
 ) -> Result<TokenResponse, anyhow::Error> {
     let pkce = generate_pkce();
     let state = generate_state();
@@ -106,6 +119,7 @@ pub fn run_browser_login_with_config(
         .map_err(|e| anyhow::anyhow!("Failed to set non-blocking: {e}"))?;
 
     println!("Open this URL in your browser to authorize:\n\n  {auth_url}\n");
+    open(&auth_url);
 
     let deadline = std::time::Instant::now() + config.timeout;
 
@@ -116,7 +130,12 @@ pub fn run_browser_login_with_config(
 
         match listener.accept() {
             Ok((mut stream, _)) => {
-                return handle_callback(&mut stream, &config.issuer, &redirect_uri, &pkce, &state);
+                match handle_callback(&mut stream, &config.issuer, &redirect_uri, &pkce, &state) {
+                    // A stray request, such as a favicon fetch or a callback
+                    // for another login, must not end this one.
+                    Err(error) if error.is::<StrayRequest>() => continue,
+                    result => return result,
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -127,6 +146,18 @@ pub fn run_browser_login_with_config(
         }
     }
 }
+
+/// A request to the callback listener that does not settle this login.
+#[derive(Debug)]
+struct StrayRequest(&'static str);
+
+impl std::fmt::Display for StrayRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for StrayRequest {}
 
 fn handle_callback(
     stream: &mut TcpStream,
@@ -142,34 +173,37 @@ fn handle_callback(
         Some(pair) => pair,
         None => {
             write_response(stream, 400, "text/plain", "Bad request");
-            anyhow::bail!("Bad request");
+            return Err(StrayRequest("Bad request").into());
         }
     };
 
     if path != "/auth/callback" {
         write_response(stream, 404, "text/plain", "Not found");
-        anyhow::bail!("Not found");
+        return Err(StrayRequest("Not found").into());
     }
 
     let params = parse_query(&query);
+    // Only a callback carrying this login's state can settle it.
+    let state_matches = params
+        .get("state")
+        .is_some_and(|received| received == state);
 
     if let Some(error) = params.get("error") {
         write_response(stream, 400, "text/plain", &format!("Auth failed: {error}"));
+        if !state_matches {
+            return Err(StrayRequest("Invalid callback: state mismatch").into());
+        }
         anyhow::bail!("{error}");
     }
 
-    let code = match params.get("code") {
-        Some(c) => c.clone(),
-        None => {
-            write_response(stream, 400, "text/plain", "Auth failed: Invalid callback");
-            anyhow::bail!("Invalid callback");
-        }
+    let Some(code) = params.get("code").cloned() else {
+        write_response(stream, 400, "text/plain", "Auth failed: Invalid callback");
+        return Err(StrayRequest("Invalid callback").into());
     };
 
-    let received_state = params.get("state").cloned().unwrap_or_default();
-    if received_state != state {
+    if !state_matches {
         write_response(stream, 400, "text/plain", "Auth failed: Invalid callback");
-        anyhow::bail!("Invalid callback: state mismatch");
+        return Err(StrayRequest("Invalid callback: state mismatch").into());
     }
 
     match exchange_code_for_tokens(issuer, &code, pkce, redirect_uri) {
@@ -465,6 +499,33 @@ mod tests {
             "unexpected response: {response}"
         );
         drop(fail_server);
+    }
+
+    #[test]
+    fn stray_requests_do_not_end_the_login() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let config = BrowserLoginConfig {
+            issuer: "http://fake-issuer".into(),
+            port,
+            timeout: Duration::from_millis(1500),
+        };
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let client = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let favicon = test_http::send_get(addr, "/favicon.ico");
+            let foreign = test_http::send_get(addr, "/auth/callback?code=c&state=other");
+            (favicon, foreign)
+        });
+
+        // Both requests are answered, and the login keeps waiting until it
+        // times out instead of failing on the first one.
+        let result = run_browser_login_with_config(&config);
+        let (favicon, foreign) = client.join().unwrap();
+        assert!(favicon.contains("404"), "{favicon}");
+        assert!(foreign.contains("400"), "{foreign}");
+        assert!(result.unwrap_err().to_string().contains("OAuth timeout"));
     }
 
     #[test]

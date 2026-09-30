@@ -103,6 +103,64 @@ pub fn exchange_code_for_tokens(
     Ok(tokens)
 }
 
+/// Exchanges a refresh token for a new token set. The response carries a
+/// rotated refresh token, which replaces the one sent.
+pub fn refresh_tokens(
+    issuer: &str,
+    refresh_token: &str,
+) -> Result<crate::providers::codex::auth::jwt::TokenResponse, RefreshError> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| RefreshError::Network(e.to_string()))?;
+    let form = [
+        ("client_id", CLIENT_ID),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+    ];
+    let resp = client
+        .post(format!("{issuer}/oauth/token"))
+        .form(&form)
+        .send()
+        .map_err(|e| RefreshError::Network(e.to_string()))?;
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() {
+        let body = resp.text().unwrap_or_default();
+        // 400 invalid_grant and 401 both mean the refresh token is spent or
+        // revoked; anything else may pass.
+        return Err(
+            if status == 401 || (status == 400 && body.contains("invalid_grant")) {
+                RefreshError::Rejected(status)
+            } else {
+                RefreshError::Failed(status)
+            },
+        );
+    }
+    resp.json()
+        .map_err(|e| RefreshError::Network(format!("unreadable token response: {e}")))
+}
+
+#[derive(Debug)]
+pub enum RefreshError {
+    /// The refresh token no longer works; the user must sign in again.
+    Rejected(u16),
+    Failed(u16),
+    Network(String),
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(status) => write!(f, "the sign-in was rejected (HTTP {status})"),
+            Self::Failed(status) => write!(f, "token refresh failed with HTTP {status}"),
+            Self::Network(message) => write!(f, "token refresh failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for RefreshError {}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

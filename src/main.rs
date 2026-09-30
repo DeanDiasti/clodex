@@ -30,7 +30,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Inspect reuse of the existing Codex CLI login.
+    /// Sign in to Codex with your ChatGPT account, or inspect the sign-in.
     Auth(AuthArgs),
     /// Inspect the live model catalog exposed by Codex.
     Models(ModelsArgs),
@@ -38,7 +38,7 @@ enum Command {
     Config(ConfigArgs),
     /// Show the effective context settings for the current model catalog.
     Context,
-    /// Check the local Claude, Codex, and proxy prerequisites.
+    /// Check the local Claude, Codex sign-in, and backend prerequisites.
     Doctor,
     #[command(name = "__supervisor", hide = true)]
     Supervisor,
@@ -52,9 +52,18 @@ struct AuthArgs {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
-    /// Verify that the existing Codex login can be reused securely.
+    /// Show which Codex sign-in Clodex uses and verify it can be read securely.
     Status,
-    /// Ask Codex to refresh its managed login and sync the active proxy.
+    /// Sign in to Codex with your ChatGPT account. No Codex CLI is needed.
+    Login {
+        /// Sign in with a one-time code instead of a local browser, such as
+        /// over SSH.
+        #[arg(long)]
+        device: bool,
+    },
+    /// Remove Clodex's own Codex sign-in.
+    Logout,
+    /// Refresh the Codex sign-in and sync the running backend.
     Sync,
 }
 
@@ -177,21 +186,42 @@ fn run_auth(args: AuthArgs) -> Result<()> {
     match args.command.unwrap_or(AuthCommand::Status) {
         AuthCommand::Status => {
             let status = auth::prepare_codex_credentials()?;
-            println!("Codex credential reuse is ready.");
-            println!("  Authentication: {}", status.auth_mode);
-            println!("  Source: {}", status.source.display());
+            println!("Codex sign-in is ready.");
+            println!("  Source: {}", status.source.describe());
+            if let Some(account) = status.account {
+                println!("  Account: {account}");
+            }
+            println!("  File: {}", status.path.display());
             println!("  Token: loaded securely in memory and not displayed");
+        }
+        AuthCommand::Login { device } => {
+            let summary = auth::login(device)?;
+            match summary.account {
+                Some(account) => println!("Signed in to Codex as {account}."),
+                None => println!("Signed in to Codex."),
+            }
+            println!("  Saved to {}", summary.path.display());
+        }
+        AuthCommand::Logout => {
+            if auth::logout()? {
+                println!("Removed Clodex's Codex sign-in.");
+            } else {
+                println!("Clodex had no Codex sign-in of its own.");
+            }
+            if auth::codex_auth_path()?.exists() {
+                println!("Clodex will fall back to the Codex CLI's login.");
+            }
         }
         AuthCommand::Sync => {
             supervisor::sync_active_credentials()?;
-            println!("Codex refreshed its managed login and Clodex synchronized the proxy.");
+            println!("Refreshed the Codex sign-in and synchronized the running backend.");
         }
     }
     Ok(())
 }
 
 fn run_models(args: ModelsArgs) -> Result<()> {
-    let catalog = Catalog::load_from_codex()?;
+    let catalog = Catalog::load()?;
 
     match args.command.unwrap_or(ModelsCommand::List) {
         ModelsCommand::List => {
@@ -229,7 +259,7 @@ fn run_config(args: ConfigArgs) -> Result<()> {
             let mut config = config::AppConfig::load()?;
             config.context.max_tokens = config::parse_context_limit(&value)?;
             config.save()?;
-            let catalog = Catalog::load_from_codex()?;
+            let catalog = Catalog::load()?;
             let mapping = ModelMapping::resolve(&catalog, &config.routes)?;
             let effective = config.effective_context_capacity(&catalog, &mapping)?;
             match config.context.max_tokens {
@@ -324,7 +354,7 @@ fn run_config(args: ConfigArgs) -> Result<()> {
 
 fn run_context() -> Result<()> {
     let config = config::AppConfig::load()?;
-    let catalog = Catalog::load_from_codex()?;
+    let catalog = Catalog::load()?;
     let mapping = ModelMapping::resolve(&catalog, &config.routes)?;
     print!("{}", config.render_effective_context(&catalog, &mapping)?);
     Ok(())

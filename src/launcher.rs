@@ -31,7 +31,7 @@ pub fn run(claude_args: Vec<OsString>) -> Result<()> {
     if !crate::config::config_path()?.exists() {
         config.save()?;
     }
-    let catalog = Catalog::load_from_codex()?;
+    let catalog = Catalog::load()?;
     let mapping = ModelMapping::resolve(&catalog, &config.routes)?;
     let support = supervisor::CodexSupport::detect(config.codex.backend)?;
     support.require(&mapping.codex_models())?;

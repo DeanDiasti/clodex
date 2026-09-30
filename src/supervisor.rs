@@ -441,7 +441,7 @@ fn hierarchical_ceiling(app_config: &config::AppConfig) -> u64 {
     if !app_config.compaction.hierarchical {
         return 0;
     }
-    crate::catalog::Catalog::load_from_codex()
+    crate::catalog::Catalog::load_cached()
         .and_then(|catalog| {
             let mapping = crate::mapping::ModelMapping::from_catalog(&catalog)?;
             app_config.effective_context_capacity(&catalog, &mapping)
@@ -490,8 +490,10 @@ fn configure_backend_environment(
 
 /// Lets the built-in backend route every model in the live catalog, and
 /// choose each one's Responses lane from the catalog rather than a fixed list.
+/// The launcher refreshed the cached catalog just before starting this
+/// supervisor, so the cache is current without another request.
 fn install_codex_catalog() {
-    let Ok(catalog) = crate::catalog::Catalog::load_from_codex() else {
+    let Ok(catalog) = crate::catalog::Catalog::load_cached() else {
         // The vendored model table still applies.
         return;
     };
@@ -629,8 +631,8 @@ fn write_proxy_auth(config_dir: &Path, credentials: &CodexCredentials) -> Result
     let auth = ProxyAuth {
         access: credentials.access_token(),
         refresh: "",
-        // Codex remains responsible for refreshing. A high value prevents the
-        // translator from trying to use the intentionally absent refresh token.
+        // The supervisor refreshes the sign-in and rewrites this file. A high
+        // value keeps the translator from using the absent refresh token.
         expires: u64::MAX,
         account_id: credentials.account_id(),
     };

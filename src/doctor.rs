@@ -12,7 +12,11 @@ pub fn run() -> Result<()> {
     let app_config = config::AppConfig::load()?;
 
     print_tool("Claude Code", "claude", &["--version"]);
-    print_tool("Codex CLI", "codex", &["--version"]);
+    if Command::new("codex").arg("--version").output().is_ok() {
+        print_tool("Codex CLI", "codex", &["--version"]);
+    } else {
+        println!("  {:<20} not installed (optional)", "Codex CLI");
+    }
     match app_config.codex.backend {
         config::CodexBackend::Builtin => println!(
             "  {:<20} built in (claude-code-proxy {} Codex path)",
@@ -24,31 +28,19 @@ pub fn run() -> Result<()> {
         }
     }
 
-    let auth = Command::new("codex").args(["login", "status"]).output();
-    match auth {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let status = if stdout.trim().is_empty() {
-                stderr.trim()
-            } else {
-                stdout.trim()
-            };
-            println!("  {:<20} {}", "Codex authentication", status);
-        }
-        Ok(output) => {
+    match auth::prepare_codex_credentials() {
+        Ok(status) => {
+            let account = status
+                .account
+                .map(|account| format!(", {account}"))
+                .unwrap_or_default();
             println!(
-                "  {:<20} unavailable ({})",
-                "Codex authentication",
-                String::from_utf8_lossy(&output.stderr).trim()
+                "  {:<20} ready ({}{account})",
+                "Codex sign-in",
+                status.source.describe()
             );
         }
-        Err(_) => println!("  {:<20} unavailable", "Codex authentication"),
-    }
-
-    match auth::prepare_codex_credentials() {
-        Ok(status) => println!("  {:<20} ready ({})", "Credential reuse", status.auth_mode),
-        Err(error) => println!("  {:<20} unavailable ({error:#})", "Credential reuse"),
+        Err(error) => println!("  {:<20} unavailable ({error:#})", "Codex sign-in"),
     }
 
     print_claude_login(&app_config);
@@ -73,7 +65,7 @@ pub fn run() -> Result<()> {
 /// Codex rejects an oversized prompt with an error that compaction cannot
 /// recover from.
 fn print_context_ceiling(app_config: &config::AppConfig) {
-    let resolved = Catalog::load_from_codex().and_then(|catalog| {
+    let resolved = Catalog::load().and_then(|catalog| {
         let mapping = ModelMapping::resolve(&catalog, &app_config.routes)?;
         let ceiling = config::routed_context_ceiling(&catalog, &mapping)?;
         let capacity = app_config.effective_context_capacity(&catalog, &mapping)?;
