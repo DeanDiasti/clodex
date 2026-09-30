@@ -5,7 +5,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
 
@@ -148,14 +147,16 @@ fn write_log_line(line: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Keeps one previous log, `<name>.1`, which each rotation replaces, so the
+/// log directory stays bounded at about twice `MAX_LOG_BYTES`.
 fn rotate_file(path: &Path) -> io::Result<()> {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let rotated = path.with_extension(format!("{ts}"));
-    fs::rename(path, rotated)?;
-    Ok(())
+    fs::rename(path, rotated_path(path))
+}
+
+fn rotated_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".1");
+    path.with_file_name(name)
 }
 
 fn create_dir(path: &Path, mode: u32) -> io::Result<()> {
@@ -286,6 +287,25 @@ mod tests {
         let rendered = redacted["text"].as_str().unwrap();
         assert!(rendered.starts_with(&"a".repeat(3999)));
         assert!(rendered.ends_with(&format!("…[{} more]", text.len() - 3999)));
+    }
+
+    #[test]
+    fn rotation_replaces_the_single_backup() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let log = directory.path().join("proxy.log");
+        for content in ["first", "second"] {
+            fs::write(&log, content).unwrap();
+            rotate_file(&log).unwrap();
+        }
+        let entries: Vec<_> = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, ["proxy.log.1"]);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("proxy.log.1")).unwrap(),
+            "second"
+        );
     }
 
     #[test]

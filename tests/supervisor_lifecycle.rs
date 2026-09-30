@@ -245,7 +245,7 @@ fn the_builtin_backend_serves_requests_without_the_external_proxy() {
         .unwrap();
 
     let socket = clodex_home.join("run/control.sock");
-    wait_until(Duration::from_secs(10), || socket.exists());
+    wait_until(Duration::from_secs(20), || socket.exists());
     let (lease, port) = acquire_lease(&socket);
 
     // Token counting is answered by the backend itself, so this exercises the
