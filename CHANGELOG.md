@@ -52,6 +52,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Restored `clodex --fast` as a session-wide priority policy for supported
+  Codex models, including subagents, model switches, and compaction, with
+  standard-speed fallback for unsupported models and unchanged Claude routes.
 - `auto` context capacity now follows the catalog's extended
   `max_context_window` and `effective_context_window_percent` instead of the
   smaller standard usage threshold.

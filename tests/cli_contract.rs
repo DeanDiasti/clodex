@@ -19,6 +19,11 @@ fn top_level_help_and_version_are_available_without_runtime_dependencies() {
         );
     }
     assert!(!help.contains("__supervisor"));
+    assert!(help.contains("--fast"));
+    assert!(help.contains("subagents"));
+
+    let fast_help = clodex(&["--fast", "--help"]);
+    assert!(fast_help.status.success());
 
     let version = clodex(&["--version"]);
     assert!(version.status.success());
