@@ -171,8 +171,14 @@ fn build_claude_command(
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
             &mapping.haiku_compatibility.model,
         )
-        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
         .env("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "1");
+    if !claude {
+        // With only the placeholder token, Claude Code's own calls to
+        // Anthropic cannot authenticate. With the subscription login they
+        // can, and they are what load feature-flagged tools and the
+        // organization's managed plugins, so they stay on.
+        command.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+    }
     Ok(command)
 }
 
@@ -635,6 +641,8 @@ mod tests {
         let value = |name: &str| environment.get(OsStr::new(name)).cloned();
         assert_eq!(value("ANTHROPIC_AUTH_TOKEN"), Some(None));
         assert_eq!(value("ANTHROPIC_API_KEY"), Some(None));
+        // Claude Code's own Anthropic calls load its plugins and tools.
+        assert_eq!(value("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"), None);
         assert_eq!(
             value("ANTHROPIC_DEFAULT_OPUS_MODEL"),
             Some(Some("anthropic/claude-opus-5-5".into()))
