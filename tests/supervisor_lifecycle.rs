@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,9 +15,13 @@ struct TestDirectory(PathBuf);
 
 impl TestDirectory {
     fn new() -> Self {
+        // Tests run in parallel, and macOS clocks have microsecond resolution,
+        // so the time alone can hand two tests the same directory.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = PathBuf::from("/tmp").join(format!(
-            "cdx-life-{}-{}",
+            "cdx-life-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
