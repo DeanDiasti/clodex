@@ -36,7 +36,8 @@ pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
     let mapping = ModelMapping::resolve(&catalog, &config.routes)?;
     let support = supervisor::CodexSupport::detect(config.codex.backend)?;
     support.require(&mapping.codex_models())?;
-    if mapping.uses_anthropic() {
+    let requires_claude_subscription = mapping.uses_anthropic();
+    if requires_claude_subscription {
         require_claude_subscription()?;
     }
 
@@ -62,7 +63,10 @@ pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
     }
     // With a subscription login, Claude models are offered even when no role
     // is routed to one, so Claude Code keeps that login for every request.
-    let claude = supports_fast_bridge && has_claude_subscription();
+    // Claude-routed launches already checked the subscription above. Reuse
+    // that result instead of starting a second `claude auth status` process.
+    let claude =
+        supports_fast_bridge && (requires_claude_subscription || has_claude_subscription());
     let models = picker::entries(&catalog, &support, claude);
     if let Err(error) =
         picker::write_gateway_cache(&format!("http://127.0.0.1:{proxy_port}"), &models, &mapping)
