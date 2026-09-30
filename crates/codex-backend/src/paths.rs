@@ -25,7 +25,7 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
         return Path::new(override_dir).to_path_buf();
     }
 
-    if deps.platform == "win32" {
+    if is_windows(&deps.platform) {
         let appdata = deps
             .env
             .get("APPDATA")
@@ -34,7 +34,7 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
         return join_with_sep(&appdata, &["claude-code-proxy"], true);
     }
 
-    if deps.platform == "darwin" {
+    if matches!(deps.platform.as_str(), "darwin" | "macos") {
         return join_with_sep(&deps.home, &[".config", "claude-code-proxy"], false);
     }
 
@@ -47,7 +47,7 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
 }
 
 pub fn resolve_state_dir(deps: &DirResolverEnv) -> PathBuf {
-    if deps.platform == "win32" {
+    if is_windows(&deps.platform) {
         let local = deps
             .env
             .get("LOCALAPPDATA")
@@ -62,6 +62,12 @@ pub fn resolve_state_dir(deps: &DirResolverEnv) -> PathBuf {
             .into_owned()
     });
     join_with_sep(&base, &["claude-code-proxy"], false)
+}
+
+/// Accepts both `std::env::consts::OS` names and the Node-style names the
+/// upstream proxy used.
+fn is_windows(platform: &str) -> bool {
+    matches!(platform, "win32" | "windows")
 }
 
 pub fn legacy_config_dir(deps: &DirResolverEnv) -> PathBuf {

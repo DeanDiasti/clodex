@@ -107,11 +107,9 @@ fn parse_block(block: &str) -> Vec<SseEvent> {
 
         let mut split = raw.splitn(2, ':');
         let key = split.next().unwrap_or_default();
-        let value = split
-            .next()
-            .unwrap_or_default()
-            .trim_start_matches(' ')
-            .to_string();
+        // The SSE spec strips exactly one space after the colon.
+        let value = split.next().unwrap_or_default();
+        let value = value.strip_prefix(' ').unwrap_or(value).to_string();
 
         match key {
             "event" => {

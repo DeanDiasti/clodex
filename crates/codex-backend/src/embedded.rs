@@ -55,9 +55,16 @@ impl EmbeddedServer {
             })
             .context("could not start the embedded Codex backend thread")?;
 
-        ready_rx
-            .recv()
-            .context("the embedded Codex backend did not start")?;
+        if ready_rx.recv().is_err() {
+            // The thread dropped the sender without signalling, so it ended
+            // before serving; its result says why.
+            let error = match thread.join() {
+                Ok(Err(error)) => error,
+                Ok(Ok(())) => anyhow::anyhow!("the backend thread exited before serving"),
+                Err(_) => anyhow::anyhow!("the backend thread panicked"),
+            };
+            return Err(error.context("the embedded Codex backend did not start"));
+        }
         Ok(Self {
             port,
             shutdown: Some(shutdown_tx),

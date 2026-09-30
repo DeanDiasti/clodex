@@ -17,10 +17,7 @@ pub fn should_retry_status(status: u16) -> bool {
 }
 
 pub fn compute_backoff_delay(attempt: u32, retry_after: Option<&str>) -> BackoffOutcome {
-    if let Some(raw) = retry_after
-        && let Ok(raw_secs) = raw.parse::<f64>()
-    {
-        let target_ms = (raw_secs * 1000.0).ceil() as u64;
+    if let Some(target_ms) = retry_after.and_then(retry_after_ms) {
         return BackoffOutcome {
             wait_ms: target_ms.min(RETRY_MAX_DELAY_MS),
             exceeds_budget: target_ms > RETRY_MAX_DELAY_MS,
@@ -38,6 +35,22 @@ pub fn compute_backoff_delay(attempt: u32, retry_after: Option<&str>) -> Backoff
         wait_ms,
         exceeds_budget: false,
     }
+}
+
+/// The wait a `Retry-After` value asks for: delay seconds, or an HTTP-date
+/// still in the future. Anything else leaves the exponential schedule in
+/// charge, so a negative or past value cannot trigger an immediate retry.
+fn retry_after_ms(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if let Ok(secs) = raw.parse::<f64>() {
+        return (secs.is_finite() && secs >= 0.0).then(|| (secs * 1000.0).ceil() as u64);
+    }
+    let date =
+        time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc2822).ok()?;
+    let remaining = date - time::OffsetDateTime::now_utc();
+    remaining
+        .is_positive()
+        .then(|| u64::try_from(remaining.whole_milliseconds()).unwrap_or(u64::MAX))
 }
 
 static ZERO_RETRY_DELAY_FOR_TESTS: AtomicBool = AtomicBool::new(false);

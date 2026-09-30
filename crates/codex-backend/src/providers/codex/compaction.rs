@@ -45,6 +45,9 @@ struct CompactionState {
     native_history: Vec<ResponsesInputItem>,
     phase: CompactionPhase,
     updated_at: u64,
+    /// `state_size` as of the last change to the history or phase, so
+    /// eviction does not reserialize every stored history.
+    size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,13 +95,15 @@ pub async fn request_compaction(
 
 pub fn begin_compaction(session_id: &str, model: &str) -> CompactionAttempt {
     let attempt = CompactionAttempt(NEXT_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed));
-    let state = CompactionState {
+    let mut state = CompactionState {
         attempt,
         model: model.to_string(),
         native_history: Vec::new(),
         phase: CompactionPhase::Preparing,
         updated_at: now_ms(),
+        size: 0,
     };
+    state.size = state_size(session_id, &state);
     let now = state.updated_at;
     let mut guard = REGISTRY.lock().unwrap();
     let registry = guard.get_or_insert_with(CompactionRegistry::default);
@@ -128,7 +133,8 @@ pub fn store_compaction(
     state.native_history = native_history;
     state.phase = CompactionPhase::Unconfirmed;
     state.updated_at = now;
-    if state_size(session_id, state) > MAX_STATE_BYTES {
+    state.size = state_size(session_id, state);
+    if state.size > MAX_STATE_BYTES {
         registry.states.remove(session_id);
         update_total_bytes(registry);
         return false;
@@ -173,7 +179,8 @@ pub fn activate_compaction(
     }
     state.phase = CompactionPhase::Anchored { portable_summary };
     state.updated_at = now;
-    if state_size(session_id, state) > MAX_STATE_BYTES {
+    state.size = state_size(session_id, state);
+    if state.size > MAX_STATE_BYTES {
         registry.states.remove(session_id);
         update_total_bytes(registry);
         return false;
@@ -521,11 +528,7 @@ fn now_ms() -> u64 {
 }
 
 fn update_total_bytes(registry: &mut CompactionRegistry) {
-    registry.total_bytes = registry
-        .states
-        .iter()
-        .map(|(session_id, state)| state_size(session_id, state))
-        .sum();
+    registry.total_bytes = registry.states.values().map(|state| state.size).sum();
 }
 
 fn evict_states(registry: &mut CompactionRegistry, now: u64) {
@@ -692,6 +695,35 @@ mod tests {
             "gpt-5.6-sol",
             &output(SUMMARY),
         ));
+    }
+
+    #[test]
+    fn cached_sizes_track_every_state_change() {
+        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        clear_all_compactions_for_tests();
+        let attempt = stored_compaction(
+            "sized",
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "x".repeat(4096),
+            }],
+        );
+        begin_compaction("other", "gpt-5.6-sol");
+        assert!(activate_compaction(
+            Some("sized"),
+            Some(attempt),
+            "gpt-5.6-sol",
+            &output(SUMMARY),
+        ));
+
+        let guard = REGISTRY.lock().unwrap();
+        let registry = guard.as_ref().unwrap();
+        let recomputed: usize = registry
+            .states
+            .iter()
+            .map(|(session_id, state)| state_size(session_id, state))
+            .sum();
+        assert_eq!(registry.total_bytes, recomputed);
+        assert!(registry.total_bytes > 4096);
     }
 
     #[test]
