@@ -3,22 +3,26 @@
 [![CI](https://github.com/DeanDiasti/clodex/actions/workflows/ci.yml/badge.svg)](https://github.com/DeanDiasti/clodex/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/tools/install)
-[![macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#requirements)
+[![macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#1-requirements)
 
-**Use Claude Code's agentic coding interface with subscription-backed OpenAI
-Codex models.**
+**Use Claude Code's agentic coding interface with OpenAI Codex models on your
+ChatGPT account, and Claude models on your Claude subscription, side by side.**
 
 Clodex is a local, open-source launcher that runs Claude Code as the interactive
-coding harness while routing model requests to Codex on your ChatGPT account. It keeps Claude Code's UI, agents, tools, permissions, and workflows;
-only the model transport and model aliases change for the launched process.
+coding harness while routing model requests to Codex on your ChatGPT account.
+It keeps Claude Code's UI, agents, tools, permissions, and workflows; only the
+model transport and model aliases change for the launched process. Any role can
+also run a real Claude model on your own Claude subscription.
 
 ```text
-Claude Code → loopback translation proxy → authenticated Codex session
+                         ┌→ built-in Codex backend → Codex on your ChatGPT account
+Claude Code → bridge ────┤
+                         └→ api.anthropic.com (Claude routes, your Claude login)
 ```
 
-Ordinary `claude` sessions are unaffected. Clodex does not require an OpenAI API
-key or the Codex CLI: sign in once with `clodex auth login`. An existing Codex
-CLI login is reused when you have one.
+Ordinary `claude` sessions are unaffected. Clodex needs no OpenAI API key, no
+Codex CLI, and no external proxy: sign in once with `clodex auth login`. An
+existing Codex CLI login is reused when you have one.
 
 > [!IMPORTANT]
 > Clodex is an independent community project. It is not affiliated with,
@@ -29,10 +33,13 @@ CLI login is reused when you have one.
 - Keep Claude Code's terminal experience, subagents, tool use, and permission
   controls.
 - Use the models your ChatGPT account can reach in Codex without hard-coding
-  model names.
-- Run everything locally through a loopback-only translation proxy.
+  model names, and mix in Claude models on your Claude subscription.
+- Pick any model from `/model`, and give subagents a model from either
+  provider.
+- Run everything locally in one self-contained binary, behind a loopback-only
+  bridge.
 - Leave normal Claude Code sessions and global model settings untouched.
-- Share one supervised proxy safely across concurrent Clodex sessions.
+- Share one supervised backend safely across concurrent Clodex sessions.
 
 ## Quick start
 
@@ -121,9 +128,10 @@ Useful installer options:
 --skip-prerequisite-checks   Build without checking runtime commands
 ```
 
-`CLODEX_INSTALL_ROOT` supplies the default for `--root`. To uninstall, remove
-`<install-root>/bin/clodex`; remove `~/.clodex` as well only if the saved
-configuration and logs are no longer wanted.
+`CLODEX_INSTALL_ROOT` supplies the default for `--root`. To uninstall, run
+`clodex auth logout`, then remove `<install-root>/bin/clodex`. Remove the
+Clodex home as well, `$CLODEX_HOME` when it is set and `~/.clodex` otherwise,
+only if the saved configuration, sign-in, cache, and logs are no longer wanted.
 
 ## Commands
 
@@ -210,16 +218,24 @@ model. `/fast` on a Claude route uses Anthropic's own fast mode.
 
 `clodex` refuses to start a Claude route unless `claude auth status` reports
 a Claude subscription login. Context capacity follows the smallest routed
-window: 1M for current Fable, Opus, and Sonnet models, 200K for Haiku.
-Hierarchical compaction currently applies to Codex routes only; a
+window: 1M for Fable, Mythos, Opus 5.x and 4.6 to 4.8, and Sonnet 5.x and 4.6;
+200K for Haiku, older Opus and Sonnet models, and any ID Clodex does not
+recognize. Hierarchical compaction currently applies to Codex routes only; a
 Claude-routed compaction is forwarded unchanged.
+
+With a subscription login, the Claude Code features that depend on it keep
+working in a Clodex session, on Codex models too: claude.ai connectors,
+managed plugins, feature-flagged tools, and artifacts. Without one, Clodex
+turns off Claude Code's nonessential traffic, since there is no Claude account
+for it to reach.
 
 ## Every model in `/model` and in subagents
 
-Each launch lists every Codex model the installed proxy can route in Claude
-Code's `/model` picker, after the four roles. With a Claude subscription login,
-the current Claude models are listed as well, even when no role is routed to
-one.
+Each launch lists every routable Codex model in Claude Code's `/model` picker,
+after the four roles: every model in the live catalog with the built-in
+backend, or those the installed proxy lists with the external one. With a
+Claude subscription login, the current Claude models are listed as well, even
+when no role is routed to one.
 
 Clodex writes that list into Claude Code's model-discovery cache
 (`~/.claude/cache/gateway-models.json`, or under `CLAUDE_CONFIG_DIR`) for the
@@ -301,7 +317,7 @@ compact — but the compaction request carries the same oversized conversation,
 so it is rejected too. The session then cannot compact its way back under the
 limit.
 
-Clodex also launches the proxy with Codex server-side compaction enabled, which
+Clodex also runs the Codex backend with server-side compaction enabled, which
 lets Codex compact upstream rather than reject a prompt that approaches the
 model's limit. The extended window is served without it; this is defence in
 depth against the rejection path above.
@@ -347,7 +363,7 @@ on the interrupted upstream responses that are common on this transport.
 
 Model routing and reasoning effort are independent. Use Claude Code's
 `/effort` control or its `--effort` option. Claude sends the selected effort
-through the translation proxy as the Codex reasoning level; Clodex does not
+through the Codex backend as the Codex reasoning level; Clodex does not
 replace or silently choose it.
 
 Claude Code may persist its last effort as a user setting, and individual
@@ -393,7 +409,8 @@ The external proxy only routes the models its release lists.
 
 Close every active Clodex session after switching so the supervisor
 restarts. The backend writes its log to
-`~/.clodex/logs/claude-code-proxy/proxy.log`, like the external proxy.
+`~/.clodex/logs/claude-code-proxy/proxy.log`, like the external proxy, and
+keeps one rotated `proxy.log.1` once the log passes 20 MB.
 
 ## Shared proxy lifecycle
 
@@ -466,7 +483,9 @@ Persistent and runtime files default to:
 ├── cache/
 │   └── codex-models.json
 ├── logs/
-│   ├── proxy.log
+│   ├── claude-code-proxy/
+│   │   └── proxy.log         # Codex backend log
+│   ├── proxy.log             # external proxy output
 │   └── supervisor.log
 └── run/
     ├── supervisor.lock
@@ -516,6 +535,10 @@ clodex context
 - **“No refresh token stored” after a 401:** run `clodex auth sync`. This
   refreshes the sign-in, then replaces the running backend's stale
   access-token adapter.
+- **A newly released Codex model is missing from `clodex models`:** Codex lists
+  models by client version, and Clodex requests the catalog as the Codex
+  version it was built against. Update Clodex to pick up models that need a
+  newer client.
 - **A newly released model is unsupported:** with the external proxy backend,
   update `claude-code-proxy` or switch back with `clodex config backend builtin`;
   Clodex refuses to start with a translator that cannot route the live mapping.
@@ -538,17 +561,20 @@ cargo test --workspace --all-targets --locked
 The test suite includes:
 
 - unit tests for CLI dispatch, parsing, validation, rendering, model mapping,
-  launch environment, credential safety, supervisor protocol, health checks,
+  Claude routes and the picker, launch environment, credential safety, the
+  Codex sign-in store and catalog cache, supervisor protocol, health checks,
   cleanup, and proxy compatibility matching;
+- the vendored Codex backend's own unit and integration tests, under
+  `crates/codex-backend`;
 - CLI contract tests for help, version output, and installer syntax/help;
-- a process-level lifecycle test that races eight supervisors, verifies only
-  one proxy starts, holds multiple leases, closes the original lease first,
-  checks final-session shutdown, and verifies SIGTERM cleanup.
+- process-level lifecycle tests that race eight supervisors, verify only one
+  proxy starts, hold multiple leases, close the original lease first, check
+  final-session shutdown and SIGTERM cleanup, and start the built-in backend.
 
 CI is defined in `.github/workflows/ci.yml` and runs formatting, Clippy, and all
 tests on both current Ubuntu and macOS runners for every push and pull request.
-The lifecycle test uses a local fake proxy, so CI does not need real Claude,
-Codex, credentials, or network access.
+The lifecycle tests use a fake Codex login and a local fake proxy, so CI does
+not need real Claude, Codex, credentials, or network access.
 
 ## Community and support
 
