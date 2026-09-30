@@ -14,7 +14,20 @@ const MAX_COMPACT_AT_PERCENT: u8 = 95;
 /// Context windows for Claude models reached through the subscription. Every
 /// current Fable, Opus, and Sonnet model accepts 1M tokens; Haiku accepts 200K.
 const CLAUDE_CONTEXT_WINDOW: u64 = 1_000_000;
-const CLAUDE_HAIKU_CONTEXT_WINDOW: u64 = 200_000;
+/// The window every other Claude model has, including Haiku and the Opus and
+/// Sonnet generations before 4.6.
+const CLAUDE_STANDARD_CONTEXT_WINDOW: u64 = 200_000;
+/// Model families whose window is 1M tokens by default.
+const CLAUDE_1M_FAMILIES: [&str; 8] = [
+    "claude-fable-",
+    "claude-mythos-",
+    "claude-opus-5",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+];
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
@@ -521,10 +534,15 @@ fn claude_context_window(route: &Route) -> u64 {
         .model
         .strip_prefix(ANTHROPIC_PREFIX)
         .unwrap_or(&route.model);
-    if model.starts_with("claude-haiku") {
-        CLAUDE_HAIKU_CONTEXT_WINDOW
-    } else {
+    // An unknown ID gets the smaller window: overstating it would let a
+    // conversation grow past what Anthropic accepts.
+    if CLAUDE_1M_FAMILIES
+        .iter()
+        .any(|family| model.starts_with(family))
+    {
         CLAUDE_CONTEXT_WINDOW
+    } else {
+        CLAUDE_STANDARD_CONTEXT_WINDOW
     }
 }
 
@@ -571,6 +589,38 @@ mod tests {
 
     use super::*;
     use crate::catalog::Model;
+
+    #[test]
+    fn only_known_families_get_the_1m_claude_window() {
+        for model in [
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-opus-4-6",
+            "claude-sonnet-5-5",
+            "claude-sonnet-4-6",
+        ] {
+            let route = crate::mapping::Route::anthropic(model);
+            assert_eq!(
+                claude_context_window(&route),
+                CLAUDE_CONTEXT_WINDOW,
+                "{model}"
+            );
+        }
+        for model in [
+            "claude-haiku-4-5",
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-opus-4-1",
+            "claude-future-9",
+        ] {
+            let route = crate::mapping::Route::anthropic(model);
+            assert_eq!(
+                claude_context_window(&route),
+                CLAUDE_STANDARD_CONTEXT_WINDOW,
+                "{model}"
+            );
+        }
+    }
 
     fn temporary_config_path(test_name: &str) -> PathBuf {
         let nonce = SystemTime::now()
