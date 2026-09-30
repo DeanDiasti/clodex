@@ -101,6 +101,11 @@ enum ConfigCommand {
         /// One of: http, websocket, or auto.
         value: String,
     },
+    /// Select the built-in Codex translator or the external claude-code-proxy.
+    Backend {
+        /// One of: builtin or proxy.
+        value: String,
+    },
     /// Fold an oversized compaction into rounds that each fit the window.
     HierarchicalCompaction {
         /// One of: on or off.
@@ -253,6 +258,15 @@ fn run_config(args: ConfigArgs) -> Result<()> {
             println!(
                 "Codex transport set to {}. Close every active Clodex session, then start a new one to apply it.",
                 config.codex.transport.as_str()
+            );
+        }
+        ConfigCommand::Backend { value } => {
+            let mut config = config::AppConfig::load()?;
+            config.codex.backend = config::CodexBackend::parse(&value)?;
+            config.save()?;
+            println!(
+                "Codex backend set to {}. Close every active Clodex session, then start a new one to apply it.",
+                config.codex.backend.as_str()
             );
         }
         ConfigCommand::HierarchicalCompaction { value } => {

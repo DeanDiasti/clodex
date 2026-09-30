@@ -33,8 +33,8 @@ pub fn run(claude_args: Vec<OsString>) -> Result<()> {
     }
     let catalog = Catalog::load_from_codex()?;
     let mapping = ModelMapping::resolve(&catalog, &config.routes)?;
-    let proxy_listing = supervisor::proxy_listed_models()?;
-    supervisor::proxy_models_support(&proxy_listing, &mapping.codex_models())?;
+    let support = supervisor::CodexSupport::detect(config.codex.backend)?;
+    support.require(&mapping.codex_models())?;
     if mapping.uses_anthropic() {
         require_claude_subscription()?;
     }
@@ -55,7 +55,7 @@ pub fn run(claude_args: Vec<OsString>) -> Result<()> {
     // With a subscription login, Claude models are offered even when no role
     // is routed to one, so Claude Code keeps that login for every request.
     let claude = supports_fast_bridge && has_claude_subscription();
-    let models = picker::entries(&catalog, &proxy_listing, claude);
+    let models = picker::entries(&catalog, &support, claude);
     if let Err(error) =
         picker::write_gateway_cache(&format!("http://127.0.0.1:{proxy_port}"), &models, &mapping)
     {
@@ -385,9 +385,9 @@ fn restore_terminal_title() {
 }
 
 fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
+    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
         format!("{}m", tokens / 1_000_000)
-    } else if tokens >= 1_000 && tokens % 1_000 == 0 {
+    } else if tokens >= 1_000 && tokens.is_multiple_of(1_000) {
         format!("{}k", tokens / 1_000)
     } else {
         tokens.to_string()

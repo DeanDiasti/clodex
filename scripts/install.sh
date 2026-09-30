@@ -21,7 +21,7 @@ Usage:
 Options:
   --root <directory>           Install under this directory (default: ~/.local).
   --install-proxy              Install claude-code-proxy with Homebrew if absent.
-  --skip-prerequisite-checks   Skip checks for Claude, Codex, and the proxy.
+  --skip-prerequisite-checks   Skip checks for Claude and Codex.
   -h, --help                   Show this help.
 
 Environment:
@@ -114,8 +114,11 @@ if [[ "${skip_prerequisite_checks}" == false ]]; then
   missing=()
   command_exists codex || missing+=("Codex CLI (https://developers.openai.com/codex/cli)")
   command_exists claude || missing+=("Claude Code (https://code.claude.com/docs/en/setup)")
-  command_exists claude-code-proxy ||
-    missing+=("claude-code-proxy (rerun with --install-proxy, or install it separately)")
+  if ! command_exists claude-code-proxy; then
+    printf 'Note: claude-code-proxy is not installed. Use the built-in Codex backend with\n' >&2
+    printf '  clodex config backend builtin\n' >&2
+    printf 'or rerun with --install-proxy.\n' >&2
+  fi
 
   if ((${#missing[@]} > 0)); then
     printf 'Missing required runtime prerequisites:\n' >&2

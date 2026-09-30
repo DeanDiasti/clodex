@@ -164,6 +164,7 @@ mod tests {
             effective_context_window_percent: None,
             supported_reasoning_levels: Vec::new(),
             additional_speed_tiers: Vec::new(),
+            use_responses_lite: None,
         }
     }
 

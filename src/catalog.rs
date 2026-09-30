@@ -35,6 +35,9 @@ pub struct Model {
     pub supported_reasoning_levels: Vec<ReasoningLevel>,
     #[serde(default)]
     pub additional_speed_tiers: Vec<String>,
+    /// Whether Codex serves the model on its Responses Lite lane.
+    #[serde(default)]
+    pub use_responses_lite: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -133,9 +136,9 @@ impl Catalog {
 }
 
 fn format_context_window(tokens: u64) -> String {
-    if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
+    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
         format!("{}m context", tokens / 1_000_000)
-    } else if tokens >= 1_000 && tokens % 1_000 == 0 {
+    } else if tokens >= 1_000 && tokens.is_multiple_of(1_000) {
         format!("{}k context", tokens / 1_000)
     } else {
         format!("{tokens} context")
@@ -159,6 +162,7 @@ mod tests {
             effective_context_window_percent: None,
             supported_reasoning_levels: Vec::new(),
             additional_speed_tiers: Vec::new(),
+            use_responses_lite: None,
         }
     }
 

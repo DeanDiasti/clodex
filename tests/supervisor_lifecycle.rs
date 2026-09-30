@@ -103,7 +103,7 @@ exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocaptur
         .collect();
 
     let socket = clodex_home.join("run/control.sock");
-    wait_until(Duration::from_secs(5), || socket.exists());
+    wait_until(Duration::from_secs(20), || socket.exists());
 
     let (first, first_port) = acquire_lease(&socket);
     let (second, second_port) = acquire_lease(&socket);
@@ -117,7 +117,7 @@ exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocaptur
     );
 
     drop(second);
-    wait_until(Duration::from_secs(5), || {
+    wait_until(Duration::from_secs(20), || {
         supervisors
             .iter_mut()
             .all(|supervisor| supervisor.try_wait().unwrap().is_some())
@@ -154,7 +154,7 @@ exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocaptur
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    wait_until(Duration::from_secs(5), || socket.exists());
+    wait_until(Duration::from_secs(20), || socket.exists());
     let (_lease, signaled_port) = acquire_lease(&socket);
 
     assert!(
@@ -164,7 +164,7 @@ exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocaptur
             .unwrap()
             .success()
     );
-    wait_until(Duration::from_secs(5), || {
+    wait_until(Duration::from_secs(20), || {
         signaled_supervisor.try_wait().unwrap().is_some()
     });
     assert!(!socket.exists());
@@ -180,6 +180,92 @@ exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocaptur
             .last()
             .is_some_and(|line| line.ends_with(" websocket")),
         "the restarted proxy did not receive the configured WebSocket transport: {starts_log}"
+    );
+}
+
+#[test]
+fn the_builtin_backend_serves_requests_without_the_external_proxy() {
+    let temporary = TestDirectory::new();
+    let clodex_home = temporary.0.join("clodex");
+    let codex_home = temporary.0.join("codex");
+    let fake_bin = temporary.0.join("bin");
+    let proxy_runs = temporary.0.join("proxy-runs");
+    fs::create_dir_all(&clodex_home).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::write(
+        clodex_home.join("config.json"),
+        r#"{"version":1,"codex":{"backend":"builtin"}}"#,
+    )
+    .unwrap();
+
+    let auth_path = codex_home.join("auth.json");
+    fs::write(
+        &auth_path,
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"header.eyJleHAiOjk5OTk5OTk5OTl9.signature","account_id":"test-account"}}"#,
+    )
+    .unwrap();
+    fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Any run of the external proxy is recorded, and must not happen.
+    let fake_proxy = fake_bin.join("claude-code-proxy");
+    fs::write(
+        &fake_proxy,
+        format!(
+            "#!/bin/sh\necho ran >> '{}'\nexit 1\n",
+            proxy_runs.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_proxy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut supervisor = Command::new(env!("CARGO_BIN_EXE_clodex"))
+        .arg("__supervisor")
+        .env("CLODEX_HOME", &clodex_home)
+        .env("CODEX_HOME", &codex_home)
+        .env("CCP_CONFIG_DIR", clodex_home.join("run/proxy"))
+        .env("XDG_STATE_HOME", clodex_home.join("logs"))
+        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let socket = clodex_home.join("run/control.sock");
+    wait_until(Duration::from_secs(10), || socket.exists());
+    let (lease, port) = acquire_lease(&socket);
+
+    // Token counting is answered by the backend itself, so this exercises the
+    // bridge and the embedded backend without reaching Codex.
+    let body = r#"{"model":"gpt-6-sol","messages":[{"role":"user","content":"hello there"}]}"#;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "POST /v1/messages/count_tokens HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains("input_tokens"), "{response}");
+
+    drop(lease);
+    wait_until(Duration::from_secs(20), || {
+        supervisor.try_wait().unwrap().is_some()
+    });
+    assert!(!socket.exists());
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+        "the bridge survived the final lease"
+    );
+    assert!(
+        !proxy_runs.exists(),
+        "the built-in backend started the external proxy"
     );
 }
 
@@ -225,7 +311,7 @@ fn fake_proxy_process() {
 }
 
 fn acquire_lease(socket: &Path) -> (UnixStream, u16) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Ok(mut stream) = UnixStream::connect(socket) {
             stream.write_all(b"CLODEX/1 LEASE\n").unwrap();

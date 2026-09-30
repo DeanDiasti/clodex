@@ -17,6 +17,7 @@ use serde_json::{Map, Value, json};
 
 use crate::catalog::Catalog;
 use crate::mapping::{ANTHROPIC_PREFIX, ModelMapping};
+use crate::supervisor::CodexSupport;
 
 /// Current Claude models reachable through the subscription.
 const CLAUDE_MODELS: [(&str, &str); 4] = [
@@ -41,11 +42,11 @@ pub struct Entry {
 
 /// Every Codex model the proxy can route, then, with a subscription, every
 /// current Claude model.
-pub fn entries(catalog: &Catalog, proxy_listing: &str, claude: bool) -> Vec<Entry> {
+pub fn entries(catalog: &Catalog, support: &CodexSupport, claude: bool) -> Vec<Entry> {
     let codex = catalog
         .routable_models()
         .into_iter()
-        .filter(|model| crate::supervisor::proxy_lists_model(proxy_listing, &model.slug))
+        .filter(|model| support.supports(&model.slug))
         .map(|model| {
             let description = if model.description.is_empty() {
                 "Codex".to_string()
@@ -198,6 +199,7 @@ mod tests {
             effective_context_window_percent: None,
             supported_reasoning_levels: Vec::new(),
             additional_speed_tiers: Vec::new(),
+            use_responses_lite: None,
         }
     }
 
@@ -211,11 +213,15 @@ mod tests {
         }
     }
 
-    const LISTING: &str = "codex: claude-opus-5, gpt-6-sol, gpt-6-sol-fast, gpt-6-luna";
+    fn listing() -> CodexSupport {
+        CodexSupport::Proxy(
+            "codex: claude-opus-5, gpt-6-sol, gpt-6-sol-fast, gpt-6-luna".to_string(),
+        )
+    }
 
     #[test]
     fn lists_proxy_supported_codex_models_then_claude_models() {
-        let ids: Vec<_> = entries(&catalog(), LISTING, true)
+        let ids: Vec<_> = entries(&catalog(), &listing(), true)
             .into_iter()
             .map(|entry| entry.id)
             .collect();
@@ -233,8 +239,17 @@ mod tests {
     }
 
     #[test]
+    fn the_builtin_backend_lists_every_catalog_model() {
+        let ids: Vec<_> = entries(&catalog(), &CodexSupport::Builtin, false)
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(ids, ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]);
+    }
+
+    #[test]
     fn claude_models_need_a_subscription() {
-        let entries = entries(&catalog(), LISTING, false);
+        let entries = entries(&catalog(), &listing(), false);
         assert!(
             entries
                 .iter()
@@ -246,7 +261,7 @@ mod tests {
     fn cache_names_the_bridge_and_skips_models_a_role_shows() {
         let mut mapping = ModelMapping::from_catalog(&catalog()).unwrap();
         mapping.opus = Route::anthropic("claude-opus-5-5");
-        let entries = entries(&catalog(), LISTING, true);
+        let entries = entries(&catalog(), &listing(), true);
 
         let cache: Value = serde_json::from_slice(
             &gateway_cache("http://127.0.0.1:41234", &entries, &mapping).unwrap(),
@@ -281,7 +296,7 @@ mod tests {
     #[test]
     fn every_model_gets_a_subagent_on_its_own_provider() {
         let agents: Value =
-            serde_json::from_str(&agents_json(&entries(&catalog(), LISTING, true))).unwrap();
+            serde_json::from_str(&agents_json(&entries(&catalog(), &listing(), true))).unwrap();
         assert_eq!(agents["codex-gpt-6-luna"]["model"], "gpt-6-luna");
         assert_eq!(
             agents["claude-sonnet-5-5"]["model"],

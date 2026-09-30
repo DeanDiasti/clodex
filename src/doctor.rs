@@ -13,7 +13,16 @@ pub fn run() -> Result<()> {
 
     print_tool("Claude Code", "claude", &["--version"]);
     print_tool("Codex CLI", "codex", &["--version"]);
-    print_tool("Translation proxy", "claude-code-proxy", &["--version"]);
+    match app_config.codex.backend {
+        config::CodexBackend::Builtin => println!(
+            "  {:<20} built in (claude-code-proxy {} Codex path)",
+            "Codex backend",
+            codex_backend_version()
+        ),
+        config::CodexBackend::Proxy => {
+            print_tool("Translation proxy", "claude-code-proxy", &["--version"]);
+        }
+    }
 
     let auth = Command::new("codex").args(["login", "status"]).output();
     match auth {
@@ -99,6 +108,10 @@ fn print_claude_login(app_config: &config::AppConfig) {
         " (no Claude routes configured)"
     };
     println!("  {:<20} {status}{note}", "Claude login");
+}
+
+fn codex_backend_version() -> &'static str {
+    codex_backend::VENDORED_VERSION
 }
 
 fn print_tool(label: &str, executable: &str, args: &[&str]) {

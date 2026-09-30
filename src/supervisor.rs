@@ -158,20 +158,24 @@ pub fn run() -> Result<()> {
     let mut credentials = auth::load_codex_credentials(false)?;
     write_proxy_auth(&paths.proxy_config, &credentials)?;
     let app_config = config::AppConfig::load()?;
-    let upstream_port = available_proxy_port()?;
-    cleanup.proxy = Some(spawn_proxy(
-        &paths,
-        upstream_port,
-        app_config.codex.transport,
-    )?);
-    wait_for_owned_proxy(
-        cleanup
-            .proxy
-            .as_mut()
-            .context("translation proxy child was not available")?,
-        upstream_port,
-        &shutdown_requested,
-    )?;
+    let upstream_port = match app_config.codex.backend {
+        config::CodexBackend::Proxy => {
+            let upstream_port = available_proxy_port()?;
+            let mut child = spawn_proxy(&paths, upstream_port, app_config.codex.transport)?;
+            let started = wait_for_owned_proxy(&mut child, upstream_port, &shutdown_requested);
+            cleanup.proxy = Some(Translator::Proxy(child));
+            started?;
+            upstream_port
+        }
+        config::CodexBackend::Builtin => {
+            install_codex_catalog();
+            let server = codex_backend::embedded::EmbeddedServer::start()?;
+            let upstream_port = server.port();
+            cleanup.proxy = Some(Translator::Builtin(server));
+            wait_for_builtin_backend(upstream_port, &shutdown_requested)?;
+            upstream_port
+        }
+    };
     let ceiling = hierarchical_ceiling(&app_config);
     cleanup.bridge = Some(FastBridge::start(
         upstream_port,
@@ -216,14 +220,14 @@ pub fn run() -> Result<()> {
             empty_since = Instant::now();
         }
 
-        if let Some(status) = cleanup
+        if let Some(exit) = cleanup
             .proxy
             .as_mut()
-            .context("translation proxy child was not available")?
-            .try_wait()?
+            .context("translation proxy was not available")?
+            .exited()?
         {
             break Err(anyhow::anyhow!(
-                "translation proxy exited unexpectedly with {status}"
+                "translation proxy exited unexpectedly: {exit}"
             ));
         }
 
@@ -300,32 +304,55 @@ fn accept_lease(stream: &mut UnixStream, proxy_port: u16) -> bool {
         .is_ok()
 }
 
-/// Fails unless the proxy, as described by [`proxy_listed_models`], can route
-/// every one of `models`.
-pub fn proxy_models_support(listed: &str, models: &[&str]) -> Result<()> {
-    let unsupported = unsupported_proxy_models(listed, models);
-    if !unsupported.is_empty() {
-        bail!(
-            "the installed translation proxy does not support the current Codex model(s): {}. Upgrade `claude-code-proxy` and try again",
-            unsupported.join(", ")
-        );
-    }
-    Ok(())
+/// Which Codex models the configured backend can route.
+pub enum CodexSupport {
+    /// The built-in backend follows the live catalog, so it routes every
+    /// catalog model.
+    Builtin,
+    /// The external proxy routes only the models it lists.
+    Proxy(String),
 }
 
-/// Whether the installed translation proxy can route `model`, given the
-/// output of [`proxy_listed_models`].
-pub fn proxy_lists_model(listed: &str, model: &str) -> bool {
-    unsupported_proxy_models(listed, &[model]).is_empty()
+impl CodexSupport {
+    pub fn detect(backend: config::CodexBackend) -> Result<Self> {
+        Ok(match backend {
+            config::CodexBackend::Builtin => Self::Builtin,
+            config::CodexBackend::Proxy => Self::Proxy(proxy_listed_models()?),
+        })
+    }
+
+    pub fn supports(&self, model: &str) -> bool {
+        match self {
+            Self::Builtin => true,
+            Self::Proxy(listed) => unsupported_proxy_models(listed, &[model]).is_empty(),
+        }
+    }
+
+    /// Fails unless every one of `models` can be routed.
+    pub fn require(&self, models: &[&str]) -> Result<()> {
+        let Self::Proxy(listed) = self else {
+            return Ok(());
+        };
+        let unsupported = unsupported_proxy_models(listed, models);
+        if !unsupported.is_empty() {
+            bail!(
+                "the installed translation proxy does not support the current Codex model(s): {}. Upgrade `claude-code-proxy`, or switch to the built-in backend with `clodex config backend builtin`",
+                unsupported.join(", ")
+            );
+        }
+        Ok(())
+    }
 }
 
 /// The raw `claude-code-proxy models` listing, after confirming the proxy is
 /// new enough for the fast bridge.
-pub fn proxy_listed_models() -> Result<String> {
+fn proxy_listed_models() -> Result<String> {
     let version = Command::new("claude-code-proxy")
         .arg("--version")
         .output()
-        .context("could not inspect claude-code-proxy version")?;
+        .context(
+            "could not run claude-code-proxy; install it, or switch to the built-in Codex backend with `clodex config backend builtin`",
+        )?;
     if !version.status.success()
         || !proxy_version_supports_fast(&String::from_utf8_lossy(&version.stdout))
     {
@@ -382,8 +409,13 @@ fn spawn_supervisor() -> Result<()> {
     let log_path = config::clodex_home()?.join("logs").join("supervisor.log");
     let stdout = append_log(&log_path)?;
     let stderr = stdout.try_clone()?;
+    let paths = SupervisorPaths::new()?;
+    let transport = config::AppConfig::load()?.codex.transport;
 
     let mut command = Command::new(std::env::current_exe()?);
+    // The built-in backend reads the same settings the external proxy does,
+    // from the process it runs in.
+    configure_backend_environment(&mut command, &paths, transport)?;
     command
         .arg("__supervisor")
         .stdin(Stdio::null())
@@ -425,8 +457,24 @@ fn spawn_proxy(
     let stdout = append_log(&paths.proxy_log)?;
     let stderr = stdout.try_clone()?;
 
-    Command::new("claude-code-proxy")
+    let mut command = Command::new("claude-code-proxy");
+    configure_backend_environment(&mut command, paths, transport)?;
+    command
         .args(["serve", "--no-monitor", "--port", &proxy_port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .context("could not start claude-code-proxy")
+}
+
+/// Settings shared by both Codex backends.
+fn configure_backend_environment(
+    command: &mut Command,
+    paths: &SupervisorPaths,
+    transport: config::CodexTransport,
+) -> Result<()> {
+    command
         .env("CCP_CONFIG_DIR", &paths.proxy_config)
         .env("CCP_CODEX_TRANSPORT", transport.as_str())
         // Lets Codex compact its own context upstream when a prompt approaches
@@ -436,12 +484,52 @@ fn spawn_proxy(
         // Claude Code answers it by compacting and the compaction request
         // carries the same oversized conversation.
         .env("CCP_CODEX_SERVER_COMPACTION", "1")
-        .env("XDG_STATE_HOME", config::clodex_home()?.join("logs"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("could not start claude-code-proxy")
+        .env("XDG_STATE_HOME", config::clodex_home()?.join("logs"));
+    Ok(())
+}
+
+/// Lets the built-in backend route every model in the live catalog, and
+/// choose each one's Responses lane from the catalog rather than a fixed list.
+fn install_codex_catalog() {
+    let Ok(catalog) = crate::catalog::Catalog::load_from_codex() else {
+        // The vendored model table still applies.
+        return;
+    };
+    codex_backend::embedded::install_catalog(
+        catalog
+            .routable_models()
+            .into_iter()
+            .map(|model| codex_backend::embedded::CatalogModel {
+                slug: model.slug,
+                responses_lite: model.use_responses_lite,
+            })
+            .collect(),
+    );
+}
+
+/// What translates Claude Code's requests for Codex behind the bridge.
+enum Translator {
+    Proxy(Child),
+    Builtin(codex_backend::embedded::EmbeddedServer),
+}
+
+impl Translator {
+    /// Describes how the translator stopped, if it has.
+    fn exited(&mut self) -> Result<Option<String>> {
+        Ok(match self {
+            Self::Proxy(child) => child.try_wait()?.map(|status| status.to_string()),
+            Self::Builtin(server) => server
+                .has_stopped()
+                .then(|| "the built-in Codex backend stopped".to_string()),
+        })
+    }
+
+    fn stop(self) {
+        match self {
+            Self::Proxy(mut child) => stop_proxy(&mut child),
+            Self::Builtin(server) => drop(server),
+        }
+    }
 }
 
 fn available_proxy_port() -> Result<u16> {
@@ -473,6 +561,24 @@ fn wait_for_owned_proxy(
         }
         if Instant::now() >= deadline {
             bail!("translation proxy did not become healthy on 127.0.0.1:{proxy_port}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The server is bound before it starts, but it only answers once its runtime
+/// is serving, so a single early check can fail spuriously.
+fn wait_for_builtin_backend(port: u16, shutdown_requested: &AtomicBool) -> Result<()> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        if shutdown_requested.load(Ordering::Relaxed) {
+            bail!("supervisor shutdown requested during backend startup");
+        }
+        if proxy_healthcheck(port) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("the built-in Codex backend did not become healthy on 127.0.0.1:{port}");
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -583,7 +689,7 @@ struct SupervisorCleanup {
     socket: PathBuf,
     proxy_config: PathBuf,
     bridge: Option<FastBridge>,
-    proxy: Option<Child>,
+    proxy: Option<Translator>,
 }
 
 impl SupervisorCleanup {
@@ -602,8 +708,8 @@ impl Drop for SupervisorCleanup {
         // Stop accepting/forwarding requests before terminating the private
         // translator process behind the bridge.
         drop(self.bridge.take());
-        if let Some(proxy) = self.proxy.as_mut() {
-            stop_proxy(proxy);
+        if let Some(proxy) = self.proxy.take() {
+            proxy.stop();
         }
         let _ = fs::remove_file(&self.socket);
         remove_ephemeral_auth(&self.proxy_config);

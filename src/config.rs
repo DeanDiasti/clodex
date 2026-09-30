@@ -59,6 +59,18 @@ pub struct ContextConfig {
 #[serde(default)]
 pub struct CodexConfig {
     pub transport: CodexTransport,
+    pub backend: CodexBackend,
+}
+
+/// What translates Claude Code's requests for Codex.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexBackend {
+    /// The external `claude-code-proxy` executable.
+    #[default]
+    Proxy,
+    /// The translator built into Clodex, running inside the supervisor.
+    Builtin,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -182,12 +194,14 @@ impl AppConfig {
              Context ceiling: {}\n\
              Compact at:     {}%\n\
              Codex transport: {}\n\
+             Codex backend:  {}\n\
              Hierarchical compaction: {}\n\
              Trusted tools:  {}\n\
              Claude routes:  {}\n",
             self.context.render_limit(),
             self.context.compact_at_percent,
             self.codex.transport.as_str(),
+            self.codex.backend.as_str(),
             if self.compaction.hierarchical {
                 "on"
             } else {
@@ -249,6 +263,23 @@ impl AppConfig {
             Some(configured) => Ok(routed_context_ceiling(catalog, mapping)
                 .map_or(configured, |ceiling| configured.min(ceiling))),
             None => routed_context_ceiling(catalog, mapping),
+        }
+    }
+}
+
+impl CodexBackend {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "proxy" => Ok(Self::Proxy),
+            "builtin" => Ok(Self::Builtin),
+            _ => bail!("invalid Codex backend {value:?}; expected builtin or proxy"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Proxy => "proxy",
+            Self::Builtin => "builtin",
         }
     }
 }
@@ -593,6 +624,7 @@ mod tests {
             effective_context_window_percent: None,
             supported_reasoning_levels: Vec::new(),
             additional_speed_tiers: Vec::new(),
+            use_responses_lite: None,
         }
     }
 
@@ -632,6 +664,22 @@ mod tests {
         );
         assert_eq!(CodexTransport::parse("AUTO").unwrap(), CodexTransport::Auto);
         assert!(CodexTransport::parse("sse").is_err());
+    }
+
+    #[test]
+    fn parses_codex_backend_names_and_defaults_to_the_proxy() {
+        assert_eq!(
+            CodexBackend::parse(" Builtin ").unwrap(),
+            CodexBackend::Builtin
+        );
+        assert_eq!(CodexBackend::parse("proxy").unwrap(), CodexBackend::Proxy);
+        assert!(CodexBackend::parse("native").is_err());
+        assert_eq!(AppConfig::default().codex.backend, CodexBackend::Proxy);
+        assert!(
+            AppConfig::default()
+                .render()
+                .contains("Codex backend:  proxy")
+        );
     }
 
     #[test]

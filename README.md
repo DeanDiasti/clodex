@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DeanDiasti/clodex/actions/workflows/ci.yml/badge.svg)](https://github.com/DeanDiasti/clodex/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/tools/install)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/tools/install)
 [![macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#requirements)
 
 **Use Claude Code's agentic coding interface with subscription-backed OpenAI
@@ -42,7 +42,8 @@ owned by the Codex CLI.
 - macOS or Linux
 - [Codex CLI](https://developers.openai.com/codex/cli), logged in with ChatGPT
 - [Claude Code](https://code.claude.com/docs/en/setup)
-- [`claude-code-proxy`](https://github.com/raine/claude-code-proxy)
+- [`claude-code-proxy`](https://github.com/raine/claude-code-proxy), unless
+  you use the [built-in Codex backend](#built-in-codex-backend)
 
 Clodex currently relies on Unix domain sockets and does not support native
 Windows.
@@ -61,7 +62,7 @@ install -m 755 clodex ~/.local/bin/clodex
 Release archives are available for Linux x86-64/ARM64 and macOS
 Intel/Apple Silicon. Ensure `~/.local/bin` is on `PATH`.
 
-To build from source instead, install Rust 1.85 or newer and run:
+To build from source instead, install Rust 1.88 or newer and run:
 
 ```sh
 git clone https://github.com/DeanDiasti/clodex.git
@@ -135,6 +136,7 @@ configuration and logs are no longer wanted.
 | `clodex config [show]` | Show persistent defaults |
 | `clodex config context <auto\|tokens>` | Set context capacity |
 | `clodex config compact-at <1..95>` | Set the auto-compaction percentage |
+| `clodex config backend <builtin\|proxy>` | Choose the Codex translator |
 | `clodex config hierarchical-compaction <on\|off>` | Fold an oversized compaction into rounds |
 | `clodex config route <role> <claude-model\|codex>` | Route a role to a Claude model on your subscription |
 | `clodex config allow-tool <exact-name>` | Trust one tool for sessions and subagents |
@@ -361,6 +363,32 @@ Only the exact tool name is allowed. Clodex does not trust an entire MCP server
 or bypass unrelated permission prompts. Treat these entries like code
 execution permissions and allow only tools you understand.
 
+## Built-in Codex backend
+
+Clodex can translate Claude Code's requests for Codex itself, with no
+external proxy installed:
+
+```sh
+clodex config backend builtin
+clodex config backend proxy     # back to claude-code-proxy
+```
+
+The built-in backend is the Codex path of `claude-code-proxy` v0.1.42,
+vendored under its MIT license in [`crates/codex-backend`](crates/codex-backend)
+with the other providers removed. It runs inside the shared supervisor behind
+the same bridge, so fast mode, Claude routes, and hierarchical compaction work
+unchanged, and it honours `clodex config transport` and Codex server-side
+compaction.
+
+It follows the live Codex catalog rather than a fixed model list: a model
+Codex adds is routable immediately, on the Responses lane the catalog names.
+The external proxy only routes the models its release lists.
+
+The default is still `proxy` while the built-in backend is proven on real
+traffic. Close every active Clodex session after switching so the supervisor
+restarts. The backend writes its log to
+`~/.clodex/logs/claude-code-proxy/proxy.log`, like the external proxy.
+
 ## Shared proxy lifecycle
 
 The first active session starts one supervisor and one loopback-only proxy on
@@ -484,8 +512,8 @@ Run the same checks as CI:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
 ```
 
 The test suite includes:
