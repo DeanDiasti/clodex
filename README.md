@@ -616,7 +616,7 @@ clodex context
   stream. Retry the failed agent after connectivity recovers. If interruptions
   persist and the workload does not use heavy agent concurrency, try
   `clodex config transport websocket`, close every Clodex session, and start a
-  new one. Inspect `~/.clodex/logs/claude-code-proxy/proxy.log` for
+  new one. Inspect `~/.clodex/logs/<build-id>/claude-code-proxy/proxy.log` for
   `codex_http_stream_failed` and `buffered_transport_retry_exhausted`.
 - **“Run `/login`” or `403 WebSocket upgrade was rejected`:** update Clodex,
   run `clodex config transport http`, and restart all Clodex sessions. Confirm

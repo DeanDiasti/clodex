@@ -377,24 +377,22 @@ exec "$FAKE_CLAUDE_TEST_BINARY" --exact fake_claude_process --ignored --nocaptur
     variant_executable(&installed, 1);
     let old_runtime = runtime_directory(&home, &installed);
     let launch = |record: &Path| {
-        Session(
-            Command::new(&installed)
-                .env("CLODEX_HOME", &home)
-                .env("CODEX_HOME", &codex)
-                .env("HOME", &user)
-                .env("CLAUDE_CONFIG_DIR", user.join(".claude"))
-                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-                .env("HTTPS_PROXY", "http://127.0.0.1:1")
-                .env("HTTP_PROXY", "http://127.0.0.1:1")
-                .env("NO_PROXY", "127.0.0.1,localhost")
-                .env("FAKE_CLAUDE_RECORD", record)
-                .env("FAKE_CLAUDE_TEST_BINARY", std::env::current_exe().unwrap())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .unwrap(),
-        )
+        let mut command = Command::new(&installed);
+        command
+            .env("CLODEX_HOME", &home)
+            .env("CODEX_HOME", &codex)
+            .env("HOME", &user)
+            .env("CLAUDE_CONFIG_DIR", user.join(".claude"))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("FAKE_CLAUDE_RECORD", record)
+            .env("FAKE_CLAUDE_TEST_BINARY", std::env::current_exe().unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        Session(spawn_variant(&mut command).unwrap())
     };
     let old_record = temporary.0.join("old.json");
     let mut old_session = launch(&old_record);
@@ -511,6 +509,19 @@ fn variant_executable(destination: &Path, marker: u8) {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+fn spawn_variant(command: &mut Command) -> std::io::Result<Child> {
+    let mut retries = 5;
+    loop {
+        match command.spawn() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy && retries > 0 => {
+                retries -= 1;
+                thread::sleep(Duration::from_millis(25));
+            }
+            result => return result,
+        }
     }
 }
 
