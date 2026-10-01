@@ -99,6 +99,9 @@ exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocaptur
         fake_bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    // Compute the expected namespace before the supervisor's idle timer starts.
+    let runtime = runtime_directory(&clodex_home, Path::new(env!("CARGO_BIN_EXE_clodex")));
+    let socket = runtime.join("control.sock");
     let mut supervisors: Vec<Child> = (0..8)
         .map(|_| {
             Command::new(env!("CARGO_BIN_EXE_clodex"))
@@ -116,13 +119,22 @@ exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocaptur
         })
         .collect();
 
-    let runtime = runtime_directory(&clodex_home, Path::new(env!("CARGO_BIN_EXE_clodex")));
-    let socket = runtime.join("control.sock");
     wait_until(Duration::from_secs(20), || socket.exists());
 
     let (first, first_port) = acquire_lease(&socket);
     let (second, second_port) = acquire_lease(&socket);
     assert_eq!(first_port, second_port);
+
+    // Hold a lease until every contender has attempted the lock. Otherwise a
+    // delayed child can legitimately start a second proxy after this one drains.
+    wait_until(Duration::from_secs(20), || {
+        supervisors
+            .iter_mut()
+            .map(|supervisor| supervisor.try_wait().unwrap().is_none())
+            .filter(|running| *running)
+            .count()
+            == 1
+    });
 
     drop(first);
     thread::sleep(Duration::from_millis(1_500));
@@ -429,8 +441,11 @@ exec "$FAKE_CLAUDE_TEST_BINARY" --exact fake_claude_process --ignored --nocaptur
     }
 
     old_session.finish();
+    // The socket is removed first; wait for the whole cleanup, not just its start.
     wait_until(Duration::from_secs(10), || {
         !old_runtime.join("control.sock").exists()
+            && !old_runtime.join("proxy/codex/auth.json").exists()
+            && !old_runtime.join("clodex").exists()
     });
     assert!(!old_runtime.join("proxy/codex/auth.json").exists());
     assert!(!old_runtime.join("clodex").exists());
@@ -441,6 +456,8 @@ exec "$FAKE_CLAUDE_TEST_BINARY" --exact fake_claude_process --ignored --nocaptur
     later_session.finish();
     wait_until(Duration::from_secs(10), || {
         !new_runtime.join("control.sock").exists()
+            && !new_runtime.join("proxy/codex/auth.json").exists()
+            && !new_runtime.join("clodex").exists()
     });
     assert!(!new_runtime.join("proxy/codex/auth.json").exists());
     assert!(!new_runtime.join("clodex").exists());

@@ -42,3 +42,7 @@ tokio = { version = "1.47", features = ["macros", "rt"] }
 codegen-units = 1
 lto = "thin"
 strip = true
+
+# Hashing large debug executables must not dominate bounded supervisor startup.
+[profile.dev.package.sha2]
+opt-level = 3
