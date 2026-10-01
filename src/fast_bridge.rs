@@ -44,6 +44,9 @@ const ANTHROPIC_API: &str = "https://api.anthropic.com";
 /// The subscription beta Claude Code attaches to OAuth requests. It means
 /// nothing to Codex and is removed from the Codex route with the credential.
 const OAUTH_BETA_PREFIX: &str = "oauth-";
+const AUTO_REVIEW_SYSTEM_PREFIX: &str =
+    "You are a security monitor for autonomous AI coding agents.";
+pub const AUTO_REVIEW_MODEL: &str = "anthropic/claude-sonnet-5";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConversationKey {
@@ -629,22 +632,27 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         == Some(BRIDGE_HEADER_VALUE);
     let is_messages =
         parts.method == axum::http::Method::POST && parts.uri.path() == "/v1/messages";
+    // Classifier calls belong to Anthropic, even in a Codex conversation.
+    // Route them before session-fast or native /fast can rewrite their model.
+    let auto_review = is_messages && route_auto_review_to_anthropic(&mut bytes)?;
     let session_fast = marked && parts.headers.contains_key(SESSION_FAST_HEADER);
-    if session_fast && is_messages {
+    if !auto_review && session_fast && is_messages {
         bytes = rewrite_request(&parts.headers, &bytes)?;
     }
     // Fold rounds use the same session tier as ordinary Codex requests.
-    if is_messages
+    if !auto_review
+        && is_messages
         && let Some(response) = hierarchical_compaction(state, &parts.headers, &bytes).await
     {
         return Ok(response);
     }
-    if marked && is_messages && !session_fast {
+    if !auto_review && marked && is_messages && !session_fast {
         bytes = rewrite_request(&parts.headers, &bytes)?;
     }
     let is_count =
         parts.method == axum::http::Method::POST && parts.uri.path() == "/v1/messages/count_tokens";
-    let to_anthropic = (is_messages || is_count) && route_to_anthropic(&mut bytes)?;
+    let to_anthropic =
+        auto_review || ((is_messages || is_count) && route_to_anthropic(&mut bytes)?);
 
     let query = parts
         .uri
@@ -777,6 +785,58 @@ fn route_to_anthropic(bytes: &mut Vec<u8>) -> Result<bool> {
         value["model"] = Value::String(bare);
     }
     *bytes = serde_json::to_vec(&value).context("could not serialize Claude request")?;
+    Ok(true)
+}
+
+/// Claude Code's local permission classifier uses a distinct system prompt,
+/// no tools, and a non-streaming reply. Keep the requested Claude judge and
+/// its prompt intact; if Claude Code chose a mapped GPT model, use Sonnet.
+fn route_auto_review_to_anthropic(bytes: &mut Vec<u8>) -> Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct SystemBlock {
+        text: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        model: Option<String>,
+        stream: Option<bool>,
+        tools: Option<Vec<serde::de::IgnoredAny>>,
+        system: Option<Vec<SystemBlock>>,
+    }
+    // Ordinary conversations can be large; do not allocate their messages
+    // just to decide whether this is a classifier request.
+    let Ok(peek) = serde_json::from_slice::<Peek>(bytes) else {
+        return Ok(false);
+    };
+    if peek.stream == Some(true)
+        || peek.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+        || !peek.system.as_ref().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with(AUTO_REVIEW_SYSTEM_PREFIX))
+            })
+        })
+    {
+        return Ok(false);
+    }
+    let Some(model) = peek.model else {
+        return Ok(false);
+    };
+    let bare = model.strip_prefix(ANTHROPIC_PREFIX).unwrap_or(&model);
+    let model = if bare.starts_with("claude-") {
+        bare.to_string()
+    } else {
+        AUTO_REVIEW_MODEL
+            .strip_prefix(ANTHROPIC_PREFIX)
+            .expect("Anthropic judge model")
+            .to_string()
+    };
+    let mut value: Value =
+        serde_json::from_slice(bytes).context("invalid auto-review request JSON")?;
+    value["model"] = Value::String(model);
+    *bytes = serde_json::to_vec(&value).context("could not serialize auto-review request")?;
     Ok(true)
 }
 
@@ -1342,6 +1402,54 @@ mod tests {
         }
     }
 
+    fn auto_review_body(model: &str) -> Value {
+        serde_json::json!({
+            "model": model,
+            "stream": false,
+            "system": [{"type":"text", "text":format!("{AUTO_REVIEW_SYSTEM_PREFIX}\nPolicy") }],
+            "messages": [{"role":"user", "content":"Review this action"}],
+            "max_tokens": 256,
+            "stop_sequences": ["</block>"]
+        })
+    }
+
+    #[test]
+    fn auto_review_preserves_claude_models_and_uses_sonnet_for_mapped_models() {
+        for (incoming, expected) in [
+            ("claude-sonnet-5[1m]", "claude-sonnet-5[1m]"),
+            ("anthropic/claude-opus-5-5", "claude-opus-5-5"),
+            ("gpt-6-luna", "claude-sonnet-5"),
+        ] {
+            let mut expected_body = auto_review_body(incoming);
+            let mut bytes = serde_json::to_vec(&expected_body).unwrap();
+            assert!(route_auto_review_to_anthropic(&mut bytes).unwrap());
+            expected_body["model"] = Value::String(expected.to_string());
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap(),
+                expected_body
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_requests_do_not_become_anthropic_classifier_calls() {
+        let classifier = auto_review_body("gpt-6-luna");
+        let mut streamed = classifier.clone();
+        streamed["stream"] = Value::Bool(true);
+        let mut with_tools = classifier.clone();
+        with_tools["tools"] = serde_json::json!([{"name":"Bash"}]);
+        let mut quoted = classifier.clone();
+        quoted["system"][0]["text"] = Value::String(format!("Quoted: {AUTO_REVIEW_SYSTEM_PREFIX}"));
+        let mut no_model = classifier;
+        no_model.as_object_mut().unwrap().remove("model");
+        for body in [streamed, with_tools, quoted, no_model, Value::Null] {
+            let original = serde_json::to_vec(&body).unwrap();
+            let mut bytes = original.clone();
+            assert!(!route_auto_review_to_anthropic(&mut bytes).unwrap());
+            assert_eq!(bytes, original);
+        }
+    }
+
     /// Accepts `count` requests, capturing each one's headers and JSON body.
     fn capture_upstream(
         count: usize,
@@ -1447,6 +1555,68 @@ mod tests {
         drop(bridge);
         codex.join().unwrap();
         anthropic.join().unwrap();
+    }
+
+    #[test]
+    fn http_auto_review_uses_anthropic_during_native_and_session_fast() {
+        for session_fast in [false, true] {
+            let (codex_port, codex_rx, codex) = capture_upstream(2);
+            let (anthropic_port, anthropic_rx, anthropic) = capture_upstream(2);
+            let bridge = FastBridge::start_with(
+                codex_port,
+                format!("http://127.0.0.1:{anthropic_port}"),
+                false,
+                0,
+            )
+            .unwrap();
+            let client = reqwest::blocking::Client::new();
+            let send = |body: &Value| {
+                let mut request = client
+                    .post(format!(
+                        "http://127.0.0.1:{}/v1/messages?beta=true",
+                        bridge.port()
+                    ))
+                    .header(SESSION_HEADER, format!("judge-fast-{session_fast}"))
+                    .header(BRIDGE_HEADER, BRIDGE_HEADER_VALUE)
+                    .header(INITIAL_MODEL_HEADER, "gpt-6-sol")
+                    .header(header::AUTHORIZATION, "Bearer sk-ant-oat01-test")
+                    .header("anthropic-beta", "oauth-2025-04-20");
+                if session_fast {
+                    request = request.header(
+                        SESSION_FAST_HEADER,
+                        r#"{"gpt-6-sol":"gpt-6-sol-fast","claude-sonnet-5":"gpt-6-sol-fast"}"#,
+                    );
+                }
+                assert!(request.json(body).send().unwrap().status().is_success());
+            };
+            let conversation = serde_json::json!({
+                "model":"gpt-6-sol", "speed":"fast", "stream":true,
+                "messages":[{"role":"user","content":"test"}],
+                "tools":[{"name":"Bash","input_schema":{"type":"object"}}]
+            });
+            send(&conversation);
+            for model in ["claude-sonnet-5", "gpt-6-luna"] {
+                let mut expected = auto_review_body(model);
+                send(&expected);
+                let (headers, body) = anthropic_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+                expected["model"] = Value::String("claude-sonnet-5".to_string());
+                assert_eq!(body, expected);
+                assert!(headers.contains("authorization: bearer sk-ant-oat01-test"));
+                assert!(headers.contains("anthropic-beta: oauth-2025-04-20"));
+                assert!(!headers.contains("x-clodex-"));
+            }
+            // A classifier must not change the conversation's selected model.
+            send(&conversation);
+            for _ in 0..2 {
+                let (headers, body) = codex_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+                assert_eq!(body["model"], "gpt-6-sol-fast");
+                assert!(!headers.contains("sk-ant-"));
+                assert!(!headers.contains("oauth-"));
+            }
+            drop(bridge);
+            codex.join().unwrap();
+            anthropic.join().unwrap();
+        }
     }
 
     #[test]

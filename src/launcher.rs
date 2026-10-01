@@ -147,6 +147,13 @@ fn build_claude_command(
         // bridge forwards that credential to Anthropic only, and strips it
         // from every request bound for Codex.
         command.env_remove("ANTHROPIC_AUTH_TOKEN");
+        command.env(
+            "CLAUDE_CODE_AUTO_MODE_MODEL",
+            crate::fast_bridge::AUTO_REVIEW_MODEL,
+        );
+        // Server review rides on the conversation request, which may go to
+        // Codex. Use separate classifier calls so the judge stays on Claude.
+        command.env("CLAUDE_CODE_AUTO_MODE_SERVER", "0");
     } else {
         command.env("ANTHROPIC_AUTH_TOKEN", "clodex-local-proxy");
     }
@@ -873,6 +880,14 @@ mod tests {
         let value = |name: &str| environment.get(OsStr::new(name)).cloned();
         assert_eq!(value("ANTHROPIC_AUTH_TOKEN"), Some(None));
         assert_eq!(value("ANTHROPIC_API_KEY"), Some(None));
+        assert_eq!(
+            value("CLAUDE_CODE_AUTO_MODE_MODEL"),
+            Some(Some("anthropic/claude-sonnet-5".into()))
+        );
+        assert_eq!(
+            value("CLAUDE_CODE_AUTO_MODE_SERVER"),
+            Some(Some("0".into()))
+        );
         // Claude Code's own Anthropic calls load its plugins and tools.
         assert_eq!(value("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"), None);
         assert_eq!(
