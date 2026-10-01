@@ -1454,6 +1454,16 @@ mod tests {
     fn capture_upstream(
         count: usize,
     ) -> (u16, mpsc::Receiver<(String, Value)>, thread::JoinHandle<()>) {
+        capture_upstream_response(
+            count,
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".to_vec(),
+        )
+    }
+
+    fn capture_upstream_response(
+        count: usize,
+        response: Vec<u8>,
+    ) -> (u16, mpsc::Receiver<(String, Value)>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (captured_tx, captured_rx) = mpsc::channel();
@@ -1485,14 +1495,56 @@ mod tests {
                 let body = serde_json::from_slice(&request[header_end..header_end + length])
                     .unwrap_or(Value::Null);
                 captured_tx.send((headers, body)).unwrap();
-                stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
-                    )
-                    .unwrap();
+                stream.write_all(&response).unwrap();
             }
         });
         (port, captured_rx, handle)
+    }
+
+    #[test]
+    fn http_claude_server_review_fields_and_responses_pass_through() {
+        // Treat review fields as opaque: their schema belongs to Anthropic,
+        // and future keys and events must survive without interpretation.
+        let results = serde_json::json!({"safeguard_results":{"future_field":["opaque"]}});
+        let json = results.to_string();
+        let sse = format!(
+            "event: ping\ndata: {{\"type\":\"ping\"}}\n\nevent: message_delta\ndata: {json}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        for (content_type, payload) in [("application/json", json), ("text/event-stream", sse)] {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let (port, captured, upstream) = capture_upstream_response(1, response.into_bytes());
+            let bridge =
+                FastBridge::start_with(0, format!("http://127.0.0.1:{port}"), false, 0).unwrap();
+            let mut expected = serde_json::json!({
+                "model":"anthropic/claude-opus-5-5",
+                "messages":[{"role":"user","content":"test"}],
+                "stream":content_type == "text/event-stream",
+                "safeguards":{"future_field":["opaque"]},
+                "future_request_field":{"nested":true}
+            });
+            let actual = reqwest::blocking::Client::new()
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/messages?beta=true",
+                    bridge.port()
+                ))
+                .header("anthropic-beta", "oauth-2025-04-20,future-safety-beta")
+                .header(header::AUTHORIZATION, "Bearer test-claude-credential")
+                .json(&expected)
+                .send()
+                .unwrap();
+            assert_eq!(actual.headers()[header::CONTENT_TYPE], content_type);
+            assert_eq!(actual.bytes().unwrap().as_ref(), payload.as_bytes());
+            expected["model"] = Value::String("claude-opus-5-5".to_string());
+            let (headers, body) = captured.recv_timeout(TEST_TIMEOUT).unwrap();
+            assert_eq!(body, expected);
+            assert!(headers.contains("anthropic-beta: oauth-2025-04-20,future-safety-beta"));
+            assert!(headers.contains("authorization: bearer test-claude-credential"));
+            drop(bridge);
+            upstream.join().unwrap();
+        }
     }
 
     #[test]
