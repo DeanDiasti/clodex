@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+use fs2::FileExt;
+use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -114,7 +116,8 @@ exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocaptur
         })
         .collect();
 
-    let socket = clodex_home.join("run/control.sock");
+    let runtime = runtime_directory(&clodex_home, Path::new(env!("CARGO_BIN_EXE_clodex")));
+    let socket = runtime.join("control.sock");
     wait_until(Duration::from_secs(20), || socket.exists());
 
     let (first, first_port) = acquire_lease(&socket);
@@ -146,7 +149,7 @@ exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocaptur
         "the proxy did not receive the HTTP transport default: {starts_log}"
     );
     assert!(!socket.exists());
-    assert!(!clodex_home.join("run/proxy/codex/auth.json").exists());
+    assert!(!runtime.join("proxy/codex/auth.json").exists());
 
     fs::write(
         clodex_home.join("config.json"),
@@ -180,7 +183,7 @@ exec "${FAKE_PROXY_TEST_BINARY}" --exact fake_proxy_process --ignored --nocaptur
         signaled_supervisor.try_wait().unwrap().is_some()
     });
     assert!(!socket.exists());
-    assert!(!clodex_home.join("run/proxy/codex/auth.json").exists());
+    assert!(!runtime.join("proxy/codex/auth.json").exists());
     assert!(
         std::net::TcpStream::connect(("127.0.0.1", signaled_port)).is_err(),
         "the proxy survived supervisor SIGTERM"
@@ -235,7 +238,6 @@ fn the_builtin_backend_serves_requests_without_the_external_proxy() {
         .arg("__supervisor")
         .env("CLODEX_HOME", &clodex_home)
         .env("CODEX_HOME", &codex_home)
-        .env("CCP_CONFIG_DIR", clodex_home.join("run/proxy"))
         .env("XDG_STATE_HOME", clodex_home.join("logs"))
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
         .stdin(Stdio::null())
@@ -244,7 +246,8 @@ fn the_builtin_backend_serves_requests_without_the_external_proxy() {
         .spawn()
         .unwrap();
 
-    let socket = clodex_home.join("run/control.sock");
+    let runtime = runtime_directory(&clodex_home, Path::new(env!("CARGO_BIN_EXE_clodex")));
+    let socket = runtime.join("control.sock");
     wait_until(Duration::from_secs(20), || socket.exists());
     let (lease, port) = acquire_lease(&socket);
 
@@ -279,6 +282,267 @@ fn the_builtin_backend_serves_requests_without_the_external_proxy() {
         !proxy_runs.exists(),
         "the built-in backend started the external proxy"
     );
+}
+
+struct Session(Child);
+
+impl Session {
+    fn finish(&mut self) {
+        drop(self.0.stdin.take());
+        wait_until(Duration::from_secs(10), || {
+            self.0.try_wait().unwrap().is_some()
+        });
+        assert!(self.0.wait().unwrap().success());
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        drop(self.0.stdin.take());
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn replacing_the_binary_routes_new_sessions_to_a_new_deployment_and_drains_the_old_one() {
+    let temporary = TestDirectory::new();
+    let home = temporary.0.join("c");
+    let codex = temporary.0.join("codex");
+    let user = temporary.0.join("user");
+    let bin = temporary.0.join("bin");
+    for directory in [
+        home.join("cache"),
+        home.join("run/proxy"),
+        codex.clone(),
+        user.clone(),
+        bin.clone(),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::write(
+        home.join("config.json"),
+        r#"{"version":1,"codex":{"backend":"builtin"}}"#,
+    )
+    .unwrap();
+    let auth = codex.join("auth.json");
+    fs::write(&auth, r#"{"auth_mode":"chatgpt","tokens":{"access_token":"header.eyJleHAiOjk5OTk5OTk5OTl9.signature"}}"#).unwrap();
+    fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    fs::write(home.join("cache/codex-models.json"), serde_json::to_vec(&serde_json::json!({
+        "fetched_at_ms":now.as_millis() as u64,"client_version":"0.159.0",
+        "catalog":{"models":[{"slug":"gpt-6-sol","display_name":"GPT","visibility":"list","supported_in_api":true,"context_window":200000}]}
+    })).unwrap()).unwrap();
+    fs::write(
+        home.join("cache/updates.json"),
+        format!(r#"{{"checked_at":{},"release":null}}"#, now.as_secs()),
+    )
+    .unwrap();
+
+    // A pre-rollout supervisor's global paths must be left completely alone.
+    let legacy_lock = fs::File::create(home.join("run/supervisor.lock")).unwrap();
+    legacy_lock.lock_exclusive().unwrap();
+    fs::write(home.join("run/control.sock"), "legacy socket").unwrap();
+    fs::write(home.join("run/proxy/legacy"), "legacy credentials").unwrap();
+
+    let fake_claude = bin.join("claude");
+    fs::write(
+        &fake_claude,
+        r#"#!/bin/sh
+if [ "$1" = auth ]; then
+  printf '{"loggedIn":false}\n'
+  exit 0
+fi
+[ "$1" = --settings ] || exit 2
+export FAKE_CLAUDE_SETTINGS="$2"
+exec "$FAKE_CLAUDE_TEST_BINARY" --exact fake_claude_process --ignored --nocapture
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let installed = bin.join("clodex");
+    variant_executable(&installed, 1);
+    let old_runtime = runtime_directory(&home, &installed);
+    let launch = |record: &Path| {
+        Session(
+            Command::new(&installed)
+                .env("CLODEX_HOME", &home)
+                .env("CODEX_HOME", &codex)
+                .env("HOME", &user)
+                .env("CLAUDE_CONFIG_DIR", user.join(".claude"))
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("HTTPS_PROXY", "http://127.0.0.1:1")
+                .env("HTTP_PROXY", "http://127.0.0.1:1")
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .env("FAKE_CLAUDE_RECORD", record)
+                .env("FAKE_CLAUDE_TEST_BINARY", std::env::current_exe().unwrap())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let old_record = temporary.0.join("old.json");
+    let mut old_session = launch(&old_record);
+    let old_port = session_port(&old_record);
+    assert_backend_responds(old_port);
+
+    let replacement = bin.join("replacement");
+    variant_executable(&replacement, 2);
+    fs::rename(replacement, &installed).unwrap();
+    let new_runtime = runtime_directory(&home, &installed);
+    assert_ne!(
+        old_runtime, new_runtime,
+        "different builds of the same package version must be isolated"
+    );
+    let new_record = temporary.0.join("new.json");
+    let mut new_session = launch(&new_record);
+    let new_port = session_port(&new_record);
+    assert_ne!(old_port, new_port);
+    assert_backend_responds(old_port);
+    assert_backend_responds(new_port);
+
+    let later_record = temporary.0.join("later.json");
+    let mut later_session = launch(&later_record);
+    assert_eq!(
+        session_port(&later_record),
+        new_port,
+        "new sessions of one build must share its backend"
+    );
+    for (record, runtime) in [(&old_record, &old_runtime), (&new_record, &new_runtime)] {
+        let record: serde_json::Value = serde_json::from_slice(&fs::read(record).unwrap()).unwrap();
+        assert_eq!(
+            record["status_command"],
+            format!("'{}' statusline", runtime.join("clodex").display())
+        );
+        assert!(runtime.join("proxy/codex/auth.json").exists());
+        assert!(
+            Command::new(runtime.join("clodex"))
+                .arg("--version")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+
+    old_session.finish();
+    wait_until(Duration::from_secs(10), || {
+        !old_runtime.join("control.sock").exists()
+    });
+    assert!(!old_runtime.join("proxy/codex/auth.json").exists());
+    assert!(!old_runtime.join("clodex").exists());
+    assert!(std::net::TcpStream::connect(("127.0.0.1", old_port)).is_err());
+    assert_backend_responds(new_port);
+    new_session.finish();
+    assert_backend_responds(new_port);
+    later_session.finish();
+    wait_until(Duration::from_secs(10), || {
+        !new_runtime.join("control.sock").exists()
+    });
+    assert!(!new_runtime.join("proxy/codex/auth.json").exists());
+    assert!(!new_runtime.join("clodex").exists());
+    assert_eq!(
+        fs::read_to_string(home.join("run/control.sock")).unwrap(),
+        "legacy socket"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("run/proxy/legacy")).unwrap(),
+        "legacy credentials"
+    );
+}
+
+/// Make two valid, functionally identical binaries with different fingerprints,
+/// without recompiling the entire workspace or changing the package version.
+fn variant_executable(destination: &Path, marker: u8) {
+    let mut bytes = fs::read(env!("CARGO_BIN_EXE_clodex")).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        // Change the Mach-O LC_UUID, then recreate its ad-hoc code signature.
+        assert_eq!(&bytes[..4], &[0xcf, 0xfa, 0xed, 0xfe]);
+        let commands = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        let mut offset = 32;
+        let mut changed = false;
+        for _ in 0..commands {
+            let command = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            let size =
+                u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            if command == 0x1b {
+                bytes[offset + 8] ^= marker;
+                changed = true;
+                break;
+            }
+            offset += size;
+        }
+        assert!(changed, "fixture binary has no LC_UUID");
+    }
+    #[cfg(not(target_os = "macos"))]
+    bytes.push(marker);
+    fs::write(destination, bytes).unwrap();
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(destination)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn session_port(record: &Path) -> u16 {
+    wait_until(Duration::from_secs(20), || {
+        fs::read(record)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some()
+    });
+    serde_json::from_slice::<serde_json::Value>(&fs::read(record).unwrap()).unwrap()["port"]
+        .as_u64()
+        .unwrap() as u16
+}
+
+fn assert_backend_responds(port: u16) {
+    let body = r#"{"model":"gpt-6-sol","messages":[{"role":"user","content":"hello"}]}"#;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(stream, "POST /v1/messages/count_tokens HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+}
+
+#[test]
+#[ignore = "runs only as the rollout test's external Claude session"]
+fn fake_claude_process() {
+    let port = std::env::var("ANTHROPIC_BASE_URL")
+        .unwrap()
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::env::var("FAKE_CLAUDE_SETTINGS").unwrap()).unwrap();
+    fs::write(
+        std::env::var("FAKE_CLAUDE_RECORD").unwrap(),
+        serde_json::to_vec(&serde_json::json!({
+            "port":port,"status_command":settings["statusLine"]["command"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
 }
 
 #[test]
@@ -320,6 +584,11 @@ fn fake_proxy_process() {
         )
         .unwrap();
     }
+}
+
+fn runtime_directory(home: &Path, executable: &Path) -> PathBuf {
+    let id = format!("{:x}", Sha256::digest(fs::read(executable).unwrap()));
+    home.join("run").join(&id[..24])
 }
 
 fn acquire_lease(socket: &Path) -> (UnixStream, u16) {

@@ -124,8 +124,9 @@ clodex update
 The command downloads the release for your platform, verifies its SHA-256
 checksum and version, and atomically replaces the installed executable in
 place. No Rust toolchain is needed, and the installation directory must be
-writable. Close all active Clodex sessions and relaunch after updating so the
-shared backend also restarts with the new version.
+writable. New sessions use the updated build and its own backend. Existing
+sessions continue on their original deployment; its backend exits automatically
+when its last session ends. You do not need to close active sessions to update.
 
 Update checks share an hourly cache under `~/.clodex/cache/updates.json` (or
 `$CLODEX_HOME/cache/updates.json`). Offline and rate-limited checks are silent;
@@ -258,9 +259,9 @@ have no classifier overhead charge; other accounts can be billed for
 separate classifier calls. See Anthropic's
 [classifier billing documentation](https://code.claude.com/docs/en/auto-mode-classifier-billing).
 Run `/status` and check **Auto mode server** for the session's active path.
-After upgrading this routing, close every active Clodex session before
-relaunching so the shared bridge also upgrades. A new launcher refuses an
-older bridge that cannot separate the Sonnet role from the native judge.
+Routing upgrades apply to new sessions immediately. Existing sessions keep
+their original bridge until they end, so an update does not interrupt their
+requests or change their routing mid-conversation.
 
 Routed models appear to Claude Code as `anthropic/<model>`. Claude Code treats
 that exactly like the bare ID, and the prefix keeps a real Claude route
@@ -353,9 +354,9 @@ process launched by `clodex`; normal `claude` sessions and global Claude
 settings are not changed. With the external proxy backend, this requires
 `claude-code-proxy` 0.1.32 or newer.
 
-After installing or upgrading Clodex, close all older Clodex sessions once so
-their old supervisor can exit. The first new `clodex` process will start the
-fast-capable bridge; later sessions share it until the final lease closes.
+After installing or upgrading Clodex, the first new `clodex` process starts
+that build's bridge. Later sessions on the same build share it until the final
+lease closes. Older sessions can finish on their own bridge in parallel.
 
 Inspect the current result:
 
@@ -493,25 +494,40 @@ The external proxy only routes the models its release lists.
 
 Close every active Clodex session after switching so the supervisor
 restarts. The backend writes its log to
-`~/.clodex/logs/claude-code-proxy/proxy.log`, like the external proxy, and
+`~/.clodex/logs/<build-id>/claude-code-proxy/proxy.log`, like the external proxy, and
 keeps one rotated `proxy.log.1` once the log passes 20 MB.
 
 ## Shared proxy lifecycle
 
-The first active session starts one supervisor and one loopback-only proxy on
-an available ephemeral port. Every launcher obtains a lease over a shared Unix
-socket. The supervisor returns its proxy port only after an exact health check
-succeeds.
+The first active session of each binary build starts one supervisor and one
+loopback-only proxy on an available ephemeral port. Every launcher obtains a
+lease over that build's Unix socket. The supervisor returns its proxy port only
+after an exact health check succeeds.
+
+Clodex fingerprints the executable's contents, so different builds are isolated
+even when they have the same package version. Each deployment has its own
+socket, lock, access-token adapter, and logs. The launcher pins its original
+executable before startup and saves a private copy for spawning the supervisor
+and rendering the status line. An update cannot replace that running session's
+helper or cause its startup to use another build.
+
+`clodex update` and source installs atomically replace the installed executable.
+New sessions select the new deployment automatically; existing deployments keep
+serving their attached sessions and exit as those sessions end.
+Supervisors from older Clodex versions using the original unversioned runtime
+can also finish normally; the new launcher leaves their files and leases alone.
 
 Concurrent startup is serialized with an exclusive file lock. Even if several
-Clodex sessions start at almost the same moment, only the lock owner starts the
-proxy and all launchers converge on the same control socket.
+Clodex sessions on the same build start at almost the same moment, only the lock
+owner starts the proxy and those launchers converge on the same control socket.
 
 The session that started the supervisor has no special ownership. If it exits
 while another session remains open, the other lease keeps the proxy alive.
 Abrupt terminal closure is also handled because the kernel closes that
 session's socket. One second after the final lease disappears, the supervisor
-stops the proxy and removes its control socket and ephemeral credential.
+stops the proxy and removes its control socket, ephemeral credential, and
+executable snapshot. The lock file remains so a later startup can safely reuse
+the same deployment directory. Cleanup never touches another build's files.
 SIGINT, SIGTERM, startup failure, and a proxy crash follow the same cleanup
 path. A supervisor that never receives a lease exits after 15 seconds.
 
@@ -568,14 +584,17 @@ Persistent and runtime files default to:
 │   ├── codex-models.json
 │   └── updates.json           # hourly release-check cache
 ├── logs/
-│   ├── claude-code-proxy/
-│   │   └── proxy.log         # Codex backend log
-│   ├── proxy.log             # external proxy output
-│   └── supervisor.log
+│   └── <build-id>/
+│       ├── claude-code-proxy/
+│       │   └── proxy.log     # Codex backend log
+│       ├── proxy.log         # external proxy output
+│       └── supervisor.log
 └── run/
-    ├── supervisor.lock
-    ├── control.sock          # active sessions only
-    └── proxy/                # active sessions only
+    └── <build-id>/
+        ├── supervisor.lock
+        ├── control.sock      # active sessions only
+        ├── clodex            # pinned executable, active sessions only
+        └── proxy/            # active sessions only
 ```
 
 Set `CLODEX_HOME` to move this entire directory.
@@ -629,7 +648,7 @@ clodex context
   Clodex refuses to start with a translator that cannot route the live mapping.
   The built-in backend routes every model in the live Codex catalog.
 - **A proxy appears to remain after all sessions close:** wait for the
-  one-second grace period, then inspect `~/.clodex/logs/supervisor.log` and
+  one-second grace period, then inspect `~/.clodex/logs/<build-id>/supervisor.log` and
   `proxy.log`. A new session can safely remove a stale control socket while
   holding the supervisor lock.
 
@@ -655,6 +674,9 @@ The test suite includes:
 - process-level lifecycle tests that race eight supervisors, verify only one
   proxy starts, hold multiple leases, close the original lease first, check
   final-session shutdown and SIGTERM cleanup, and start the built-in backend.
+  A rollout test replaces the installed executable while sessions are running,
+  verifies new sessions share the new backend, and drains each deployment
+  without affecting the other or an older unversioned runtime.
 
 CI is defined in `.github/workflows/ci.yml` and runs formatting, Clippy, and all
 tests on both current Ubuntu and macOS runners for every push and pull request.

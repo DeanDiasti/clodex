@@ -27,6 +27,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Rolling updates: new sessions use the newly installed binary's deployment,
+  while existing sessions keep their original backend and status-line helper.
+  Each build has separate runtime files and logs, and its backend, credentials,
+  and executable snapshot are cleaned up after its final session ends.
 - Background checks for stable Clodex releases, an update-available notice in
   the session status line, and `clodex update` to verify and install a release
   in place without a Rust toolchain.

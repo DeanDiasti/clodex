@@ -28,6 +28,7 @@ const CLODEX_THEME: &str = r##"{
 "##;
 
 pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
+    crate::deployment::Deployment::current()?;
     crate::update::start_background_checks();
     let config = AppConfig::load()?;
     if !crate::config::config_path()?.exists() {
@@ -50,7 +51,7 @@ pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
     if fast && !crate::fast_bridge::supports_session_fast(proxy_port) {
         lease.close();
         bail!(
-            "clodex --fast requires the session-fast bridge. Close every active Clodex session, then start a new one"
+            "this Clodex deployment does not support the session-fast bridge; update Clodex and start a new session"
         );
     }
     let fast_routes = fast.then(|| session_fast_routes(&catalog, &mapping, &support));
@@ -59,7 +60,7 @@ pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
     if mapping.uses_anthropic() && !supports_fast_bridge {
         lease.close();
         bail!(
-            "Claude routes need the current Clodex supervisor. Close every active Clodex session, then start a new one"
+            "this Clodex deployment does not support Claude routes; update Clodex and start a new session"
         );
     }
     // With a subscription login, Claude models are offered even when no role
@@ -71,7 +72,7 @@ pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
     if claude && !crate::fast_bridge::supports_native_judge(proxy_port) {
         lease.close();
         bail!(
-            "Native auto mode needs the updated Clodex bridge. Close every active Clodex session, then start a new one"
+            "this Clodex deployment does not support native auto mode; update Clodex and start a new session"
         );
     }
     let models = picker::entries(&catalog, &support, claude);
@@ -102,6 +103,7 @@ pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
         claude,
         &models,
         fast_routes.as_ref(),
+        lease.executable(),
     )?;
 
     let status = command
@@ -127,10 +129,11 @@ fn build_claude_command(
     claude: bool,
     models: &[picker::Entry],
     fast_routes: Option<&BTreeMap<String, String>>,
+    session_executable: &Path,
 ) -> Result<Command> {
     let mut command = Command::new("claude");
     let mut settings = serde_json::from_str(&launch_settings(config, Some(proxy_port), models)?)?;
-    crate::statusline::configure(&mut settings, &mut claude_args)?;
+    crate::statusline::configure(&mut settings, &mut claude_args, session_executable)?;
     command.args(["--settings", &serde_json::to_string(&settings)?]);
     // A user's own --agents takes precedence over the per-model agents.
     let user_agents = claude_args.iter().any(|argument| argument == "--agents");
@@ -678,6 +681,7 @@ mod tests {
             false,
             &[],
             None,
+            &std::env::current_exe().unwrap(),
         )
         .unwrap();
 
@@ -774,6 +778,7 @@ mod tests {
             true,
             &[],
             Some(&routes),
+            &std::env::current_exe().unwrap(),
         )
         .unwrap();
         let environment: HashMap<_, _> = command
@@ -893,6 +898,7 @@ mod tests {
             true,
             &[],
             None,
+            &std::env::current_exe().unwrap(),
         )
         .unwrap();
 
@@ -952,6 +958,7 @@ mod tests {
             true,
             &models,
             None,
+            &std::env::current_exe().unwrap(),
         )
         .unwrap();
 
@@ -976,6 +983,7 @@ mod tests {
             true,
             &models,
             None,
+            &std::env::current_exe().unwrap(),
         )
         .unwrap();
         let arguments: Vec<_> = command.get_args().collect();

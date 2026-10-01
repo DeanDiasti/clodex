@@ -12,7 +12,11 @@ use serde_json::Value;
 
 /// Install the wrapper for this launch only. Explicit --settings are folded
 /// into the launch JSON so a second --settings cannot discard the wrapper.
-pub fn configure(settings: &mut Value, arguments: &mut Vec<OsString>) -> Result<()> {
+pub fn configure(
+    settings: &mut Value,
+    arguments: &mut Vec<OsString>,
+    executable: &Path,
+) -> Result<()> {
     let user_directory = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")));
@@ -61,7 +65,6 @@ pub fn configure(settings: &mut Value, arguments: &mut Vec<OsString>) -> Result<
             remaining.push(argument);
         }
     }
-    let executable = std::env::current_exe()?;
     let command = wrapper_command(
         executable
             .to_str()
@@ -316,7 +319,12 @@ mod tests {
         ];
         let mut settings =
             serde_json::json!({"theme":"custom:clodex","permissions":{"allow":["Write"]}});
-        configure(&mut settings, &mut arguments).unwrap();
+        configure(
+            &mut settings,
+            &mut arguments,
+            &std::env::current_exe().unwrap(),
+        )
+        .unwrap();
         assert_eq!(settings["theme"], "custom:clodex");
         assert_eq!(
             settings["permissions"]["allow"],
