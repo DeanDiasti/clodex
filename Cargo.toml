@@ -1,6 +1,6 @@
 [package]
 name = "clodex"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Use Claude Code's agentic interface with subscription-backed Codex models"
@@ -42,3 +42,7 @@ tokio = { version = "1.47", features = ["macros", "rt"] }
 codegen-units = 1
 lto = "thin"
 strip = true
+
+# Hashing large debug executables must not dominate bounded supervisor startup.
+[profile.dev.package.sha2]
+opt-level = 3

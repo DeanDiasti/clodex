@@ -2,6 +2,7 @@ mod auth;
 mod catalog;
 mod compaction;
 mod config;
+mod deployment;
 mod doctor;
 mod fast_bridge;
 mod launcher;

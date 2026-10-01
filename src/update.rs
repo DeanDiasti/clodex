@@ -284,7 +284,7 @@ pub fn run() -> Result<()> {
         executable.display()
     );
     println!(
-        "Close all active Clodex sessions and relaunch to use the updated launcher and backend."
+        "New Clodex sessions will use this update. Existing sessions keep their deployment until they end."
     );
     Ok(())
 }

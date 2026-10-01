@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -20,6 +20,7 @@ use signal_hook::flag;
 
 use crate::auth::{self, CodexCredentials};
 use crate::config;
+use crate::deployment::Deployment;
 use crate::fast_bridge::FastBridge;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -36,6 +37,8 @@ pub struct Lease {
     stream: UnixStream,
     proxy_port: u16,
     fast_bridge: bool,
+    executable: PathBuf,
+    proxy_config: PathBuf,
 }
 
 impl Lease {
@@ -45,6 +48,10 @@ impl Lease {
 
     pub fn supports_fast_bridge(&self) -> bool {
         self.fast_bridge
+    }
+
+    pub fn executable(&self) -> &Path {
+        &self.executable
     }
 
     pub fn close(self) {
@@ -63,14 +70,16 @@ struct ProxyAuth<'a> {
 
 pub fn acquire() -> Result<Lease> {
     config::ensure_home_layout()?;
-    let socket = socket_path()?;
+    let paths = SupervisorPaths::new()?;
+    paths.prepare()?;
+    let socket = &paths.socket;
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut last_spawn = None;
 
     loop {
-        let error = match connect_and_acquire(&socket, deadline) {
+        let mut error = match connect_and_acquire(&paths, deadline) {
             Ok(lease) => {
-                sync_proxy_credentials(false)?;
+                sync_proxy_credentials(&paths.proxy_config, false)?;
                 return Ok(lease);
             }
             Err(error) => error,
@@ -80,7 +89,11 @@ pub fn acquire() -> Result<Lease> {
             .map(|instant: Instant| instant.elapsed() >= Duration::from_millis(500))
             .unwrap_or(true);
         if should_spawn {
-            spawn_supervisor()?;
+            // The previous supervisor may remove its snapshot during this
+            // handoff. Retry startup within the same bounded deadline.
+            if let Err(spawn_error) = spawn_supervisor(&paths) {
+                error = spawn_error;
+            }
             last_spawn = Some(Instant::now());
         }
 
@@ -94,9 +107,9 @@ pub fn acquire() -> Result<Lease> {
     }
 }
 
-fn connect_and_acquire(socket: &Path, deadline: Instant) -> Result<Lease> {
-    let mut stream = UnixStream::connect(socket)
-        .with_context(|| format!("could not connect to {}", socket.display()))?;
+fn connect_and_acquire(paths: &SupervisorPaths, deadline: Instant) -> Result<Lease> {
+    let mut stream = UnixStream::connect(&paths.socket)
+        .with_context(|| format!("could not connect to {}", paths.socket.display()))?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         bail!("timed out waiting for the clodex supervisor");
@@ -124,6 +137,8 @@ fn connect_and_acquire(socket: &Path, deadline: Instant) -> Result<Lease> {
                 // bridge before enabling Claude's /fast command so an update
                 // cannot silently expose a non-functional toggle.
                 fast_bridge: crate::fast_bridge::healthcheck(proxy_port),
+                executable: paths.executable.clone(),
+                proxy_config: paths.proxy_config.clone(),
             })
         }
         _ => bail!("clodex supervisor returned an invalid lease response"),
@@ -133,6 +148,10 @@ fn connect_and_acquire(socket: &Path, deadline: Instant) -> Result<Lease> {
 pub fn run() -> Result<()> {
     config::ensure_home_layout()?;
     let paths = SupervisorPaths::new()?;
+    paths.prepare()?;
+    let app_config = config::AppConfig::load()?;
+    // Set private backend paths before auth refresh can start HTTP threads.
+    configure_embedded_environment(&paths, app_config.codex.transport);
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -157,7 +176,6 @@ pub fn run() -> Result<()> {
 
     let mut credentials = auth::load_codex_credentials(false)?;
     write_proxy_auth(&paths.proxy_config, &credentials)?;
-    let app_config = config::AppConfig::load()?;
     let upstream_port = match app_config.codex.backend {
         config::CodexBackend::Proxy => {
             let upstream_port = available_proxy_port()?;
@@ -275,18 +293,17 @@ pub fn run() -> Result<()> {
 
 pub fn sync_active_credentials() -> Result<()> {
     let lease = acquire()?;
-    sync_proxy_credentials(true)?;
+    sync_proxy_credentials(&lease.proxy_config, true)?;
     lease.close();
     Ok(())
 }
 
-fn sync_proxy_credentials(force_refresh: bool) -> Result<()> {
+fn sync_proxy_credentials(proxy_config: &Path, force_refresh: bool) -> Result<()> {
     let mut credentials = auth::load_codex_credentials(false)?;
     if force_refresh || credentials_need_refresh(&credentials) {
         credentials = auth::load_codex_credentials(true)?;
     }
-    let proxy_config = config::clodex_home()?.join("run").join("proxy");
-    write_proxy_auth(&proxy_config, &credentials)
+    write_proxy_auth(proxy_config, &credentials)
 }
 
 fn accept_lease(stream: &mut UnixStream, proxy_port: u16) -> bool {
@@ -405,17 +422,17 @@ fn unsupported_proxy_models<'a>(listed: &str, models: &'a [&'a str]) -> Vec<&'a 
         .collect()
 }
 
-fn spawn_supervisor() -> Result<()> {
-    let log_path = config::clodex_home()?.join("logs").join("supervisor.log");
-    let stdout = append_log(&log_path)?;
+fn spawn_supervisor(paths: &SupervisorPaths) -> Result<()> {
+    // A preceding supervisor may just have drained and removed this snapshot.
+    Deployment::current()?.snapshot(&paths.runtime)?;
+    let stdout = append_log(&paths.supervisor_log)?;
     let stderr = stdout.try_clone()?;
-    let paths = SupervisorPaths::new()?;
     let transport = config::AppConfig::load()?.codex.transport;
 
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::new(&paths.executable);
     // The built-in backend reads the same settings the external proxy does,
     // from the process it runs in.
-    configure_backend_environment(&mut command, &paths, transport)?;
+    configure_backend_environment(&mut command, paths, transport)?;
     command
         .arg("__supervisor")
         .stdin(Stdio::null())
@@ -484,8 +501,19 @@ fn configure_backend_environment(
         // Claude Code answers it by compacting and the compaction request
         // carries the same oversized conversation.
         .env("CCP_CODEX_SERVER_COMPACTION", "1")
-        .env("XDG_STATE_HOME", config::clodex_home()?.join("logs"));
+        .env("XDG_STATE_HOME", &paths.log_directory);
     Ok(())
+}
+
+fn configure_embedded_environment(paths: &SupervisorPaths, transport: config::CodexTransport) {
+    // This is called only in the dedicated, still-single-threaded supervisor
+    // process, before the embedded backend or bridge creates any threads.
+    unsafe {
+        std::env::set_var("CCP_CONFIG_DIR", &paths.proxy_config);
+        std::env::set_var("CCP_CODEX_TRANSPORT", transport.as_str());
+        std::env::set_var("CCP_CODEX_SERVER_COMPACTION", "1");
+        std::env::set_var("XDG_STATE_HOME", &paths.log_directory);
+    }
 }
 
 /// Lets the built-in backend route every model in the live catalog, and
@@ -627,7 +655,6 @@ fn write_proxy_auth(config_dir: &Path, credentials: &CodexCredentials) -> Result
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
 
     let path = directory.join("auth.json");
-    let temporary = directory.join("auth.json.tmp");
     let auth = ProxyAuth {
         access: credentials.access_token(),
         refresh: "",
@@ -638,16 +665,11 @@ fn write_proxy_auth(config_dir: &Path, credentials: &CodexCredentials) -> Result
     };
     let bytes = serde_json::to_vec(&auth)?;
 
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&temporary)
-        .with_context(|| format!("could not create {}", temporary.display()))?;
+    let mut file = tempfile::NamedTempFile::new_in(&directory)?;
     file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(&temporary, &path).with_context(|| format!("could not save {}", path.display()))?;
+    file.as_file().sync_all()?;
+    file.persist(&path)
+        .with_context(|| format!("could not save {}", path.display()))?;
     Ok(())
 }
 
@@ -690,6 +712,7 @@ fn stop_proxy(proxy: &mut Child) {
 struct SupervisorCleanup {
     socket: PathBuf,
     proxy_config: PathBuf,
+    executable: PathBuf,
     bridge: Option<FastBridge>,
     proxy: Option<Translator>,
 }
@@ -699,6 +722,7 @@ impl SupervisorCleanup {
         Self {
             socket: paths.socket.clone(),
             proxy_config: paths.proxy_config.clone(),
+            executable: paths.executable.clone(),
             bridge: None,
             proxy: None,
         }
@@ -715,6 +739,7 @@ impl Drop for SupervisorCleanup {
         }
         let _ = fs::remove_file(&self.socket);
         remove_ephemeral_auth(&self.proxy_config);
+        let _ = fs::remove_file(&self.executable);
     }
 }
 
@@ -750,11 +775,10 @@ fn log_line(path: &Path, line: &str) {
     }
 }
 
-fn socket_path() -> Result<PathBuf> {
-    Ok(config::clodex_home()?.join("run").join("control.sock"))
-}
-
 struct SupervisorPaths {
+    runtime: PathBuf,
+    executable: PathBuf,
+    log_directory: PathBuf,
     socket: PathBuf,
     lock: PathBuf,
     proxy_config: PathBuf,
@@ -765,13 +789,25 @@ struct SupervisorPaths {
 impl SupervisorPaths {
     fn new() -> Result<Self> {
         let home = config::clodex_home()?;
+        let deployment = Deployment::current()?;
+        let runtime = deployment.runtime_directory(&home);
+        let log_directory = home.join("logs").join(&deployment.id()[..24]);
         Ok(Self {
-            socket: home.join("run").join("control.sock"),
-            lock: home.join("run").join("supervisor.lock"),
-            proxy_config: home.join("run").join("proxy"),
-            supervisor_log: home.join("logs").join("supervisor.log"),
-            proxy_log: home.join("logs").join("proxy.log"),
+            socket: runtime.join("control.sock"),
+            lock: runtime.join("supervisor.lock"),
+            proxy_config: runtime.join("proxy"),
+            supervisor_log: log_directory.join("supervisor.log"),
+            proxy_log: log_directory.join("proxy.log"),
+            executable: runtime.join("clodex"),
+            runtime,
+            log_directory,
         })
+    }
+
+    fn prepare(&self) -> Result<()> {
+        fs::create_dir_all(&self.log_directory)?;
+        Deployment::current()?.snapshot(&self.runtime)?;
+        Ok(())
     }
 }
 
@@ -788,6 +824,19 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn test_paths(runtime: &Path) -> SupervisorPaths {
+        SupervisorPaths {
+            socket: runtime.join("control.sock"),
+            lock: runtime.join("supervisor.lock"),
+            proxy_config: runtime.join("proxy"),
+            supervisor_log: runtime.join("supervisor.log"),
+            proxy_log: runtime.join("proxy.log"),
+            executable: runtime.join("clodex"),
+            log_directory: runtime.to_path_buf(),
+            runtime: runtime.to_path_buf(),
+        }
     }
 
     fn serve_http_once(response: &'static [u8]) -> (u16, thread::JoinHandle<()>) {
@@ -849,7 +898,11 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         });
 
-        let lease = connect_and_acquire(&socket, Instant::now() + Duration::from_secs(1)).unwrap();
+        let lease = connect_and_acquire(
+            &test_paths(&directory),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
         assert_eq!(lease.proxy_port(), 42_123);
         lease.close();
         server.join().unwrap();
@@ -915,7 +968,13 @@ mod tests {
                 BufReader::new(&stream).read_line(&mut request).unwrap();
                 stream.write_all(reply.as_bytes()).unwrap();
             });
-            assert!(connect_and_acquire(&socket, Instant::now() + Duration::from_secs(1)).is_err());
+            assert!(
+                connect_and_acquire(
+                    &test_paths(&directory),
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .is_err()
+            );
             handle.join().unwrap();
             fs::remove_file(socket).unwrap();
             fs::remove_dir(directory).unwrap();
@@ -995,6 +1054,9 @@ mod tests {
         fs::write(codex.join("auth.json"), b"credential placeholder").unwrap();
 
         let paths = SupervisorPaths {
+            runtime: run.clone(),
+            executable: run.join("clodex"),
+            log_directory: directory.clone(),
             socket: socket.clone(),
             lock: run.join("supervisor.lock"),
             proxy_config: proxy_config.clone(),
