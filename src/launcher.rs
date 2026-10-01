@@ -67,6 +67,12 @@ pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
     // that result instead of starting a second `claude auth status` process.
     let claude =
         supports_fast_bridge && (requires_claude_subscription || has_claude_subscription());
+    if claude && !crate::fast_bridge::supports_native_judge(proxy_port) {
+        lease.close();
+        bail!(
+            "Native auto mode needs the updated Clodex bridge. Close every active Clodex session, then start a new one"
+        );
+    }
     let models = picker::entries(&catalog, &support, claude);
     if let Err(error) =
         picker::write_gateway_cache(&format!("http://127.0.0.1:{proxy_port}"), &models, &mapping)
@@ -147,10 +153,6 @@ fn build_claude_command(
         // bridge forwards that credential to Anthropic only, and strips it
         // from every request bound for Codex.
         command.env_remove("ANTHROPIC_AUTH_TOKEN");
-        command.env(
-            "CLAUDE_CODE_AUTO_MODE_MODEL",
-            crate::fast_bridge::AUTO_REVIEW_MODEL,
-        );
         // Keep Claude Code's server-review default (and any user override).
         // Claude routes forward the review protocol intact; Codex routes
         // return no review results, so Claude Code uses its local classifier.
@@ -198,6 +200,27 @@ fn build_claude_command(
             &mapping.haiku_compatibility.model,
         )
         .env("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "1");
+    if claude {
+        // Claude Code 2.1.286 chooses its external judge through the Sonnet
+        // default, not CLAUDE_CODE_AUTO_MODE_MODEL. A mapped role here changes
+        // the judge and can lose Anthropic's per-model severity calibration.
+        command.env(
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            crate::fast_bridge::AUTO_REVIEW_MODEL,
+        );
+        let headers = command
+            .get_envs()
+            .find(|(key, _)| *key == "ANTHROPIC_CUSTOM_HEADERS")
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str())
+            .map(str::to_owned)
+            .or_else(|| std::env::var("ANTHROPIC_CUSTOM_HEADERS").ok())
+            .unwrap_or_default();
+        command.env(
+            "ANTHROPIC_CUSTOM_HEADERS",
+            format!("{headers}\nX-Clodex-Sonnet-Route: {}", mapping.sonnet.model),
+        );
+    }
     if !claude {
         // With only the placeholder token, Claude Code's own calls to
         // Anthropic cannot authenticate. With the subscription login they
@@ -880,9 +903,19 @@ mod tests {
         let value = |name: &str| environment.get(OsStr::new(name)).cloned();
         assert_eq!(value("ANTHROPIC_AUTH_TOKEN"), Some(None));
         assert_eq!(value("ANTHROPIC_API_KEY"), Some(None));
+        assert_eq!(value("CLAUDE_CODE_AUTO_MODE_MODEL"), None);
         assert_eq!(
-            value("CLAUDE_CODE_AUTO_MODE_MODEL"),
-            Some(Some("anthropic/claude-sonnet-5".into()))
+            value("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some(Some("claude-sonnet-5".into()))
+        );
+        assert!(
+            value("ANTHROPIC_CUSTOM_HEADERS")
+                .flatten()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .lines()
+                .any(|line| line == "X-Clodex-Sonnet-Route: gpt-sonnet")
         );
         assert_eq!(value("CLAUDE_CODE_AUTO_MODE_SERVER"), None);
         // Claude Code's own Anthropic calls load its plugins and tools.

@@ -19,6 +19,7 @@ use crate::mapping::ANTHROPIC_PREFIX;
 const BRIDGE_HEADER: &str = "x-clodex-fast-bridge";
 const BRIDGE_HEADER_VALUE: &str = "1";
 const SESSION_FAST_HEADER: &str = "x-clodex-session-fast";
+const SONNET_ROUTE_HEADER: &str = "x-clodex-sonnet-route";
 const INITIAL_MODEL_HEADER: &str = "x-clodex-initial-model";
 const SESSION_HEADER: &str = "x-claude-code-session-id";
 const AGENT_HEADER: &str = "x-claude-code-agent-id";
@@ -46,7 +47,7 @@ const ANTHROPIC_API: &str = "https://api.anthropic.com";
 const OAUTH_BETA_PREFIX: &str = "oauth-";
 const AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
-pub const AUTO_REVIEW_MODEL: &str = "anthropic/claude-sonnet-5";
+pub const AUTO_REVIEW_MODEL: &str = "claude-sonnet-5";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConversationKey {
@@ -165,8 +166,8 @@ async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "ok": true,
         "service": "clodex-fast-bridge",
-        "version": 2,
-        "capabilities": ["session-fast"]
+        "version": 3,
+        "capabilities": ["session-fast", "native-judge"]
     }))
 }
 
@@ -632,9 +633,14 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         == Some(BRIDGE_HEADER_VALUE);
     let is_messages =
         parts.method == axum::http::Method::POST && parts.uri.path() == "/v1/messages";
+    let is_count =
+        parts.method == axum::http::Method::POST && parts.uri.path() == "/v1/messages/count_tokens";
     // Classifier calls belong to Anthropic, even in a Codex conversation.
     // Route them before session-fast or native /fast can rewrite their model.
     let auto_review = is_messages && route_auto_review_to_anthropic(&mut bytes)?;
+    if !auto_review && (is_messages || is_count) {
+        route_sonnet_role(&parts.headers, &mut bytes)?;
+    }
     let session_fast = marked && parts.headers.contains_key(SESSION_FAST_HEADER);
     if !auto_review && session_fast && is_messages {
         bytes = rewrite_request(&parts.headers, &bytes)?;
@@ -649,8 +655,6 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
     if !auto_review && marked && is_messages && !session_fast {
         bytes = rewrite_request(&parts.headers, &bytes)?;
     }
-    let is_count =
-        parts.method == axum::http::Method::POST && parts.uri.path() == "/v1/messages/count_tokens";
     let to_anthropic =
         auto_review || ((is_messages || is_count) && route_to_anthropic(&mut bytes)?);
 
@@ -730,6 +734,7 @@ fn should_forward_request_header(name: &HeaderName) -> bool {
         && name.as_str() != BRIDGE_HEADER
         && name.as_str() != INITIAL_MODEL_HEADER
         && name.as_str() != SESSION_FAST_HEADER
+        && name.as_str() != SONNET_ROUTE_HEADER
 }
 
 /// Returns the value to send to the Codex proxy, or `None` to drop the header.
@@ -828,16 +833,40 @@ fn route_auto_review_to_anthropic(bytes: &mut Vec<u8>) -> Result<bool> {
     let model = if bare.starts_with("claude-") {
         bare.to_string()
     } else {
-        AUTO_REVIEW_MODEL
-            .strip_prefix(ANTHROPIC_PREFIX)
-            .expect("Anthropic judge model")
-            .to_string()
+        AUTO_REVIEW_MODEL.to_string()
     };
     let mut value: Value =
         serde_json::from_slice(bytes).context("invalid auto-review request JSON")?;
     value["model"] = Value::String(model);
     *bytes = serde_json::to_vec(&value).context("could not serialize auto-review request")?;
     Ok(true)
+}
+
+/// The native Sonnet default also selects the permission judge. Keep that
+/// default canonical, and resolve the user's Sonnet role only after a
+/// request has been identified as an ordinary conversation or token count.
+fn route_sonnet_role(headers: &HeaderMap, bytes: &mut Vec<u8>) -> Result<()> {
+    let Some(target) = read_header(headers, SONNET_ROUTE_HEADER) else {
+        return Ok(());
+    };
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        model: Option<String>,
+    }
+    let alias = serde_json::from_slice::<Peek>(bytes)
+        .ok()
+        .and_then(|peek| peek.model)
+        .is_some_and(|model| model.trim_end_matches("[1m]") == AUTO_REVIEW_MODEL);
+    if !alias {
+        return Ok(());
+    }
+    if !is_routed_model(&target) {
+        bail!("invalid Clodex Sonnet route");
+    }
+    let mut value: Value = serde_json::from_slice(bytes).context("invalid Sonnet request JSON")?;
+    value["model"] = Value::String(target);
+    *bytes = serde_json::to_vec(&value).context("could not serialize Sonnet request")?;
+    Ok(())
 }
 
 fn should_forward_response_header(name: &HeaderName) -> bool {
@@ -973,6 +1002,14 @@ pub fn custom_headers(initial_model: &str) -> String {
 }
 
 pub fn supports_session_fast(port: u16) -> bool {
+    supports_capability(port, "session-fast")
+}
+
+pub fn supports_native_judge(port: u16) -> bool {
+    supports_capability(port, "native-judge")
+}
+
+fn supports_capability(port: u16, capability: &str) -> bool {
     reqwest::blocking::Client::new()
         .get(format!("http://127.0.0.1:{port}/__clodex/health"))
         .timeout(std::time::Duration::from_millis(500))
@@ -984,7 +1021,7 @@ pub fn supports_session_fast(port: u16) -> bool {
             body["service"] == "clodex-fast-bridge"
                 && body["capabilities"]
                     .as_array()
-                    .is_some_and(|caps| caps.iter().any(|cap| cap == "session-fast"))
+                    .is_some_and(|caps| caps.iter().any(|cap| cap == capability))
         })
 }
 
@@ -1607,6 +1644,120 @@ mod tests {
         drop(bridge);
         codex.join().unwrap();
         anthropic.join().unwrap();
+    }
+
+    #[test]
+    fn http_sonnet_role_routes_without_changing_the_native_judge() {
+        for target in ["gpt-6-sol", "anthropic/claude-sonnet-5-5"] {
+            for session_fast in [false, true] {
+                let claude_role = target.starts_with(ANTHROPIC_PREFIX);
+                let (codex_port, codex_rx, codex) =
+                    capture_upstream(if claude_role { 0 } else { 2 });
+                let (anthropic_port, anthropic_rx, anthropic) =
+                    capture_upstream(if claude_role { 5 } else { 3 });
+                let bridge = FastBridge::start_with(
+                    codex_port,
+                    format!("http://127.0.0.1:{anthropic_port}"),
+                    false,
+                    0,
+                )
+                .unwrap();
+                assert!(supports_native_judge(bridge.port()));
+                let client = reqwest::blocking::Client::new();
+                let send = |path: &str, body: &Value| {
+                    let mut request = client
+                        .post(format!("http://127.0.0.1:{}{path}", bridge.port()))
+                        .header(SESSION_HEADER, format!("sonnet-{target}-{session_fast}"))
+                        .header(BRIDGE_HEADER, BRIDGE_HEADER_VALUE)
+                        .header(INITIAL_MODEL_HEADER, target)
+                        .header(SONNET_ROUTE_HEADER, target)
+                        .header(header::AUTHORIZATION, "Bearer test-claude-credential");
+                    if session_fast {
+                        request = request
+                            .header(SESSION_FAST_HEADER, r#"{"gpt-6-sol":"gpt-6-sol-fast"}"#);
+                    }
+                    assert!(request.json(body).send().unwrap().status().is_success());
+                };
+                let conversation = serde_json::json!({
+                    "model":"claude-sonnet-5", "speed":"fast", "stream":true,
+                    "messages":[{"role":"user","content":"test"}],
+                    "safeguards":{"future_field":true},
+                    "tools":[{"name":"Bash","input_schema":{"type":"object"}}]
+                });
+                send("/v1/messages?beta=true", &conversation);
+                send(
+                    "/v1/messages/count_tokens?beta=true",
+                    &serde_json::json!({
+                        "model":"claude-sonnet-5[1m]", "messages":[]
+                    }),
+                );
+                let captured = if claude_role {
+                    &anthropic_rx
+                } else {
+                    &codex_rx
+                };
+                for (index, expected_model) in [
+                    if claude_role {
+                        "claude-sonnet-5-5"
+                    } else {
+                        "gpt-6-sol-fast"
+                    },
+                    if claude_role {
+                        "claude-sonnet-5-5"
+                    } else {
+                        "gpt-6-sol"
+                    },
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let (headers, body) = captured.recv_timeout(TEST_TIMEOUT).unwrap();
+                    assert_eq!(body["model"], expected_model);
+                    assert!(!headers.contains("x-clodex-"));
+                    assert_eq!(headers.contains("test-claude-credential"), claude_role);
+                    if index == 0 {
+                        assert_eq!(body["safeguards"], conversation["safeguards"]);
+                    }
+                }
+                // Explicit provider IDs retain their own model; only the bare
+                // role alias is redirected. Classifier prompts also stay intact.
+                send(
+                    "/v1/messages",
+                    &serde_json::json!({
+                        "model":"anthropic/claude-sonnet-5", "messages":[]
+                    }),
+                );
+                assert_eq!(
+                    anthropic_rx.recv_timeout(TEST_TIMEOUT).unwrap().1["model"],
+                    "claude-sonnet-5"
+                );
+                for model in ["claude-sonnet-5", "anthropic/claude-sonnet-5-5"] {
+                    let mut expected = auto_review_body(model);
+                    send("/v1/messages", &expected);
+                    expected["model"] =
+                        Value::String(model.trim_start_matches(ANTHROPIC_PREFIX).to_string());
+                    let (headers, body) = anthropic_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+                    assert_eq!(body, expected);
+                    assert!(!headers.contains("x-clodex-"));
+                    assert!(headers.contains("test-claude-credential"));
+                }
+                drop(bridge);
+                codex.join().unwrap();
+                anthropic.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_bridge_does_not_advertise_native_judge_routing() {
+        let body = r#"{"service":"clodex-fast-bridge","capabilities":["session-fast"]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (port, _captured, upstream) = capture_upstream_response(1, response.into_bytes());
+        assert!(!supports_native_judge(port));
+        upstream.join().unwrap();
     }
 
     #[test]
