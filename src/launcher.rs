@@ -28,6 +28,7 @@ const CLODEX_THEME: &str = r##"{
 "##;
 
 pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
+    crate::update::start_background_checks();
     let config = AppConfig::load()?;
     if !crate::config::config_path()?.exists() {
         config.save()?;
@@ -117,7 +118,7 @@ pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn build_claude_command(
-    claude_args: Vec<OsString>,
+    mut claude_args: Vec<OsString>,
     mapping: &ModelMapping,
     config: &AppConfig,
     context_capacity: u64,
@@ -128,10 +129,9 @@ fn build_claude_command(
     fast_routes: Option<&BTreeMap<String, String>>,
 ) -> Result<Command> {
     let mut command = Command::new("claude");
-    command.args([
-        "--settings",
-        &launch_settings(config, Some(proxy_port), models)?,
-    ]);
+    let mut settings = serde_json::from_str(&launch_settings(config, Some(proxy_port), models)?)?;
+    crate::statusline::configure(&mut settings, &mut claude_args)?;
+    command.args(["--settings", &serde_json::to_string(&settings)?]);
     // A user's own --agents takes precedence over the per-model agents.
     let user_agents = claude_args.iter().any(|argument| argument == "--agents");
     if !models.is_empty() && !user_agents {

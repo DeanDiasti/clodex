@@ -112,7 +112,31 @@ sessions retain their own theme.
 
 ## Update or uninstall
 
-The installer is repeatable. Update the checkout and run it again:
+Clodex checks for a new stable GitHub release in the background when you launch
+it and once an hour while it runs. When a release is available, the status line
+shows `Clodex v… update available · clodex update`, alongside your existing
+status-line output. Run this in another terminal:
+
+```sh
+clodex update
+```
+
+The command downloads the release for your platform, verifies its SHA-256
+checksum and version, and atomically replaces the installed executable in
+place. No Rust toolchain is needed, and the installation directory must be
+writable. Close all active Clodex sessions and relaunch after updating so the
+shared backend also restarts with the new version.
+
+Update checks share an hourly cache under `~/.clodex/cache/updates.json` (or
+`$CLODEX_HOME/cache/updates.json`). Offline and rate-limited checks are silent;
+status-line rendering reads only the cache and never makes network requests.
+The wrapper is supplied only to the launched Claude process, preserving the
+configured user, project, or `--settings` status-line command and its JSON input.
+It refreshes at least every 15 seconds, including while idle. Managed Claude
+settings can override the session's status line.
+
+For development builds, the source installer is also repeatable. Update the
+checkout and run it again to install the latest source rather than a release:
 
 ```sh
 git pull
@@ -138,6 +162,7 @@ only if the saved configuration, sign-in, cache, and logs are no longer wanted.
 | Command | Purpose |
 | --- | --- |
 | `clodex` | Start Claude Code through Clodex |
+| `clodex update` | Install the latest stable release in place |
 | `clodex auth login [--device]` | Sign in to Codex with your ChatGPT account |
 | `clodex auth logout` | Remove Clodex's Codex sign-in |
 | `clodex auth [status]` | Show which Codex sign-in is used and validate it |
@@ -540,7 +565,8 @@ Persistent and runtime files default to:
 ├── auth/
 │   └── codex.json            # after `clodex auth login`
 ├── cache/
-│   └── codex-models.json
+│   ├── codex-models.json
+│   └── updates.json           # hourly release-check cache
 ├── logs/
 │   ├── claude-code-proxy/
 │   │   └── proxy.log         # Codex backend log

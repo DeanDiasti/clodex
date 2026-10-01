@@ -9,6 +9,7 @@ mod mapping;
 mod picker;
 mod statusline;
 mod supervisor;
+mod update;
 
 use std::ffi::OsString;
 
@@ -45,6 +46,11 @@ enum Command {
     Context,
     /// Check the local Claude, Codex sign-in, and backend prerequisites.
     Doctor,
+    /// Download and install the latest stable Clodex release.
+    Update,
+    /// Render the session status line, including an available Clodex update.
+    #[command(hide = true)]
+    Statusline,
     /// Print this launch's fast label from Claude status-line JSON on stdin.
     StatuslineFast,
     #[command(name = "__supervisor", hide = true)]
@@ -166,6 +172,8 @@ fn main() -> Result<()> {
         Some(Command::Config(args)) => run_config(args),
         Some(Command::Context) => run_context(),
         Some(Command::Doctor) => doctor::run(),
+        Some(Command::Update) => update::run(),
+        Some(Command::Statusline) => statusline::run_combined(),
         Some(Command::StatuslineFast) => statusline::run(),
         Some(Command::Supervisor) => supervisor::run(),
     }
@@ -194,6 +202,8 @@ fn should_launch_claude(arguments: &[OsString]) -> bool {
             | "config"
             | "context"
             | "doctor"
+            | "update"
+            | "statusline"
             | "statusline-fast"
             | "__supervisor"
             | "-h"
@@ -397,6 +407,8 @@ mod tests {
             "config",
             "context",
             "doctor",
+            "update",
+            "statusline",
             "statusline-fast",
             "__supervisor",
             "-h",
