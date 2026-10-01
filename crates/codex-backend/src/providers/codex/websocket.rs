@@ -338,12 +338,17 @@ static WS_CONNECT_GATE: once_cell::sync::Lazy<WebSocketConnectGate> =
     once_cell::sync::Lazy::new(|| WebSocketConnectGate::new(WEBSOCKET_CONNECT_START_SPACING));
 
 fn next_monotonic_nonzero(sequence: &AtomicU64, label: &str) -> u64 {
-    let previous = sequence
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_add(1)
-        })
-        .unwrap_or_else(|_| panic!("{label} sequence exhausted"));
-    previous + 1
+    // Keep Rust 1.88 compatibility without fetch_update (deprecated in Rust 1.99).
+    let mut previous = sequence.load(Ordering::Relaxed);
+    loop {
+        let next = previous
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("{label} sequence exhausted"));
+        match sequence.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(current) => previous = current,
+        }
+    }
 }
 
 fn next_pool_activity() -> u64 {
@@ -3338,6 +3343,37 @@ mod tests {
 
         assert_ne!(first.socket_id, 0);
         assert!(second.socket_id > first.socket_id);
+    }
+
+    #[test]
+    fn monotonic_sequence_does_not_wrap_on_exhaustion() {
+        let sequence = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_monotonic_nonzero(&sequence, "test"), u64::MAX);
+        let exhausted = std::panic::catch_unwind(|| next_monotonic_nonzero(&sequence, "test"));
+        assert!(exhausted.is_err());
+        assert_eq!(sequence.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn monotonic_sequence_is_unique_under_contention() {
+        let sequence = AtomicU64::new(0);
+        let mut values = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..128)
+                            .map(|_| next_monotonic_nonzero(&sequence, "test"))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        values.sort_unstable();
+        assert_eq!(values, (1..=1024).collect::<Vec<_>>());
     }
 
     #[tokio::test]
