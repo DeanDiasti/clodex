@@ -213,13 +213,23 @@ everything else     → Claude credential and OAuth beta removed → Codex proxy
 ```
 
 Auto mode permission checks use Anthropic models even when the conversation
-runs on GPT. With a Claude subscription login, Clodex selects Sonnet 5 as
-the judge and uses separate classifier calls rather than server review on
-the conversation request. The bridge sends classifier requests directly to
-Anthropic before any Codex or fast-mode routing, preserving the classifier
-prompt and your Claude login. These checks require a Claude subscription
-login. An unavailable judge reports an error
-rather than falling back to GPT.
+runs on GPT. Clodex leaves Claude Code's server-review default and your
+`CLAUDE_CODE_AUTO_MODE_SERVER` override intact. Claude routes preserve the
+server-review request fields, headers, and response streams. Where Anthropic
+enables server review, those checks run at no charge as part of the
+conversation request.
+
+Codex does not implement Anthropic's server-review protocol. When it returns
+no review results, Claude Code falls back to separate classifier requests;
+that fallback can persist for the session, including after a model switch.
+With a Claude subscription login, Clodex selects Sonnet 5 for these calls
+and sends them directly to Anthropic before any Codex or fast-mode routing,
+preserving the classifier prompt and your Claude login. An unavailable judge
+reports an error rather than falling back to GPT. Pro, Max, and Team plans
+have no classifier overhead charge; other accounts can be billed for
+separate classifier calls. See Anthropic's
+[classifier billing documentation](https://code.claude.com/docs/en/auto-mode-classifier-billing).
+Run `/status` and check **Auto mode server** for the session's active path.
 
 Routed models appear to Claude Code as `anthropic/<model>`. Claude Code treats
 that exactly like the bare ID, and the prefix keeps a real Claude route

@@ -151,9 +151,9 @@ fn build_claude_command(
             "CLAUDE_CODE_AUTO_MODE_MODEL",
             crate::fast_bridge::AUTO_REVIEW_MODEL,
         );
-        // Server review rides on the conversation request, which may go to
-        // Codex. Use separate classifier calls so the judge stays on Claude.
-        command.env("CLAUDE_CODE_AUTO_MODE_SERVER", "0");
+        // Keep Claude Code's server-review default (and any user override).
+        // Claude routes forward the review protocol intact; Codex routes
+        // return no review results, so Claude Code uses its local classifier.
     } else {
         command.env("ANTHROPIC_AUTH_TOKEN", "clodex-local-proxy");
     }
@@ -884,10 +884,7 @@ mod tests {
             value("CLAUDE_CODE_AUTO_MODE_MODEL"),
             Some(Some("anthropic/claude-sonnet-5".into()))
         );
-        assert_eq!(
-            value("CLAUDE_CODE_AUTO_MODE_SERVER"),
-            Some(Some("0".into()))
-        );
+        assert_eq!(value("CLAUDE_CODE_AUTO_MODE_SERVER"), None);
         // Claude Code's own Anthropic calls load its plugins and tools.
         assert_eq!(value("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"), None);
         assert_eq!(
