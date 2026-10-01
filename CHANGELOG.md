@@ -27,6 +27,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Background checks for stable Clodex releases, an update-available notice in
+  the session status line, and `clodex update` to verify and install a release
+  in place without a Rust toolchain.
 - A built-in Codex backend (`clodex config backend builtin`), vendored from
   claude-code-proxy v0.1.42's Codex path, that runs inside the supervisor so
   no external proxy is needed. It routes every model in the live Codex

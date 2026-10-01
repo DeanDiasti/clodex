@@ -13,7 +13,7 @@ fn top_level_help_and_version_are_available_without_runtime_dependencies() {
     let help = clodex(&["--help"]);
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).unwrap();
-    for command in ["auth", "models", "config", "context", "doctor"] {
+    for command in ["auth", "models", "config", "context", "doctor", "update"] {
         assert!(
             help.contains(command),
             "{command} missing from help:\n{help}"
@@ -32,6 +32,92 @@ fn top_level_help_and_version_are_available_without_runtime_dependencies() {
         String::from_utf8(version.stdout).unwrap().trim(),
         concat!("clodex ", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn update_help_is_available_without_runtime_dependencies() {
+    let output = Command::new(env!("CARGO_BIN_EXE_clodex"))
+        .args(["update", "--help"])
+        .env("PATH", "")
+        .env("CLODEX_HOME", "/dev/null/clodex-update-test")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("latest stable"));
+    assert!(help.contains("clodex update"));
+}
+
+#[test]
+fn statusline_appends_cached_updates_preserving_custom_stdin_and_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    std::fs::create_dir(&cache).unwrap();
+    let target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "aarch64") if cfg!(target_env = "gnu") => "aarch64-unknown-linux-gnu",
+        ("linux", "x86_64") if cfg!(target_env = "gnu") => "x86_64-unknown-linux-gnu",
+        _ => return,
+    };
+    for (tag, notice) in [
+        ("v999.0.0", true),
+        ("v0.0.1", false),
+        ("v999.0.0-rc.1", false),
+    ] {
+        let assets: Vec<_> = [format!("clodex-{tag}-{target}.tar.gz"), "SHA256SUMS".into()]
+            .into_iter().map(|name| serde_json::json!({"browser_download_url":format!("https://github.com/DeanDiasti/clodex/releases/download/{tag}/{name}"), "name":name})).collect();
+        std::fs::write(
+            cache.join("updates.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "checked_at":0,"release":{"tag_name":tag,"assets":assets}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_clodex"))
+            .arg("statusline")
+            .env("PATH", "")
+            .env("CLODEX_HOME", directory.path())
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env(
+                "CLODEX_STATUSLINE_COMMAND",
+                "read -r input; printf 'custom %s\\n' \"$input\"",
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"model\":{}}\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let expected = if notice {
+            "custom {\"model\":{}} · Clodex v999.0.0 update available · clodex update\n"
+        } else {
+            "custom {\"model\":{}}\n"
+        };
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+    // Missing/broken cache and a failing custom command remain quiet.
+    std::fs::write(cache.join("updates.json"), "broken").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_clodex"))
+        .arg("statusline")
+        .env("PATH", "")
+        .env("CLODEX_HOME", directory.path())
+        .env("CLODEX_STATUSLINE_COMMAND", "exit 1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
