@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use rand::Rng;
+
 pub const RETRY_INITIAL_DELAY_MS: u64 = 2000;
 pub const RETRY_MAX_DELAY_MS: u64 = 30_000;
 pub const RETRY_BACKOFF_FACTOR: u64 = 2;
@@ -29,12 +31,20 @@ pub fn compute_backoff_delay(attempt: u32, retry_after: Option<&str>) -> Backoff
     if exp > RETRY_MAX_DELAY_MS {
         exp = RETRY_MAX_DELAY_MS;
     }
-    let jitter = exp / 2;
-    let wait_ms = (exp / 2) + (jitter / 2);
     BackoffOutcome {
-        wait_ms,
+        wait_ms: jittered_delay_ms(exp),
         exceeds_budget: false,
     }
+}
+
+/// Equal jitter keeps a minimum recovery interval while spreading callers
+/// that failed together across the second half of the backoff window.
+pub fn jittered_delay_ms(ceiling_ms: u64) -> u64 {
+    jittered_delay_with_rng(ceiling_ms, &mut rand::thread_rng())
+}
+
+fn jittered_delay_with_rng(ceiling_ms: u64, rng: &mut impl Rng) -> u64 {
+    rng.gen_range(ceiling_ms / 2..=ceiling_ms)
 }
 
 /// The wait a `Retry-After` value asks for: delay seconds, or an HTTP-date
@@ -92,4 +102,26 @@ where
         }
     }
     unreachable!()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+    use std::collections::HashSet;
+
+    #[test]
+    fn simultaneous_retries_receive_different_bounded_delays() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let delays: HashSet<_> = (0..64)
+            .map(|_| jittered_delay_with_rng(RETRY_INITIAL_DELAY_MS, &mut rng))
+            .collect();
+        assert!(delays.len() > 1, "backoff must spread simultaneous retries");
+        assert!(
+            delays
+                .iter()
+                .all(|ms| (RETRY_INITIAL_DELAY_MS / 2..=RETRY_INITIAL_DELAY_MS).contains(ms))
+        );
+        assert_eq!(jittered_delay_with_rng(0, &mut rng), 0);
+    }
 }

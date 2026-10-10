@@ -37,7 +37,8 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 /// Extra attempts for an upstream request that failed before any of its
 /// response reached Claude Code.
 const UPSTREAM_RETRIES: u32 = 2;
-/// Base backoff between those attempts, scaled by attempt number.
+/// Minimum backoff between attempts, scaled by attempt number. Jitter adds
+/// up to one more interval so parallel sessions do not retry in lockstep.
 const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
 /// Where Claude-routed requests go. Claude Code's own subscription credential
 /// travels with them unchanged.
@@ -701,7 +702,11 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         }
 
         attempt += 1;
-        tokio::time::sleep(RETRY_BACKOFF * attempt).await;
+        let ceiling_ms = (RETRY_BACKOFF * attempt * 2).as_millis() as u64;
+        tokio::time::sleep(std::time::Duration::from_millis(
+            codex_backend::retry::jittered_delay_ms(ceiling_ms),
+        ))
+        .await;
     };
 
     let status = upstream.status();
