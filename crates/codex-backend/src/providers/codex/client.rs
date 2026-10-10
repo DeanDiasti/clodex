@@ -1178,6 +1178,7 @@ impl CodexHttpClient {
                 Ok(attempt) => break attempt,
                 Err(error) if retryable_http_stream_error(&error) => {
                     if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
+                        log_http_stream_retry(ctx, &error, retries, None);
                         return Err(error);
                     }
                     let delay = compute_backoff_delay(retries, error.retry_after.as_deref());
@@ -1185,6 +1186,7 @@ impl CodexHttpClient {
                         return Err(error);
                     }
                     retries += 1;
+                    log_http_stream_retry(ctx, &error, retries, Some(delay.wait_ms));
                     sleep(delay.wait_ms).await;
                 }
                 Err(error) => return Err(error),
@@ -1400,7 +1402,8 @@ impl CodexHttpClient {
                             let error = CodexError {
                                 status: 0,
                                 message: format!(
-                                    "Transport error reading Codex response body: {err}"
+                                    "Transport error reading Codex response body: {}",
+                                    reqwest_error_summary(&err.without_url())
                                 ),
                                 detail: Some("http_response_body".to_string()),
                                 retry_after: None,
@@ -1579,6 +1582,7 @@ impl CodexHttpClient {
 
                 loop {
                     if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
+                        log_http_stream_retry(&ctx, &retry_error, retries, None);
                         let _ = tx.send(Err(retry_error)).await;
                         return;
                     }
@@ -1588,6 +1592,7 @@ impl CodexHttpClient {
                         return;
                     }
                     retries += 1;
+                    log_http_stream_retry(&ctx, &retry_error, retries, Some(delay.wait_ms));
                     tokio::select! {
                         _ = tx.closed() => return,
                         _ = sleep(delay.wait_ms) => {}
@@ -2387,24 +2392,30 @@ impl CodexHttpClient {
                 origin: CodexErrorOrigin::Http,
             })?
             .map_err(|e| {
-                if is_retryable_reqwest_error(&e) {
-                    CodexError {
-                        status: 0,
-                        message: format!("Transport error: {e}"),
-                        detail: None,
-                        retry_after: None,
-                        usage_limit: None,
-                        origin: CodexErrorOrigin::Http,
-                    }
-                } else {
-                    CodexError {
-                        status: 0,
-                        message: format!("Network error: {e}"),
-                        detail: None,
-                        retry_after: None,
-                        usage_limit: None,
-                        origin: CodexErrorOrigin::Http,
-                    }
+                let e = e.without_url();
+                let retryable = is_retryable_reqwest_error(&e);
+                let causes = reqwest_error_causes(&e);
+                create_logger("codex").warn(
+                    "codex_http_request_failed",
+                    Some(serde_json::Map::from_iter([
+                        ("reqId".into(), serde_json::json!(ctx.req_id)),
+                        ("retryable".into(), serde_json::json!(retryable)),
+                        ("isConnect".into(), serde_json::json!(e.is_connect())),
+                        ("isTimeout".into(), serde_json::json!(e.is_timeout())),
+                        ("causes".into(), serde_json::json!(causes)),
+                    ])),
+                );
+                CodexError {
+                    status: 0,
+                    message: if retryable {
+                        format!("Transport error: {e}")
+                    } else {
+                        format!("Network error: {e}")
+                    },
+                    detail: (!causes.is_empty()).then_some(causes),
+                    retry_after: None,
+                    usage_limit: None,
+                    origin: CodexErrorOrigin::Http,
                 }
             })?;
 
@@ -2445,7 +2456,10 @@ impl CodexHttpClient {
             })?
             .map_err(|e| CodexError {
                 status: 0,
-                message: format!("Transport error reading Codex response body: {e}"),
+                message: format!(
+                    "Transport error reading Codex response body: {}",
+                    reqwest_error_summary(&e.without_url())
+                ),
                 detail: Some("http_response_body".to_string()),
                 retry_after: None,
                 usage_limit: None,
@@ -2990,15 +3004,104 @@ fn is_retryable_transport_error(err: &CodexError) -> bool {
 }
 
 fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
+    if err.is_builder() || err.is_redirect() || err.is_status() {
+        return false;
+    }
     if err.is_timeout() || err.is_connect() {
         return true;
     }
-    let msg = err.to_string().to_lowercase();
-    msg.contains("connection reset")
-        || msg.contains("connection closed")
-        || msg.contains("econnreset")
-        || msg.contains("etimedout")
-        || msg.contains("epipe")
+    // reqwest's Display omits its source: resets and incomplete responses
+    // otherwise appear only as "error sending request" and skip retries.
+    is_retryable_connection_source(err)
+}
+
+fn is_retryable_connection_source(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
+    for _ in 0..16 {
+        let Some(error) = source else { break };
+        if let Some(error) = error.downcast_ref::<std::io::Error>()
+            && matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return true;
+        }
+        let message = error.to_string().to_ascii_lowercase();
+        if [
+            "connection reset",
+            "connection closed",
+            "connection error",
+            "incomplete message",
+            "unexpected eof",
+            "broken pipe",
+            "operation was canceled",
+            "channel closed",
+            "goaway",
+            "refused_stream",
+            "econnreset",
+            "etimedout",
+            "epipe",
+        ]
+        .iter()
+        .any(|reason| message.contains(reason))
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+fn reqwest_error_causes(error: &reqwest::Error) -> String {
+    let mut source = std::error::Error::source(error);
+    let mut causes = Vec::new();
+    for _ in 0..16 {
+        let Some(error) = source else { break };
+        causes.push(error.to_string());
+        source = error.source();
+    }
+    causes.join(": ")
+}
+
+fn reqwest_error_summary(error: &reqwest::Error) -> String {
+    let causes = reqwest_error_causes(error);
+    if causes.is_empty() {
+        error.to_string()
+    } else {
+        format!("{error}: {causes}")
+    }
+}
+
+fn log_http_stream_retry(
+    ctx: &RequestContext,
+    error: &CodexError,
+    retries: u32,
+    delay_ms: Option<u64>,
+) {
+    create_logger("codex").warn(
+        if delay_ms.is_some() {
+            "codex_http_retry_scheduled"
+        } else {
+            "codex_http_retry_exhausted"
+        },
+        Some(serde_json::Map::from_iter([
+            ("reqId".into(), serde_json::json!(ctx.req_id)),
+            ("retries".into(), serde_json::json!(retries)),
+            (
+                "maxRetries".into(),
+                serde_json::json!(MAX_BUFFERED_TRANSPORT_RETRIES),
+            ),
+            ("delayMs".into(), serde_json::json!(delay_ms)),
+            ("reason".into(), serde_json::json!(error.message)),
+            ("causes".into(), serde_json::json!(error.detail)),
+        ])),
+    );
 }
 
 fn should_refresh_after_unauthorized(
@@ -3345,6 +3448,83 @@ mod tests {
                 return request;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn http_stream_retries_connection_closed_before_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut dropped, _) = listener.accept().await.unwrap();
+            let first = read_http_request(&mut dropped).await;
+            drop(dropped);
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let second = read_http_request(&mut stream).await;
+            assert_eq!(first, second, "a retry must preserve the original request");
+            let body = b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let mut events = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.stream_codex_http_events(&buffered_test_request(), &http_test_context()),
+        )
+        .await
+        .expect("a dropped connection must recover within one backoff")
+        .unwrap();
+        let mut completed = 0;
+        while let Some(event) = events.recv().await {
+            if event.unwrap()["type"] == "response.completed" {
+                completed += 1;
+            }
+        }
+        assert_eq!(completed, 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_connection_is_classified_from_its_hidden_cause() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+        });
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("http://{addr}/responses"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(error.is_request());
+        assert!(!error.is_connect());
+        assert!(!error.is_timeout());
+        assert!(is_retryable_reqwest_error(&error), "{error:?}");
+        assert!(!reqwest_error_causes(&error).is_empty());
+        assert!(!error.to_string().contains("connection closed"));
+    }
+
+    #[tokio::test]
+    async fn malformed_request_is_not_a_retryable_connection_error() {
+        let error = reqwest::Client::new()
+            .post("not a URL")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_builder());
+        assert!(!is_retryable_reqwest_error(&error));
     }
 
     #[tokio::test]

@@ -236,10 +236,13 @@ fn retry_backoff_decisions() {
 
     // Negative, non-finite, and past-date values fall back to backoff
     // instead of retrying immediately.
-    let exponential = compute_backoff_delay(0, None).wait_ms;
     for raw in ["-5", "NaN", "inf", "Sun, 06 Nov 1994 08:49:37 GMT", "soon"] {
         let outcome = compute_backoff_delay(0, Some(raw));
-        assert_eq!(outcome.wait_ms, exponential, "{raw}");
+        assert!(
+            (RETRY_INITIAL_DELAY_MS / 2..=RETRY_INITIAL_DELAY_MS).contains(&outcome.wait_ms),
+            "{raw}: {}",
+            outcome.wait_ms
+        );
         assert!(!outcome.exceeds_budget, "{raw}");
     }
 

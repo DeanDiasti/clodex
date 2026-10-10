@@ -7,12 +7,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-
-- Switching to a Codex model with `/model <name>` no longer waits a second or
-  more on the first switch. Clodex lists its models as Claude Code's curated
-  `modelPicker` rows, so Claude Code no longer checks each one with a
-  one-token request to Codex.
+## [0.1.1] - 2026-10-09
 
 ### Changed
 
@@ -59,6 +54,19 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Transient HTTP connection failures are classified using their underlying
+  error causes, so dropped connections can enter the bounded retry policy
+  instead of immediately failing as generic network errors. Retries still
+  stop after semantic output has been forwarded.
+- Retry delays include randomized jitter to spread concurrent agents' retry
+  attempts. Explicit upstream `Retry-After` values remain honored.
+- Concurrent backend log writes and rotation are serialized so each line
+  remains a complete JSON record. HTTP failures and retries now log their
+  underlying causes and retry decisions.
+- Switching to a Codex model with `/model <name>` no longer waits a second or
+  more on the first switch. Clodex lists its models as Claude Code's curated
+  `modelPicker` rows, so Claude Code no longer checks each one with a
+  one-token request to Codex.
 - Restored `clodex --fast` as a session-wide priority policy for supported
   Codex models, including subagents, model switches, and compaction, with
   standard-speed fallback for unsupported models and unchanged Claude routes.
@@ -86,5 +94,6 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Repeatable source installer for macOS and Linux.
 - Automated tests and GitHub Actions CI on Ubuntu and macOS.
 
-[Unreleased]: https://github.com/DeanDiasti/clodex/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/DeanDiasti/clodex/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/DeanDiasti/clodex/releases/tag/v0.1.1
 [0.1.0]: https://github.com/DeanDiasti/clodex/releases/tag/v0.1.0

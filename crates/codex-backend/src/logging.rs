@@ -4,11 +4,13 @@ use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
 
 static STDERR_SUPPRESSION_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 pub const REDACT_KEYS: [&str; 23] = [
     "authorization",
@@ -133,17 +135,26 @@ pub fn create_logger(service: &str) -> Logger {
 
 fn write_log_line(line: &str) -> io::Result<()> {
     let file = log_file();
+    write_log_line_to(&file, line)
+}
+
+fn write_log_line_to(file: &Path, line: &str) -> io::Result<()> {
+    // The embedded backend logs from multiple runtime threads. Serialize
+    // rotation with append, and keep the newline in the same write as JSON.
+    let _guard = LOG_WRITE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     if let Some(dir) = file.parent() {
         create_dir(dir, 0o700)?;
     }
 
-    if fs::metadata(&file).is_ok_and(|meta| meta.len() > MAX_LOG_BYTES) {
-        rotate_file(&file)?;
+    if fs::metadata(file).is_ok_and(|meta| meta.len() > MAX_LOG_BYTES) {
+        rotate_file(file)?;
     }
 
-    let mut out = OpenOptions::new().create(true).append(true).open(&file)?;
-    out.write_all(line.as_bytes())?;
-    out.write_all(b"\n")?;
+    let mut out = OpenOptions::new().create(true).append(true).open(file)?;
+    let mut record = Vec::with_capacity(line.len() + 1);
+    record.extend_from_slice(line.as_bytes());
+    record.push(b'\n');
+    out.write_all(&record)?;
     Ok(())
 }
 
@@ -306,6 +317,40 @@ mod tests {
             fs::read_to_string(directory.path().join("proxy.log.1")).unwrap(),
             "second"
         );
+    }
+
+    #[test]
+    fn concurrent_writers_preserve_complete_json_records() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let log = directory.path().join("proxy.log");
+        let writers = 8;
+        let records = 100;
+        let barrier = std::sync::Barrier::new(writers);
+        std::thread::scope(|scope| {
+            for writer in 0..writers {
+                let log = &log;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for record in 0..records {
+                        let line =
+                            serde_json::json!({"writer": writer, "record": record}).to_string();
+                        write_log_line_to(log, &line).unwrap();
+                    }
+                });
+            }
+        });
+        let contents = fs::read_to_string(log).unwrap();
+        let mut seen = HashSet::new();
+        for line in contents.lines() {
+            let value: Value =
+                serde_json::from_str(line).expect("one complete JSON record per line");
+            assert!(seen.insert((
+                value["writer"].as_u64().unwrap(),
+                value["record"].as_u64().unwrap()
+            )));
+        }
+        assert_eq!(seen.len(), writers * records);
     }
 
     #[test]
