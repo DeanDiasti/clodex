@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
@@ -10,7 +11,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -49,6 +50,107 @@ const OAUTH_BETA_PREFIX: &str = "oauth-";
 const AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
 pub const AUTO_REVIEW_MODEL: &str = "claude-sonnet-5";
+
+static ANTHROPIC_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Native Claude traffic bypasses the Codex backend's request logger. Record
+/// its transport lifecycle without inspecting response bodies or credentials.
+struct AnthropicRequestLog {
+    logger: codex_backend::logging::Logger,
+    started: std::time::Instant,
+    status: Option<u16>,
+    body_bytes: u64,
+    chunks: u64,
+    terminal: bool,
+}
+
+impl AnthropicRequestLog {
+    fn new(path: &str, body: &[u8]) -> Self {
+        #[derive(serde::Deserialize)]
+        struct Peek {
+            model: Option<String>,
+        }
+        let model = serde_json::from_slice::<Peek>(body)
+            .ok()
+            .and_then(|peek| peek.model);
+        let req_id = format!(
+            "anthropic-{}-{}",
+            std::process::id(),
+            ANTHROPIC_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let logger = codex_backend::logging::create_logger("anthropic").child(
+            serde_json::json!({"reqId":req_id, "model":model, "path":path})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        logger.info("anthropic_request_started", None);
+        Self {
+            logger,
+            started: std::time::Instant::now(),
+            status: None,
+            body_bytes: 0,
+            chunks: 0,
+            terminal: false,
+        }
+    }
+
+    fn fields(&self) -> serde_json::Map<String, Value> {
+        serde_json::json!({
+            "ms":self.started.elapsed().as_millis() as u64,
+            "status":self.status,
+            "bodyBytes":self.body_bytes,
+            "chunks":self.chunks,
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    fn response_ready(&mut self, status: StatusCode) {
+        self.status = Some(status.as_u16());
+        if status.is_client_error() || status.is_server_error() {
+            self.logger
+                .warn("anthropic_upstream_http_error", Some(self.fields()));
+        } else {
+            self.logger
+                .info("anthropic_response_ready", Some(self.fields()));
+        }
+    }
+
+    fn failed(&mut self, event: &str, error: reqwest::Error) -> std::io::Error {
+        // reqwest's outer display can contain a request URL. Strip it before
+        // collecting the transport causes; never log headers or body content.
+        let error = error.without_url();
+        let mut summary = error.to_string();
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            summary.push_str(": ");
+            summary.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        let mut fields = self.fields();
+        fields.insert("error".into(), Value::String(summary));
+        self.logger.error(event, Some(fields));
+        self.terminal = true;
+        std::io::Error::other(error)
+    }
+
+    fn completed(&mut self) {
+        self.logger
+            .info("anthropic_response_completed", Some(self.fields()));
+        self.terminal = true;
+    }
+}
+
+impl Drop for AnthropicRequestLog {
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.logger
+                .info("anthropic_caller_disconnected", Some(self.fields()));
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConversationKey {
@@ -668,6 +770,7 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
     } else {
         format!("http://127.0.0.1:{}{query}", state.upstream_port)
     };
+    let mut native_log = to_anthropic.then(|| AnthropicRequestLog::new(parts.uri.path(), &bytes));
 
     // Codex intermittently drops a pooled connection, which surfaces as a 502
     // that fails in tens of milliseconds -- before the request was ever sent.
@@ -697,7 +800,13 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
             Ok(response) if response.status() == StatusCode::BAD_GATEWAY && retryable => {}
             Ok(response) => break response,
             Err(_) if retryable => {}
-            Err(error) if to_anthropic => return Err(error).context("could not reach Anthropic"),
+            Err(error) if to_anthropic => {
+                let error = native_log
+                    .as_mut()
+                    .expect("Anthropic requests have a transport logger")
+                    .failed("anthropic_request_failed", error);
+                return Err(error).context("could not reach Anthropic");
+            }
             Err(error) => return Err(error).context("could not reach claude-code-proxy"),
         }
 
@@ -711,8 +820,36 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
 
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
-    let stream = upstream.bytes_stream().map_err(std::io::Error::other);
-    let mut response = Response::new(Body::from_stream(stream));
+    let body = if let Some(mut log) = native_log {
+        log.response_ready(status);
+        let stream = futures_util::stream::unfold(
+            (Box::pin(upstream.bytes_stream()), log),
+            |(mut stream, mut log)| async move {
+                if log.terminal {
+                    return None;
+                }
+                match stream.next().await {
+                    Some(Ok(chunk)) => {
+                        log.body_bytes += chunk.len() as u64;
+                        log.chunks += 1;
+                        Some((Ok(chunk), (stream, log)))
+                    }
+                    Some(Err(error)) => {
+                        let error = log.failed("anthropic_stream_failed", error);
+                        Some((Err(error), (stream, log)))
+                    }
+                    None => {
+                        log.completed();
+                        None
+                    }
+                }
+            },
+        );
+        Body::from_stream(stream)
+    } else {
+        Body::from_stream(upstream.bytes_stream().map_err(std::io::Error::other))
+    };
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     for (name, value) in &response_headers {
         if should_forward_response_header(name) {
@@ -1541,6 +1678,104 @@ mod tests {
             }
         });
         (port, captured_rx, handle)
+    }
+
+    #[test]
+    fn http_native_failures_log_metadata_without_request_or_response_content() {
+        for (model, status, declared_length, payload, expected_event) in [
+            (
+                "claude-log-test-http-error",
+                "429 Too Many Requests",
+                24,
+                "private-upstream-content",
+                "anthropic_upstream_http_error",
+            ),
+            (
+                "claude-log-test-stream-error",
+                "200 OK",
+                100,
+                "private-upstream-content",
+                "anthropic_stream_failed",
+            ),
+        ] {
+            let model = format!("{model}-{}", std::process::id());
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n{payload}"
+            );
+            let (port, captured, upstream) = capture_upstream_response(1, response.into_bytes());
+            let bridge =
+                FastBridge::start_with(0, format!("http://127.0.0.1:{port}"), false, 0).unwrap();
+            let response = reqwest::blocking::Client::new()
+                .post(format!(
+                    "http://127.0.0.1:{}/v1/messages?private-query=secret-query",
+                    bridge.port()
+                ))
+                .header(header::AUTHORIZATION, "Bearer secret-native-credential")
+                .json(&serde_json::json!({
+                    "model":format!("anthropic/{model}"),
+                    "messages":[{"role":"user","content":"private-prompt-content"}]
+                }))
+                .send()
+                .unwrap();
+            if declared_length == payload.len() {
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(response.text().unwrap(), payload);
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(
+                    response.bytes().is_err(),
+                    "transport failures must reach the caller"
+                );
+            }
+            captured.recv_timeout(TEST_TIMEOUT).unwrap();
+            drop(bridge);
+            upstream.join().unwrap();
+
+            let log = std::fs::read_to_string(codex_backend::logging::log_file()).unwrap();
+            let events: Vec<Value> = log
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|entry| {
+                    entry["service"] == "anthropic" && entry["fields"]["model"] == model
+                })
+                .collect();
+            assert!(
+                events.iter().any(|entry| entry["msg"] == expected_event),
+                "{events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|entry| entry["msg"] == "anthropic_request_started")
+                    .count(),
+                1
+            );
+            if expected_event == "anthropic_stream_failed" {
+                assert!(
+                    !events
+                        .iter()
+                        .any(|entry| entry["msg"] == "anthropic_response_completed")
+                );
+            }
+            for event in events {
+                let serialized = event.to_string();
+                for private in [
+                    "private-upstream-content",
+                    "private-prompt-content",
+                    "secret-native-credential",
+                    "secret-query",
+                ] {
+                    assert!(!serialized.contains(private), "{serialized}");
+                }
+                assert_eq!(event["fields"]["path"], "/v1/messages");
+                assert!(
+                    event["fields"]["reqId"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("anthropic-")
+                );
+            }
+        }
     }
 
     #[test]
