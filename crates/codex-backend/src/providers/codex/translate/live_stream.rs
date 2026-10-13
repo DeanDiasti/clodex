@@ -231,7 +231,9 @@ impl LiveStreamTranslator {
         if self.finished {
             return out;
         }
-        self.close_open_blocks(traffic, &mut out);
+        // An error aborts the message. Closing an unfinished tool block here
+        // tells Claude Code to parse and dispatch its partial arguments before
+        // it sees the error. Only upstream completion may close those blocks.
         self.ensure_message_start(traffic, &mut out);
         self.emit(
             traffic,
@@ -1196,6 +1198,59 @@ mod tests {
             out.extend(translator.accept(&event, None).unwrap());
         }
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn stream_error_does_not_complete_interrupted_tool_arguments() {
+        // Even valid JSON is unfinished until the upstream tool item is done.
+        for (name, arguments) in [
+            ("SubagentHandback", "{\"message\":\"unfinished"),
+            ("SubagentHandback", "{\"message\":\"valid but not done\"}"),
+            ("Read", "{\"file_path\":\"/tmp/unfinished"),
+        ] {
+            let mut translator = LiveStreamTranslator::new("msg_tool", "gpt-6.1-sol");
+            translator
+                .accept(
+                    &json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {"type": "function_call", "call_id": "call_1", "name": name}
+                    }),
+                    None,
+                )
+                .unwrap();
+            translator
+                .accept(
+                    &json!({
+                        "type": "response.function_call_arguments.delta",
+                        "output_index": 0,
+                        "delta": arguments
+                    }),
+                    None,
+                )
+                .unwrap();
+
+            let error = String::from_utf8(translator.error_chunk(
+                "upstream stream reset",
+                "api_error",
+                None,
+            ))
+            .unwrap();
+            assert!(error.contains("event: error"), "{error}");
+            assert!(!error.contains("content_block_stop"), "{error}");
+            assert!(!error.contains("input_json_delta"), "{error}");
+            assert!(!error.contains("message_stop"), "{error}");
+            assert!(
+                translator
+                    .finish_after_closed_completed_tool_call(None)
+                    .is_empty()
+            );
+            assert!(
+                translator
+                    .error_chunk("again", "api_error", None)
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

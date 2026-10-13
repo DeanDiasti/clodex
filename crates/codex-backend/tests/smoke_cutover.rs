@@ -2503,6 +2503,53 @@ async fn smoke_codex_http_body_error_after_semantic_output_preserves_message() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_codex_http_body_error_does_not_complete_partial_handback() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    write_auth(config.path(), "codex");
+
+    let upstream = spawn_truncated_http_upstream(concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_handback_partial\"}}\n\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_partial\",\"name\":\"SubagentHandback\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"message\\\":\\\"partial report\"}\n\n"
+    ).as_bytes())
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"return the report"}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(2),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("interrupted tool stream must terminate")
+    .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("\"name\":\"SubagentHandback\""), "{text}");
+    assert!(text.contains("partial report"), "{text}");
+    assert!(text.contains("event: error"), "{text}");
+    assert!(
+        text.contains("Transport error reading Codex response body"),
+        "{text}"
+    );
+    assert!(!text.contains("event: content_block_stop"), "{text}");
+    assert!(!text.contains("event: message_stop"), "{text}");
+    assert!(!text.contains("\"stop_reason\":\"tool_use\""), "{text}");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_body_error_after_closed_tool_is_not_success() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
