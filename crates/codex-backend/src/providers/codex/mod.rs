@@ -725,7 +725,156 @@ async fn live_stream_response(
     compaction: LiveStreamCompaction,
     transport: config::CodexTransport,
 ) -> Response {
-    let model = model.to_string();
+    let model = model.to_owned();
+    let progress_ctx = ctx.clone();
+    keep_alive_until_live_response(
+        async move {
+            live_stream_response_inner(
+                client,
+                message_id,
+                model,
+                ctx,
+                request_body,
+                continuation,
+                compaction,
+                transport,
+            )
+            .await
+        },
+        progress_ctx,
+        LIVE_STREAM_HEARTBEAT_INTERVAL,
+    )
+    .await
+}
+
+/// Preserve HTTP errors for quick failures, then keep long pre-output waits
+/// alive without exposing framing or content from attempts that may retry.
+async fn keep_alive_until_live_response<F>(
+    response: F,
+    ctx: RequestContext,
+    heartbeat_interval: Duration,
+) -> Response
+where
+    F: std::future::Future<Output = Response> + Send + 'static,
+{
+    use futures_util::StreamExt as _;
+
+    let mut response = Box::pin(response);
+    tokio::select! {
+        biased;
+        response = &mut response => return response,
+        _ = tokio::time::sleep(heartbeat_interval) => {}
+    }
+
+    create_logger("codex").info(
+        "codex_waiting_for_output",
+        Some(serde_json::Map::from_iter([
+            ("reqId".into(), serde_json::json!(ctx.req_id)),
+            (
+                "heartbeatMs".into(),
+                serde_json::json!(heartbeat_interval.as_millis()),
+            ),
+        ])),
+    );
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        let ping = Bytes::from(crate::anthropic::sse::encode_sse_event(
+            Some("ping"),
+            r#"{"type":"ping"}"#,
+        ));
+        let mut heartbeat = tokio::time::interval(heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let response = loop {
+            tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                response = &mut response => break response,
+                _ = heartbeat.tick() => {
+                    record_live_stream_downstream_capture(&ctx, &ping);
+                    record_live_stream_progress(&ctx, &ping);
+                    if tx.send(Ok(ping.clone())).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        };
+
+        if !response.status().is_success() {
+            // Headers are already sent after the first ping. Report a late
+            // failure as an Anthropic SSE error, never as an empty end_turn.
+            let status = response.status();
+            let bytes = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                body = axum::body::to_bytes(response.into_body(), 64 * 1024) => body,
+            };
+            let error = bytes
+                .ok()
+                .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+                .filter(|value| value.get("type").and_then(serde_json::Value::as_str) == Some("error"))
+                .unwrap_or_else(|| serde_json::json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": format!("Codex request failed with HTTP {status}")}
+                }));
+            create_logger("codex").warn(
+                "codex_live_start_failed",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".into(), serde_json::json!(ctx.req_id)),
+                    ("status".into(), serde_json::json!(status.as_u16())),
+                    (
+                        "errorType".into(),
+                        serde_json::json!(
+                            error
+                                .pointer("/error/type")
+                                .and_then(serde_json::Value::as_str)
+                        ),
+                    ),
+                    (
+                        "message".into(),
+                        serde_json::json!(
+                            error
+                                .pointer("/error/message")
+                                .and_then(serde_json::Value::as_str)
+                        ),
+                    ),
+                ])),
+            );
+            let chunk = crate::anthropic::sse::encode_sse_event(Some("error"), &error.to_string());
+            record_live_stream_downstream_capture(&ctx, &chunk);
+            record_live_stream_progress(&ctx, &chunk);
+            let _ = tx.send(Ok(Bytes::from(chunk))).await;
+            return;
+        }
+
+        let mut body = response.into_body().into_data_stream();
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                chunk = body.next() => chunk,
+            };
+            let Some(chunk) = chunk else { return };
+            if tx.send(chunk.map_err(std::io::Error::other)).await.is_err() {
+                return;
+            }
+        }
+    });
+    event_stream_response(futures_util::stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|item| (item, rx))
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn live_stream_response_inner(
+    client: Arc<CodexHttpClient>,
+    message_id: String,
+    model: String,
+    ctx: RequestContext,
+    request_body: translate::request::ResponsesRequest,
+    continuation: ContinuationReservation,
+    compaction: LiveStreamCompaction,
+    transport: config::CodexTransport,
+) -> Response {
     let request_continuation = continuation.clone();
     let mut cleanup = LiveRequestStateCleanup::new(
         request_continuation.clone(),
@@ -943,6 +1092,19 @@ async fn live_stream_response_once(
             && is_codex_success_terminal_event(&payload)
             && !translator.has_semantic_output()
         {
+            let mut fields = empty_completion_diagnostics(&payload, &upstream_sse_body);
+            fields.insert("reqId".into(), serde_json::json!(ctx.req_id));
+            fields.insert("model".into(), serde_json::json!(request_body.model));
+            fields.insert(
+                "reasoningEffort".into(),
+                serde_json::json!(
+                    request_body
+                        .reasoning
+                        .as_ref()
+                        .and_then(|value| value.effort.as_ref())
+                ),
+            );
+            create_logger("codex").warn("codex_empty_completion", Some(fields));
             return provider_retry(&upstream_events, empty_live_completion_error());
         }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
@@ -1012,6 +1174,74 @@ fn empty_live_completion_error() -> client::CodexError {
         usage_limit: None,
         origin: client::CodexErrorOrigin::WebSocket,
     }
+}
+
+/// Diagnose missing visible output without logging prompts, generated text,
+/// tool arguments, or encrypted reasoning contents.
+fn empty_completion_diagnostics(
+    terminal: &serde_json::Value,
+    upstream_sse: &[u8],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut event_types = std::collections::BTreeMap::<String, usize>::new();
+    for event in parse_sse_events(upstream_sse) {
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) {
+            *event_types
+                .entry(payload["type"].as_str().unwrap_or("unknown").to_owned())
+                .or_default() += 1;
+        }
+    }
+    let response = &terminal["response"];
+    let mut item_types = std::collections::BTreeMap::<String, usize>::new();
+    let mut content_types = std::collections::BTreeMap::<String, usize>::new();
+    let mut text_bytes = 0;
+    let mut encrypted_reasoning_bytes = 0;
+    if let Some(items) = response["output"].as_array() {
+        for item in items {
+            *item_types
+                .entry(item["type"].as_str().unwrap_or("unknown").to_owned())
+                .or_default() += 1;
+            encrypted_reasoning_bytes += item["encrypted_content"].as_str().map_or(0, str::len);
+            for key in ["content", "summary"] {
+                if let Some(parts) = item[key].as_array() {
+                    for part in parts {
+                        *content_types
+                            .entry(part["type"].as_str().unwrap_or("unknown").to_owned())
+                            .or_default() += 1;
+                        text_bytes += part["text"].as_str().map_or(0, str::len);
+                    }
+                }
+            }
+        }
+    }
+    serde_json::Map::from_iter([
+        ("eventTypes".into(), serde_json::json!(event_types)),
+        ("outputItemTypes".into(), serde_json::json!(item_types)),
+        (
+            "outputContentTypes".into(),
+            serde_json::json!(content_types),
+        ),
+        ("outputTextBytes".into(), serde_json::json!(text_bytes)),
+        (
+            "encryptedReasoningBytes".into(),
+            serde_json::json!(encrypted_reasoning_bytes),
+        ),
+        (
+            "outputTokens".into(),
+            serde_json::json!(
+                response
+                    .pointer("/usage/output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+            ),
+        ),
+        (
+            "reasoningTokens".into(),
+            serde_json::json!(
+                response
+                    .pointer("/usage/output_tokens_details/reasoning_tokens")
+                    .and_then(serde_json::Value::as_u64)
+            ),
+        ),
+    ])
 }
 
 fn codex_generation_event(payload: &serde_json::Value) -> bool {
@@ -1943,6 +2173,154 @@ mod tests {
         assert_eq!(state.active[0].output_tokens, Some(48));
     }
 
+    fn preoutput_test_context() -> RequestContext {
+        RequestContext {
+            req_id: "preoutput-heartbeat".to_owned(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_owned(),
+            traffic: None,
+            monitor: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn preoutput_heartbeats_arrive_before_content_and_forward_it_once() {
+        use http_body_util::BodyExt as _;
+
+        let (ready, waiting) = tokio::sync::oneshot::channel::<Response>();
+        let response = keep_alive_until_live_response(
+            async move { waiting.await.unwrap() },
+            preoutput_test_context(),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let first = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let first = String::from_utf8(first.to_vec()).unwrap();
+        assert!(first.contains("event: ping"));
+        assert!(!first.contains("message_start"));
+
+        let content = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ready\"}}\n\n";
+        ready
+            .send(single_live_stream_response(content.to_vec()))
+            .unwrap();
+        let remaining = tokio::time::timeout(Duration::from_secs(1), body.collect())
+            .await
+            .unwrap()
+            .unwrap()
+            .to_bytes();
+        let events = parse_sse_events(&remaining);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event.as_deref() == Some("content_block_delta"))
+                .count(),
+            1
+        );
+        assert!(
+            String::from_utf8(remaining.to_vec())
+                .unwrap()
+                .contains("ready")
+        );
+    }
+
+    #[tokio::test]
+    async fn preoutput_quick_failure_keeps_original_http_error() {
+        use http_body_util::BodyExt as _;
+
+        let response = keep_alive_until_live_response(
+            async {
+                json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    "test auth error",
+                )
+            },
+            preoutput_test_context(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"]["type"], "authentication_error");
+    }
+
+    #[tokio::test]
+    async fn preoutput_late_failure_is_an_sse_error_not_empty_success() {
+        use http_body_util::BodyExt as _;
+
+        let (ready, waiting) = tokio::sync::oneshot::channel::<Response>();
+        let response = keep_alive_until_live_response(
+            async move { waiting.await.unwrap() },
+            preoutput_test_context(),
+            Duration::from_millis(10),
+        )
+        .await;
+        let mut body = response.into_body();
+        let _ping = body.frame().await.unwrap().unwrap();
+        ready
+            .send(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                "test failure",
+            ))
+            .unwrap();
+        let bytes = tokio::time::timeout(Duration::from_secs(1), body.collect())
+            .await
+            .unwrap()
+            .unwrap()
+            .to_bytes();
+        let events = parse_sse_events(&bytes);
+        let errors: Vec<_> = events
+            .iter()
+            .filter(|event| event.event.as_deref() == Some("error"))
+            .collect();
+        assert_eq!(errors.len(), 1);
+        let error: serde_json::Value = serde_json::from_str(&errors[0].data).unwrap();
+        assert_eq!(error["error"]["message"], "test failure");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event.as_deref() == Some("message_stop"))
+        );
+    }
+
+    #[tokio::test]
+    async fn preoutput_cancellation_drops_pending_upstream_work() {
+        struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let (cancelled, cancellation) = tokio::sync::oneshot::channel();
+        let response = keep_alive_until_live_response(
+            async move {
+                let _notify = NotifyOnDrop(Some(cancelled));
+                std::future::pending::<Response>().await
+            },
+            preoutput_test_context(),
+            Duration::from_millis(10),
+        )
+        .await;
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn live_stream_response_emits_downstream_frames_before_terminal_event() {
         use http_body_util::BodyExt as _;
@@ -2164,6 +2542,43 @@ mod tests {
             map_codex_error_to_response(&err).status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn empty_completion_diagnostics_detect_reasoning_only_without_content() {
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "input": [{"text": "private prompt"}],
+                "output": [{"type": "reasoning", "encrypted_content": "private encrypted reasoning", "summary": []}],
+                "usage": {"output_tokens": 12, "output_tokens_details": {"reasoning_tokens": 12}}
+            }
+        });
+        let sse = format!("data: {terminal}\n\n");
+        let diagnostic =
+            serde_json::Value::Object(empty_completion_diagnostics(&terminal, sse.as_bytes()));
+        assert_eq!(diagnostic["outputItemTypes"]["reasoning"], 1);
+        assert_eq!(diagnostic["reasoningTokens"], 12);
+        assert_eq!(diagnostic["outputTextBytes"], 0);
+        assert_eq!(diagnostic["encryptedReasoningBytes"], 27);
+        assert!(!diagnostic.to_string().contains("private"));
+    }
+
+    #[test]
+    fn empty_completion_diagnostics_detect_untranslated_terminal_text() {
+        let terminal = serde_json::json!({
+            "type": "response.completed",
+            "response": {"output": [{"type": "message", "content": [{"type": "output_text", "text": "private answer"}]}]}
+        });
+        let diagnostic = serde_json::Value::Object(empty_completion_diagnostics(
+            &terminal,
+            b"data: {\"type\":\"response.created\"}\n\n",
+        ));
+        assert_eq!(diagnostic["outputItemTypes"]["message"], 1);
+        assert_eq!(diagnostic["outputContentTypes"]["output_text"], 1);
+        assert_eq!(diagnostic["outputTextBytes"], 14);
+        assert_eq!(diagnostic["eventTypes"]["response.created"], 1);
+        assert!(!diagnostic.to_string().contains("private"));
     }
 
     #[test]
