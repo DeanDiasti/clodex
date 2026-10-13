@@ -52,6 +52,7 @@ const AUTO_REVIEW_SYSTEM_PREFIX: &str =
 pub const AUTO_REVIEW_MODEL: &str = "claude-sonnet-5";
 
 static ANTHROPIC_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_LOGGED_MODEL_CHARS: usize = 128;
 
 /// Native Claude traffic bypasses the Codex backend's request logger. Record
 /// its transport lifecycle without inspecting response bodies or credentials.
@@ -72,7 +73,14 @@ impl AnthropicRequestLog {
         }
         let model = serde_json::from_slice::<Peek>(body)
             .ok()
-            .and_then(|peek| peek.model);
+            .and_then(|peek| peek.model)
+            // Bound retained log bindings before JSON construction and cloning.
+            .map(|model| {
+                model
+                    .chars()
+                    .take(MAX_LOGGED_MODEL_CHARS)
+                    .collect::<String>()
+            });
         let req_id = format!(
             "anthropic-{}-{}",
             std::process::id(),
@@ -1678,6 +1686,43 @@ mod tests {
             }
         });
         (port, captured_rx, handle)
+    }
+
+    #[test]
+    fn native_model_log_is_bounded_without_changing_the_upstream_model() {
+        let prefix = format!("claude-model-bound-{}-", std::process::id());
+        let model = format!("{prefix}{}", "🦀".repeat(10_000));
+        let (port, captured, upstream) = capture_upstream(1);
+        let bridge =
+            FastBridge::start_with(0, format!("http://127.0.0.1:{port}"), false, 0).unwrap();
+        let response = reqwest::blocking::Client::new()
+            .post(format!("http://127.0.0.1:{}/v1/messages", bridge.port()))
+            .json(&serde_json::json!({"model":format!("anthropic/{model}"),"messages":[]}))
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().unwrap();
+        assert_eq!(
+            captured.recv_timeout(TEST_TIMEOUT).unwrap().1["model"],
+            model
+        );
+        drop(bridge);
+        upstream.join().unwrap();
+
+        let log = std::fs::read_to_string(codex_backend::logging::log_file()).unwrap();
+        let models: Vec<String> = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|entry| entry["service"] == "anthropic")
+            .filter_map(|entry| entry["fields"]["model"].as_str().map(str::to_owned))
+            .filter(|model| model.starts_with(&prefix))
+            .collect();
+        assert!(!models.is_empty());
+        for logged in models {
+            assert_eq!(logged.chars().count(), 128);
+            assert!(model.starts_with(&logged));
+            assert!(logged.len() <= 128 * 4);
+        }
     }
 
     #[test]
