@@ -52,7 +52,7 @@ const AUTO_REVIEW_SYSTEM_PREFIX: &str =
 pub const AUTO_REVIEW_MODEL: &str = "claude-sonnet-5";
 
 static ANTHROPIC_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
-const MAX_LOGGED_MODEL_CHARS: usize = 128;
+const MAX_LOGGED_ID_CHARS: usize = 128;
 
 /// Native Claude traffic bypasses the Codex backend's request logger. Record
 /// its transport lifecycle without inspecting response bodies or credentials.
@@ -66,7 +66,7 @@ struct AnthropicRequestLog {
 }
 
 impl AnthropicRequestLog {
-    fn new(path: &str, body: &[u8]) -> Self {
+    fn new(path: &str, body: &[u8], headers: &HeaderMap) -> Self {
         #[derive(serde::Deserialize)]
         struct Peek {
             model: Option<String>,
@@ -75,22 +75,30 @@ impl AnthropicRequestLog {
             .ok()
             .and_then(|peek| peek.model)
             // Bound retained log bindings before JSON construction and cloning.
-            .map(|model| {
-                model
-                    .chars()
-                    .take(MAX_LOGGED_MODEL_CHARS)
-                    .collect::<String>()
-            });
+            .map(|model| model.chars().take(MAX_LOGGED_ID_CHARS).collect::<String>());
+        let header_id = |name| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.chars().take(MAX_LOGGED_ID_CHARS).collect::<String>())
+        };
         let req_id = format!(
             "anthropic-{}-{}",
             std::process::id(),
             ANTHROPIC_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
         );
         let logger = codex_backend::logging::create_logger("anthropic").child(
-            serde_json::json!({"reqId":req_id, "model":model, "path":path})
-                .as_object()
-                .unwrap()
-                .clone(),
+            serde_json::json!({
+                "reqId":req_id,
+                "model":model,
+                "path":path,
+                "sessionId":header_id(SESSION_HEADER),
+                "agentId":header_id(AGENT_HEADER),
+                "requestBytes":body.len(),
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
         );
         logger.info("anthropic_request_started", None);
         Self {
@@ -115,8 +123,19 @@ impl AnthropicRequestLog {
         .clone()
     }
 
-    fn response_ready(&mut self, status: StatusCode) {
+    fn response_ready(
+        &mut self,
+        status: StatusCode,
+        version: axum::http::Version,
+        remote: Option<std::net::SocketAddr>,
+    ) {
         self.status = Some(status.as_u16());
+        self.logger = self.logger.child(
+            serde_json::json!({"httpVersion":format!("{version:?}"),"remoteAddress":remote.map(|address|address.to_string())})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
         if status.is_client_error() || status.is_server_error() {
             self.logger
                 .warn("anthropic_upstream_http_error", Some(self.fields()));
@@ -225,6 +244,10 @@ impl FastBridge {
                     upstream_port,
                     anthropic_base,
                     client: reqwest::Client::builder()
+                        // A failed multiplexed TLS connection can abort Claude
+                        // calls across sessions. Match the native CLI's HTTP/1.1
+                        // transport so concurrent calls use separate connections.
+                        .http1_only()
                         .build()
                         .context("could not create the Clodex fast bridge client")?,
                     hierarchical,
@@ -778,7 +801,8 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
     } else {
         format!("http://127.0.0.1:{}{query}", state.upstream_port)
     };
-    let mut native_log = to_anthropic.then(|| AnthropicRequestLog::new(parts.uri.path(), &bytes));
+    let mut native_log =
+        to_anthropic.then(|| AnthropicRequestLog::new(parts.uri.path(), &bytes, &parts.headers));
 
     // Codex intermittently drops a pooled connection, which surfaces as a 502
     // that fails in tens of milliseconds -- before the request was ever sent.
@@ -829,7 +853,7 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
     let body = if let Some(mut log) = native_log {
-        log.response_ready(status);
+        log.response_ready(status, upstream.version(), upstream.remote_addr());
         let stream = futures_util::stream::unfold(
             (Box::pin(upstream.bytes_stream()), log),
             |(mut stream, mut log)| async move {
@@ -1686,6 +1710,53 @@ mod tests {
             }
         });
         (port, captured_rx, handle)
+    }
+
+    #[test]
+    fn native_lifecycle_logs_bounded_session_ids_and_transport_metadata() {
+        let model = format!("claude-session-log-{}", std::process::id());
+        let session = format!("session-{}", "s".repeat(1000));
+        let agent = format!("agent-{}", "a".repeat(1000));
+        let (port, captured, upstream) = capture_upstream(1);
+        let bridge =
+            FastBridge::start_with(0, format!("http://127.0.0.1:{port}"), false, 0).unwrap();
+        let response = reqwest::blocking::Client::new()
+            .post(format!("http://127.0.0.1:{}/v1/messages", bridge.port()))
+            .header(SESSION_HEADER, &session)
+            .header(AGENT_HEADER, &agent)
+            .json(&serde_json::json!({"model":format!("anthropic/{model}"),"messages":[]}))
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().unwrap();
+        let (headers, body) = captured.recv_timeout(TEST_TIMEOUT).unwrap();
+        assert!(headers.contains(&format!("{SESSION_HEADER}: {session}")));
+        assert!(headers.contains(&format!("{AGENT_HEADER}: {agent}")));
+        let request_bytes = serde_json::to_vec(&body).unwrap().len();
+        drop(bridge);
+        upstream.join().unwrap();
+
+        let log = std::fs::read_to_string(codex_backend::logging::log_file()).unwrap();
+        let events: Vec<Value> = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|entry| entry["service"] == "anthropic" && entry["fields"]["model"] == model)
+            .collect();
+        assert!(!events.is_empty());
+        for event in &events {
+            assert_eq!(event["fields"]["sessionId"], &session[..128]);
+            assert_eq!(event["fields"]["agentId"], &agent[..128]);
+            assert_eq!(event["fields"]["requestBytes"], request_bytes);
+        }
+        let completed = events
+            .iter()
+            .find(|event| event["msg"] == "anthropic_response_completed")
+            .unwrap();
+        assert_eq!(completed["fields"]["httpVersion"], "HTTP/1.1");
+        assert_eq!(
+            completed["fields"]["remoteAddress"],
+            format!("127.0.0.1:{port}")
+        );
     }
 
     #[test]
