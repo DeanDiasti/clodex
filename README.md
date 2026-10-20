@@ -38,6 +38,8 @@ existing Codex CLI login is reused when you have one.
   provider.
 - Run everything locally in one self-contained binary, behind a loopback-only
   bridge.
+- Enable `/remote-control` in a Claude subscription session while keeping
+  OpenAI models available.
 - Leave normal Claude Code sessions and global model settings untouched.
 - Share one supervised backend safely across concurrent Clodex sessions.
 
@@ -175,6 +177,7 @@ only if the saved configuration, sign-in, cache, and logs are no longer wanted.
 | `clodex config context <auto\|tokens>` | Set context capacity |
 | `clodex config compact-at <1..95>` | Set the auto-compaction percentage |
 | `clodex config backend <builtin\|proxy>` | Choose the Codex translator |
+| `clodex config remote-control <on\|off>` | Enable the Remote Control compatible launch transport (default: on) |
 | `clodex config hierarchical-compaction <on\|off>` | Fold an oversized compaction into rounds |
 | `clodex config route <role> <claude-model\|codex>` | Route a role to a Claude model on your subscription |
 | `clodex config allow-tool <exact-name>` | Trust one tool for sessions and subagents |
@@ -280,6 +283,50 @@ working in a Clodex session, on Codex models too: claude.ai connectors,
 managed plugins, feature-flagged tools, and artifacts. Without one, Clodex
 turns off Claude Code's nonessential traffic, since there is no Claude account
 for it to reach.
+
+## Remote Control with OpenAI models
+
+With a Claude subscription login, new Clodex sessions are prepared for native
+Remote Control by default. Start normally, choose an OpenAI model in `/model`,
+then run `/remote-control` (or `/rc`) whenever you want to connect from another
+device. To enable it at launch, use:
+
+```sh
+clodex --remote-control
+```
+
+The local session continues to use the selected model, including Codex models.
+Claude's subscription eligibility, organization policy, and trusted-device
+requirements still apply. The computer and Clodex launcher must remain running.
+The standalone `clodex remote-control` server mode is not supported; use the
+interactive flag or slash command instead.
+
+Clodex leaves `ANTHROPIC_BASE_URL` unset and supplies the terminal picker through
+`modelPicker.options`. A session-local HTTPS proxy decrypts only traffic addressed
+to `api.anthropic.com`. It sends the two model endpoints through the existing
+bridge, which routes Claude and Codex models and strips Claude credentials from
+Codex requests. Account, policy, and Remote Control endpoints retain their
+Anthropic destination; other HTTPS hosts use encrypted CONNECT tunnels.
+
+Each launch generates a temporary CA certificate and an authenticated loopback
+proxy. The certificate is trusted through the launched process's
+`NODE_EXTRA_CA_CERTS`, preserving any existing extra roots; no system trust store
+is changed and no private key is written to disk. The proxy and certificate file
+are removed on normal launcher exit. The environment is inherited by Claude's
+child processes. This mode disables request gzip compression and replaces
+`NO_PROXY` with loopback exemptions so model calls cannot bypass the bridge.
+
+Existing outbound `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` settings cannot
+currently be chained. To retain an existing proxy setup or use the previous
+custom-endpoint transport, run `clodex config remote-control off` and start a new
+session. Re-enable with `clodex config remote-control on`. Without a Claude
+subscription login, Clodex continues to use the previous transport; this feature
+does not grant Remote Control eligibility.
+
+Verified with Claude Code 2.1.305: OpenAI models appear in the terminal picker,
+GPT turns complete through the HTTPS proxy, and `/remote-control` activates in
+the same session. Browser-submitted turns and custom model rows in the mobile/web
+picker still need verification with a signed-in, trusted browser.
 
 ## Every model in `/model` and in subagents
 

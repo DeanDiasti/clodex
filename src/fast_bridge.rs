@@ -22,6 +22,7 @@ const BRIDGE_HEADER: &str = "x-clodex-fast-bridge";
 const BRIDGE_HEADER_VALUE: &str = "1";
 const SESSION_FAST_HEADER: &str = "x-clodex-session-fast";
 const SONNET_ROUTE_HEADER: &str = "x-clodex-sonnet-route";
+pub const NATIVE_API_HEADER: &str = "x-clodex-native-api";
 const INITIAL_MODEL_HEADER: &str = "x-clodex-initial-model";
 const SESSION_HEADER: &str = "x-claude-code-session-id";
 const AGENT_HEADER: &str = "x-claude-code-agent-id";
@@ -428,7 +429,9 @@ async fn hierarchical_compaction(
     let model = object.get("model").and_then(Value::as_str)?.to_string();
     // Folding runs against the Codex proxy. A Claude-routed compaction is
     // forwarded to Anthropic untouched.
-    if model.starts_with(ANTHROPIC_PREFIX) {
+    if model.starts_with(ANTHROPIC_PREFIX)
+        || (headers.contains_key(NATIVE_API_HEADER) && model.starts_with("claude-"))
+    {
         return None;
     }
     let system = object.get("system").cloned();
@@ -810,8 +813,11 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
     if !auto_review && marked && is_messages && !session_fast {
         bytes = rewrite_request(&parts.headers, &bytes)?;
     }
-    let to_anthropic =
-        auto_review || ((is_messages || is_count) && route_to_anthropic(&mut bytes)?);
+    // Fast-mode shadows have already been resolved above. Native endpoint
+    // sessions also expose Claude's own unprefixed picker entries.
+    let to_anthropic = auto_review
+        || ((is_messages || is_count)
+            && route_to_anthropic(&mut bytes, parts.headers.contains_key(NATIVE_API_HEADER))?);
 
     let query = parts
         .uri
@@ -963,6 +969,7 @@ fn should_forward_request_header(name: &HeaderName) -> bool {
         && name.as_str() != INITIAL_MODEL_HEADER
         && name.as_str() != SESSION_FAST_HEADER
         && name.as_str() != SONNET_ROUTE_HEADER
+        && name.as_str() != NATIVE_API_HEADER
 }
 
 /// Returns the value to send to the Codex proxy, or `None` to drop the header.
@@ -995,7 +1002,7 @@ fn codex_header_value(
 
 /// Whether a message request is bound for Anthropic. If it is, the routing
 /// prefix is removed so Anthropic receives the bare Claude model ID.
-fn route_to_anthropic(bytes: &mut Vec<u8>) -> Result<bool> {
+fn route_to_anthropic(bytes: &mut Vec<u8>, native_api: bool) -> Result<bool> {
     #[derive(serde::Deserialize)]
     struct Peek {
         model: Option<String>,
@@ -1004,7 +1011,9 @@ fn route_to_anthropic(bytes: &mut Vec<u8>) -> Result<bool> {
     let routed = serde_json::from_slice::<Peek>(bytes)
         .ok()
         .and_then(|peek| peek.model)
-        .is_some_and(|model| model.starts_with(ANTHROPIC_PREFIX));
+        .is_some_and(|model| {
+            model.starts_with(ANTHROPIC_PREFIX) || (native_api && model.starts_with("claude-"))
+        });
     if !routed {
         return Ok(false);
     }
@@ -1170,8 +1179,14 @@ fn rewrite_request(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>> {
             if let Some(selected) = route.selected_model.as_deref() {
                 object.insert("model".into(), Value::String(selected.to_string()));
             }
-        } else if is_routed_model(normalized) {
-            route.selected_model = Some(normalized.to_string());
+        } else if is_routed_model(normalized)
+            || (headers.contains_key(NATIVE_API_HEADER) && normalized.starts_with("claude-"))
+        {
+            route.selected_model = Some(if normalized.starts_with("claude-") {
+                format!("{ANTHROPIC_PREFIX}{normalized}")
+            } else {
+                normalized.to_string()
+            });
             route.claude_fast_model = None;
             route.fast_was_enabled = false;
         }
@@ -1886,7 +1901,7 @@ mod tests {
     fn only_prefixed_models_are_routed_to_anthropic() {
         let mut claude =
             serde_json::to_vec(&serde_json::json!({"model": "anthropic/claude-opus-5-5"})).unwrap();
-        assert!(route_to_anthropic(&mut claude).unwrap());
+        assert!(route_to_anthropic(&mut claude, false).unwrap());
         assert_eq!(
             serde_json::from_slice::<Value>(&claude).unwrap()["model"],
             "claude-opus-5-5"
@@ -1895,9 +1910,45 @@ mod tests {
         for model in ["gpt-5.6-sol", "claude-opus-5-5"] {
             let original = serde_json::to_vec(&serde_json::json!({"model": model})).unwrap();
             let mut bytes = original.clone();
-            assert!(!route_to_anthropic(&mut bytes).unwrap(), "{model}");
+            assert!(!route_to_anthropic(&mut bytes, false).unwrap(), "{model}");
             assert_eq!(bytes, original);
         }
+    }
+
+    #[test]
+    fn native_api_picker_models_reach_anthropic_but_gpt_does_not() {
+        for (model, expected) in [("claude-haiku-4-5", true), ("gpt-6.1-sol", false)] {
+            let mut bytes = serde_json::to_vec(&serde_json::json!({"model": model})).unwrap();
+            assert_eq!(route_to_anthropic(&mut bytes, true).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap()["model"],
+                model
+            );
+        }
+        assert!(!should_forward_request_header(&HeaderName::from_static(
+            NATIVE_API_HEADER
+        )));
+    }
+
+    #[test]
+    fn native_api_fast_shadows_still_follow_the_selected_provider() {
+        let mut headers = headers("native-api-fast", None);
+        headers.insert(NATIVE_API_HEADER, HeaderValue::from_static("1"));
+        let _ = rewrite(&headers, "gpt-6.1-sol", false);
+        let mut fast = serde_json::to_vec(&rewrite(&headers, "claude-opus-5-5", true)).unwrap();
+        assert!(!route_to_anthropic(&mut fast, true).unwrap());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fast).unwrap()["model"],
+            "gpt-6.1-sol-fast"
+        );
+        let _ = rewrite(&headers, "gpt-6.1-sol", false);
+        let _ = rewrite(&headers, "claude-haiku-4-5", false);
+        let mut fast = serde_json::to_vec(&rewrite(&headers, "claude-opus-5-5", true)).unwrap();
+        assert!(route_to_anthropic(&mut fast, true).unwrap());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fast).unwrap()["model"],
+            "claude-haiku-4-5"
+        );
     }
 
     fn auto_review_body(model: &str) -> Value {

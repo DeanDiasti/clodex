@@ -49,6 +49,34 @@ fn update_help_is_available_without_runtime_dependencies() {
 }
 
 #[test]
+fn remote_control_transport_defaults_on_and_can_be_disabled_without_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_clodex"))
+            .args(args)
+            .env("CLODEX_HOME", directory.path())
+            .env("PATH", "")
+            .output()
+            .unwrap()
+    };
+    let defaults = run(&["config", "show"]);
+    assert!(defaults.status.success());
+    assert!(String::from_utf8_lossy(&defaults.stdout).contains("Remote Control transport: on"));
+    assert!(run(&["config", "remote-control", "off"]).status.success());
+    let disabled = run(&["config", "show"]);
+    assert!(String::from_utf8_lossy(&disabled.stdout).contains("Remote Control transport: off"));
+    assert!(run(&["config", "remote-control", "on"]).status.success());
+    assert!(
+        !run(&["config", "remote-control", "invalid"])
+            .status
+            .success()
+    );
+    let server = run(&["remote-control"]);
+    assert!(!server.status.success());
+    assert!(String::from_utf8_lossy(&server.stderr).contains("interactive Remote Control"));
+}
+
+#[test]
 fn statusline_appends_cached_updates_preserving_custom_stdin_and_output() {
     let directory = tempfile::tempdir().unwrap();
     let cache = directory.path().join("cache");

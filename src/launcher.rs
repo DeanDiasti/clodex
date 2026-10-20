@@ -28,6 +28,14 @@ const CLODEX_THEME: &str = r##"{
 "##;
 
 pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
+    if claude_args
+        .first()
+        .is_some_and(|arg| arg == "remote-control" || arg == "rc")
+    {
+        bail!(
+            "Clodex supports interactive Remote Control: use `clodex --remote-control`, or run `/remote-control` inside `clodex`. The standalone remote-control server is not supported"
+        );
+    }
     crate::deployment::Deployment::current()?;
     crate::update::start_background_checks();
     let config = AppConfig::load()?;
@@ -76,8 +84,17 @@ pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
         );
     }
     let models = picker::entries(&catalog, &support, claude);
-    if let Err(error) =
-        picker::write_gateway_cache(&format!("http://127.0.0.1:{proxy_port}"), &models, &mapping)
+    let remote_proxy = if claude && config.remote_control {
+        Some(crate::remote_proxy::RemoteProxy::start(proxy_port)?)
+    } else {
+        None
+    };
+    if remote_proxy.is_none()
+        && let Err(error) = picker::write_gateway_cache(
+            &format!("http://127.0.0.1:{proxy_port}"),
+            &models,
+            &mapping,
+        )
     {
         // The picker is a convenience; routing works without it.
         if io::stderr().is_terminal() {
@@ -105,10 +122,14 @@ pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
         fast_routes.as_ref(),
         lease.executable(),
     )?;
+    if let Some(proxy) = &remote_proxy {
+        proxy.configure(&mut command);
+    }
 
     let status = command
         .status()
         .context("could not start Claude Code; is `claude` installed?")?;
+    drop(remote_proxy);
     lease.close();
     restore_terminal_title();
 

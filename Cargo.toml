@@ -23,6 +23,10 @@ codex-backend = { path = "crates/codex-backend" }
 flate2 = "1.1"
 fs2 = "0.4"
 futures-util = "0.3"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -32,6 +36,7 @@ signal-hook = "0.3"
 tar = "0.4"
 tempfile = "3.27"
 tokio = { version = "1.47", features = ["macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
