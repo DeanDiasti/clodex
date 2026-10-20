@@ -38,6 +38,8 @@ pub struct AppConfig {
     pub compaction: CompactionConfig,
     pub permissions: PermissionsConfig,
     pub routes: RoutesConfig,
+    /// Prepare subscription-authenticated sessions for native Remote Control.
+    pub remote_control: bool,
 }
 
 /// Claude models, reached through the user's own Claude subscription, that
@@ -119,6 +121,7 @@ impl Default for AppConfig {
             compaction: CompactionConfig::default(),
             permissions: PermissionsConfig::default(),
             routes: RoutesConfig::default(),
+            remote_control: true,
         }
     }
 }
@@ -208,6 +211,7 @@ impl AppConfig {
              Compact at:     {}%\n\
              Codex transport: {}\n\
              Codex backend:  {}\n\
+             Remote Control transport: {}\n\
              Hierarchical compaction: {}\n\
              Trusted tools:  {}\n\
              Claude routes:  {}\n",
@@ -215,6 +219,7 @@ impl AppConfig {
             self.context.compact_at_percent,
             self.codex.transport.as_str(),
             self.codex.backend.as_str(),
+            if self.remote_control { "on" } else { "off" },
             if self.compaction.hierarchical {
                 "on"
             } else {

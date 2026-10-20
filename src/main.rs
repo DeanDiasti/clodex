@@ -8,6 +8,7 @@ mod fast_bridge;
 mod launcher;
 mod mapping;
 mod picker;
+mod remote_proxy;
 mod statusline;
 mod supervisor;
 mod update;
@@ -132,6 +133,11 @@ enum ConfigCommand {
     /// Fold an oversized compaction into rounds that each fit the window.
     HierarchicalCompaction {
         /// One of: on or off.
+        value: String,
+    },
+    /// Prepare Claude subscription sessions for /remote-control via a local HTTPS proxy.
+    RemoteControl {
+        /// One of: on or off. Applies to new sessions.
         value: String,
     },
     /// Trust an exact Claude tool name in every Clodex agent.
@@ -344,6 +350,16 @@ fn run_config(args: ConfigArgs) -> Result<()> {
                 "Hierarchical compaction {}. Start a new Clodex session to apply it.",
                 if enabled { "enabled" } else { "disabled" }
             );
+        }
+        ConfigCommand::RemoteControl { value } => {
+            let mut config = config::AppConfig::load()?;
+            config.remote_control = match value.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => anyhow::bail!("invalid value {value:?}; expected on or off"),
+            };
+            config.save()?;
+            println!("Remote Control transport {value}. Start a new Clodex session to apply it.");
         }
         ConfigCommand::Route { role, model } => {
             let role = config::Role::parse(&role)?;
