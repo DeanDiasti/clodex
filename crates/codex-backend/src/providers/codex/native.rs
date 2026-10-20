@@ -50,6 +50,7 @@ impl CodexNativeBackend {
             monitor.upstream_started(&ctx.req_id);
         }
 
+        let network = crate::network::NetworkMonitor::system().lease();
         let upstream = match self
             .client
             .post_native_responses(&body, &ctx, resolved.use_responses_lite, resolved.stream)
@@ -59,7 +60,7 @@ impl CodexNativeBackend {
             Err(error) => return local_codex_error(error),
         };
 
-        passthrough_response(upstream, ctx, self.client.body_idle_timeout_ms())
+        passthrough_response(upstream, ctx, self.client.body_idle_timeout_ms(), network)
     }
 }
 
@@ -236,6 +237,7 @@ fn passthrough_response(
     upstream: reqwest::Response,
     ctx: RequestContext,
     body_idle_timeout_ms: u64,
+    network: crate::network::NetworkLease,
 ) -> Response {
     let status = upstream.status();
     let headers = passthrough_headers(upstream.headers());
@@ -247,19 +249,38 @@ fn passthrough_response(
     let outcome = NativeResponseOutcome::default();
     let observer = NativeResponseObserver::new(ctx, is_sse, outcome.clone());
     let state = Some(NativeBodyState {
+        network,
+        output_forwarded: false,
         stream: Box::pin(upstream.bytes_stream()),
         observer,
         body_idle_timeout_ms,
     });
     let stream = futures_util::stream::unfold(state, |state| async move {
         let mut state = state?;
-        match tokio::time::timeout(
-            Duration::from_millis(state.body_idle_timeout_ms),
-            state.stream.next(),
-        )
-        .await
-        {
+        let next = state
+            .network
+            .run(tokio::time::timeout(
+                Duration::from_millis(state.body_idle_timeout_ms),
+                state.stream.next(),
+            ))
+            .await;
+        let next = match next {
+            Ok(next) => next,
+            Err(error) => {
+                super::client::log_network_interruption(
+                    &state.observer.ctx.req_id,
+                    true,
+                    false,
+                    state.output_forwarded,
+                );
+                state.observer.outcome.fail(error.to_string());
+                state.observer.finish("network_changed");
+                return Some((Err(error), None));
+            }
+        };
+        match next {
             Ok(Some(Ok(chunk))) => {
+                state.output_forwarded = true;
                 state.observer.observe(&chunk);
                 Some((Ok::<Bytes, io::Error>(chunk), Some(state)))
             }
@@ -316,6 +337,8 @@ type UpstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
 
 struct NativeBodyState {
+    network: crate::network::NetworkLease,
+    output_forwarded: bool,
     stream: UpstreamByteStream,
     observer: NativeResponseObserver,
     body_idle_timeout_ms: u64,
@@ -617,6 +640,57 @@ mod tests {
             traffic: None,
             monitor: None,
         }
+    }
+
+    #[tokio::test]
+    async fn network_change_interrupts_native_body_without_replay() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let network = crate::network::NetworkMonitor::isolated();
+        let lease = network.lease();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n")
+                .await
+                .unwrap();
+            release_rx.await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let upstream = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/responses"))
+            .send()
+            .await
+            .unwrap();
+        let response = passthrough_response(upstream, observer_context(), 60_000, lease);
+        let outcome = response
+            .extensions()
+            .get::<NativeResponseOutcome>()
+            .unwrap()
+            .clone();
+        network.notify_change();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            axum::body::to_bytes(response.into_body(), 1024),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("Network changed"));
+        assert!(outcome.failure().unwrap().contains("Network changed"));
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
     }
 
     #[test]

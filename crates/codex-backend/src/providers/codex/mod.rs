@@ -1540,6 +1540,9 @@ fn is_codex_success_terminal_event(payload: &serde_json::Value) -> bool {
 }
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
+    if err.detail.as_deref() == Some("network_changed") {
+        return true;
+    }
     if err.origin == client::CodexErrorOrigin::WebSocketHandshake {
         if err.detail.as_deref() == Some(websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL) {
             return false;
@@ -1579,6 +1582,8 @@ fn drop_live_continuation_for_retry(continuation: &mut Option<ContinuationReserv
 fn retryable_live_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     [
+        "network_changed",
+        "network changed",
         "overloaded",
         "rate limit",
         "you can retry your request",

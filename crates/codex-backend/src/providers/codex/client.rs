@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
+use crate::network::{ClientPool, NetworkLease, NetworkMonitor};
 use crate::provider::RequestContext;
 use crate::request_identity::ConversationIdentity;
 use crate::retry::{compute_backoff_delay, should_retry_status, sleep};
@@ -374,6 +375,9 @@ struct DecodedHttpSseEvent {
 }
 
 struct HttpEventStreamState {
+    network: NetworkLease,
+    monitor: Arc<NetworkMonitor>,
+    network_retried: bool,
     resp: reqwest::Response,
     response_headers: Vec<(String, String)>,
     started_at: Instant,
@@ -650,6 +654,7 @@ fn websocket_http_client(proxy_environment: &ProxyEnvironment) -> reqwest::Clien
         .apply(
             reqwest::Client::builder()
                 .http1_only()
+                .connect_timeout(Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::none())
                 .use_preconfigured_tls((*tls_config).clone()),
         )
@@ -688,9 +693,9 @@ fn test_websocket_http_client() -> reqwest::Client {
 }
 
 pub struct CodexHttpClient {
-    client: reqwest::Client,
-    native_client: reqwest::Client,
-    websocket_client: reqwest::Client,
+    client: ClientPool,
+    native_client: ClientPool,
+    websocket_client: ClientPool,
     websocket_proxy_config: super::websocket::WebSocketProxyConfig,
     auto_http_fallback_enabled: bool,
     auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
@@ -710,12 +715,25 @@ impl CodexHttpClient {
         let timeout_ms = config::codex_header_timeout_ms();
         let proxy_environment = ProxyEnvironment::from_env();
         Self {
-            client: proxy_environment
-                .apply(reqwest::Client::builder().connect_timeout(Duration::from_secs(15)))
-                .build()
-                .expect("failed to create HTTP client"),
-            native_client: native_http_client(&proxy_environment),
-            websocket_client: websocket_http_client(&proxy_environment),
+            client: {
+                let proxy = proxy_environment.clone();
+                ClientPool::new(NetworkMonitor::system(), move || {
+                    proxy
+                        .apply(reqwest::Client::builder().connect_timeout(Duration::from_secs(15)))
+                        .build()
+                        .expect("failed to create HTTP client")
+                })
+            },
+            native_client: {
+                let proxy = proxy_environment.clone();
+                ClientPool::new(NetworkMonitor::system(), move || native_http_client(&proxy))
+            },
+            websocket_client: {
+                let proxy = proxy_environment.clone();
+                ClientPool::new(NetworkMonitor::system(), move || {
+                    websocket_http_client(&proxy)
+                })
+            },
             websocket_proxy_config: proxy_environment.websocket_proxy_config(),
             auto_http_fallback_enabled: true,
             auth_manager: CodexAuthManager::new(file_store()),
@@ -735,11 +753,19 @@ impl CodexHttpClient {
         let auto_http_fallback_enabled =
             custom_client_auto_http_fallback_enabled(&base_url, &websocket_proxy_config);
         Self {
-            native_client: native_http_client(&proxy_environment),
-            websocket_client: websocket_http_client(&proxy_environment),
+            native_client: {
+                let proxy = proxy_environment.clone();
+                ClientPool::new(NetworkMonitor::system(), move || native_http_client(&proxy))
+            },
+            websocket_client: {
+                let proxy = proxy_environment.clone();
+                ClientPool::new(NetworkMonitor::system(), move || {
+                    websocket_http_client(&proxy)
+                })
+            },
             websocket_proxy_config,
             auto_http_fallback_enabled,
-            client,
+            client: ClientPool::fixed(client),
             auth_manager,
             base_url,
             header_timeout_ms: config::codex_header_timeout_ms(),
@@ -755,11 +781,11 @@ impl CodexHttpClient {
         body_idle_timeout_ms: u64,
     ) -> Self {
         Self {
-            native_client: test_native_http_client(),
-            websocket_client: test_websocket_http_client(),
+            native_client: ClientPool::fixed(test_native_http_client()),
+            websocket_client: ClientPool::fixed(test_websocket_http_client()),
             websocket_proxy_config: super::websocket::WebSocketProxyConfig::direct(),
             auto_http_fallback_enabled: true,
-            client,
+            client: ClientPool::fixed(client),
             auth_manager: CodexAuthManager::new(file_store()),
             base_url,
             header_timeout_ms,
@@ -781,36 +807,40 @@ impl CodexHttpClient {
         input: &super::transcription::PreparedTranscription,
         ctx: &RequestContext,
     ) -> Result<reqwest::Response, CodexError> {
-        let url = format!("{}/transcribe", base_url.trim_end_matches('/'));
-        let mut auth = self
-            .auth_manager
-            .get_auth()
-            .await
-            .map_err(|error| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(error.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
-        let mut refresh_attempted = false;
+        let mut network = NetworkMonitor::system().lease();
+        run_network_request(&mut network, &ctx.req_id, async {
+            let url = format!("{}/transcribe", base_url.trim_end_matches('/'));
+            let mut auth = self
+                .auth_manager
+                .get_auth()
+                .await
+                .map_err(|error| CodexError {
+                    status: 401,
+                    message: "Auth error".to_string(),
+                    detail: Some(error.to_string()),
+                    retry_after: None,
+                    usage_limit: None,
+                    origin: CodexErrorOrigin::Auth,
+                })?;
+            let mut refresh_attempted = false;
 
-        loop {
-            let headers = build_codex_transcription_headers(&auth, ctx)?;
-            let response = self.attempt_transcription(&url, &headers, input).await?;
-            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
-                refresh_attempted = true;
-                drop(response);
-                auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
-                    .await
-                    .map_err(auth_refresh_error)?;
-                continue;
+            loop {
+                let headers = build_codex_transcription_headers(&auth, ctx)?;
+                let response = self.attempt_transcription(&url, &headers, input).await?;
+                if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
+                    refresh_attempted = true;
+                    drop(response);
+                    auth = self
+                        .auth_manager
+                        .force_refresh(&auth.access)
+                        .await
+                        .map_err(auth_refresh_error)?;
+                    continue;
+                }
+                return Ok(response);
             }
-            return Ok(response);
-        }
+        })
+        .await?
     }
 
     async fn attempt_transcription(
@@ -834,7 +864,7 @@ impl CodexHttpClient {
         if let Some(language) = input.language.as_deref() {
             form = form.text("language", language.to_string());
         }
-        let mut request = self.native_client.post(url).multipart(form);
+        let mut request = self.native_client.get().post(url).multipart(form);
         for (key, value) in headers {
             request = request.header(key.as_str(), value.as_bytes());
         }
@@ -871,50 +901,54 @@ impl CodexHttpClient {
         body: &serde_json::Value,
         ctx: &RequestContext,
     ) -> Result<reqwest::Response, CodexError> {
-        let body_json = serde_json::to_vec(body).map_err(|error| CodexError {
-            status: 500,
-            message: "Failed to serialize image request".to_string(),
-            detail: Some(error.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::Http,
-        })?;
-        let url = format!(
-            "{}/{}",
-            base_url.trim_end_matches('/'),
-            operation.upstream_path()
-        );
-        let mut auth = self
-            .auth_manager
-            .get_auth()
-            .await
-            .map_err(|error| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
+        let mut network = NetworkMonitor::system().lease();
+        run_network_request(&mut network, &ctx.req_id, async {
+            let body_json = serde_json::to_vec(body).map_err(|error| CodexError {
+                status: 500,
+                message: "Failed to serialize image request".to_string(),
                 detail: Some(error.to_string()),
                 retry_after: None,
                 usage_limit: None,
-                origin: CodexErrorOrigin::Auth,
+                origin: CodexErrorOrigin::Http,
             })?;
-        let mut refresh_attempted = false;
+            let url = format!(
+                "{}/{}",
+                base_url.trim_end_matches('/'),
+                operation.upstream_path()
+            );
+            let mut auth = self
+                .auth_manager
+                .get_auth()
+                .await
+                .map_err(|error| CodexError {
+                    status: 401,
+                    message: "Auth error".to_string(),
+                    detail: Some(error.to_string()),
+                    retry_after: None,
+                    usage_limit: None,
+                    origin: CodexErrorOrigin::Auth,
+                })?;
+            let mut refresh_attempted = false;
 
-        loop {
-            let headers = build_codex_image_headers(&auth, ctx)?;
-            let response = self
-                .attempt_image_json(&url, &headers, body_json.clone())
-                .await?;
-            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
-                refresh_attempted = true;
-                drop(response);
-                auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
-                    .await
-                    .map_err(auth_refresh_error)?;
-                continue;
+            loop {
+                let headers = build_codex_image_headers(&auth, ctx)?;
+                let response = self
+                    .attempt_image_json(&url, &headers, body_json.clone())
+                    .await?;
+                if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
+                    refresh_attempted = true;
+                    drop(response);
+                    auth = self
+                        .auth_manager
+                        .force_refresh(&auth.access)
+                        .await
+                        .map_err(auth_refresh_error)?;
+                    continue;
+                }
+                return Ok(response);
             }
-            return Ok(response);
-        }
+        })
+        .await?
     }
 
     async fn attempt_image_json(
@@ -923,7 +957,7 @@ impl CodexHttpClient {
         headers: &http::HeaderMap,
         body_json: Vec<u8>,
     ) -> Result<reqwest::Response, CodexError> {
-        let mut request = self.native_client.post(url);
+        let mut request = self.native_client.get().post(url);
         for (key, value) in headers {
             request = request.header(key.as_str(), value.as_bytes());
         }
@@ -960,55 +994,59 @@ impl CodexHttpClient {
         use_responses_lite: bool,
         stream: bool,
     ) -> Result<reqwest::Response, CodexError> {
-        let body_json = serde_json::to_string(body).map_err(|err| CodexError {
-            status: 500,
-            message: "Failed to serialize native Responses request".to_string(),
-            detail: Some(err.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::Http,
-        })?;
-        let mut auth = self
-            .auth_manager
-            .get_auth()
-            .await
-            .map_err(|err| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
+        let mut network = NetworkMonitor::system().lease();
+        run_network_request(&mut network, &ctx.req_id, async {
+            let body_json = serde_json::to_string(body).map_err(|err| CodexError {
+                status: 500,
+                message: "Failed to serialize native Responses request".to_string(),
                 detail: Some(err.to_string()),
                 retry_after: None,
                 usage_limit: None,
-                origin: CodexErrorOrigin::Auth,
+                origin: CodexErrorOrigin::Http,
             })?;
-        let mut refresh_attempted = false;
+            let mut auth = self
+                .auth_manager
+                .get_auth()
+                .await
+                .map_err(|err| CodexError {
+                    status: 401,
+                    message: "Auth error".to_string(),
+                    detail: Some(err.to_string()),
+                    retry_after: None,
+                    usage_limit: None,
+                    origin: CodexErrorOrigin::Auth,
+                })?;
+            let mut refresh_attempted = false;
 
-        loop {
-            let started_at = Instant::now();
-            let headers = build_native_codex_headers(&auth, ctx, use_responses_lite, stream)?;
-            if let Some(traffic) = ctx.traffic.as_deref() {
-                write_codex_http_request_capture(traffic, &self.base_url, &headers, &body_json);
-            }
+            loop {
+                let started_at = Instant::now();
+                let headers = build_native_codex_headers(&auth, ctx, use_responses_lite, stream)?;
+                if let Some(traffic) = ctx.traffic.as_deref() {
+                    write_codex_http_request_capture(traffic, &self.base_url, &headers, &body_json);
+                }
 
-            let response = self
-                .attempt_native_responses(&headers, body_json.clone())
-                .await?;
-            let status = response.status().as_u16();
-            if status == 401 && !refresh_attempted {
-                refresh_attempted = true;
-                drop(response);
-                auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
-                    .await
-                    .map_err(auth_refresh_error)?;
-                continue;
-            }
+                let response = self
+                    .attempt_native_responses(&headers, body_json.clone())
+                    .await?;
+                let status = response.status().as_u16();
+                if status == 401 && !refresh_attempted {
+                    refresh_attempted = true;
+                    drop(response);
+                    auth = self
+                        .auth_manager
+                        .force_refresh(&auth.access)
+                        .await
+                        .map_err(auth_refresh_error)?;
+                    continue;
+                }
 
-            if let Some(traffic) = ctx.traffic.as_deref() {
-                write_live_upstream_response_headers(traffic, &response, started_at.elapsed());
+                if let Some(traffic) = ctx.traffic.as_deref() {
+                    write_live_upstream_response_headers(traffic, &response, started_at.elapsed());
+                }
+                return Ok(response);
             }
-            return Ok(response);
-        }
+        })
+        .await?
     }
 
     async fn attempt_native_responses(
@@ -1016,7 +1054,7 @@ impl CodexHttpClient {
         headers: &http::HeaderMap,
         body_json: String,
     ) -> Result<reqwest::Response, CodexError> {
-        let mut request = self.native_client.post(&self.base_url);
+        let mut request = self.native_client.get().post(&self.base_url);
         for (key, value) in headers {
             request = request.header(key.as_str(), value.as_bytes());
         }
@@ -1145,6 +1183,48 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
+        self.stream_codex_http_events_with_monitor(body, ctx, NetworkMonitor::system())
+            .await
+    }
+
+    async fn stream_codex_http_events_with_monitor(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        monitor: Arc<NetworkMonitor>,
+    ) -> Result<CodexHttpEventReceiver, CodexError> {
+        for retried in [false, true] {
+            let mut network = monitor.lease();
+            let result = network
+                .run(self.stream_codex_http_events_on_network(
+                    body,
+                    ctx,
+                    network.clone(),
+                    monitor.clone(),
+                    retried,
+                ))
+                .await;
+            match result {
+                Ok(result) => return result,
+                Err(error) => {
+                    log_network_interruption(&ctx.req_id, false, !retried, false);
+                    if retried {
+                        return Err(network_error(error));
+                    }
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    async fn stream_codex_http_events_on_network(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        network: NetworkLease,
+        monitor: Arc<NetworkMonitor>,
+        network_retried: bool,
+    ) -> Result<CodexHttpEventReceiver, CodexError> {
         let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
@@ -1195,6 +1275,9 @@ impl CodexHttpClient {
 
         Ok(self.spawn_http_event_stream(
             HttpEventStreamState {
+                network,
+                monitor,
+                network_retried,
                 resp,
                 response_headers,
                 started_at,
@@ -1315,6 +1398,9 @@ impl CodexHttpClient {
         ctx: RequestContext,
     ) -> CodexHttpEventReceiver {
         let HttpEventStreamState {
+            mut network,
+            monitor,
+            mut network_retried,
             mut resp,
             mut response_headers,
             mut started_at,
@@ -1333,6 +1419,21 @@ impl CodexHttpClient {
         tokio::spawn(async move {
             let log = create_logger("codex");
             let mut semantic_output_forwarded = false;
+            let mut restart = false;
+            loop {
+                let result = network.run(async {
+                if restart {
+                    match client.start_http_event_attempt(
+                        &mut auth, &body_json, &ctx, use_responses_lite, &mut auth_refresh_attempted,
+                    ).await {
+                        Ok((next_resp, next_headers, next_started)) => {
+                            resp = next_resp;
+                            response_headers = next_headers;
+                            started_at = next_started;
+                        }
+                        Err(error) => { let _ = tx.send(Err(error)).await; return; }
+                    }
+                }
 
             if tx
                 .send(Ok(serde_json::json!({
@@ -1625,12 +1726,53 @@ impl CodexHttpClient {
                     }
                 }
             }
+            }).await;
+                match result {
+                    Ok(()) => break,
+                    Err(error) => {
+                        let retry = !network_retried && !semantic_output_forwarded;
+                        log_network_interruption(&req_id, true, retry, semantic_output_forwarded);
+                        if !retry {
+                            let _ = tx.send(Err(network_error(error))).await;
+                            break;
+                        }
+                        network_retried = true;
+                        network = monitor.lease();
+                        restart = true;
+                    }
+                }
+            }
         });
 
         rx
     }
 
     async fn post_codex_with_transport(
+        &self,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+        transport: crate::config::CodexTransport,
+    ) -> Result<OwnerAwareCodexResponse, CodexError> {
+        for retried in [false, true] {
+            let result = NetworkMonitor::system()
+                .lease()
+                .run(self.post_codex_with_transport_on_network(body, ctx, continuation, transport))
+                .await;
+            match result {
+                Ok(result) => return result,
+                Err(error) => {
+                    log_network_interruption(&ctx.req_id, false, !retried, false);
+                    if retried {
+                        return Err(network_error(error));
+                    }
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    async fn post_codex_with_transport_on_network(
         &self,
         body: &ResponsesRequest,
         ctx: &RequestContext,
@@ -1688,7 +1830,7 @@ impl CodexHttpClient {
                     );
 
                     super::websocket::codex_websocket_request(
-                        &self.websocket_client,
+                        &self.websocket_client.get(),
                         &self.websocket_proxy_config,
                         &self.base_url,
                         &ws_headers,
@@ -1714,7 +1856,7 @@ impl CodexHttpClient {
 
                     // Try WebSocket first
                     let ws_result = super::websocket::codex_websocket_request(
-                        &self.websocket_client,
+                        &self.websocket_client.get(),
                         &self.websocket_proxy_config,
                         &self.base_url,
                         &ws_headers,
@@ -2100,8 +2242,9 @@ impl CodexHttpClient {
                     .as_ref()
                     .map(super::continuation::ContinuationReservation::candidate),
             );
+            let websocket_client = self.websocket_client.get();
             let start = super::websocket::codex_websocket_event_stream(
-                &self.websocket_client,
+                &websocket_client,
                 &self.websocket_proxy_config,
                 &self.base_url,
                 &ws_headers,
@@ -2368,7 +2511,7 @@ impl CodexHttpClient {
         }
 
         // Build headers
-        let mut req_builder = self.client.post(url);
+        let mut req_builder = self.client.get().post(url);
         for (key, value) in headers.iter() {
             req_builder = req_builder.header(key.as_str(), value.as_bytes());
         }
@@ -2509,7 +2652,7 @@ impl CodexHttpClient {
             write_codex_http_request_capture(traffic, &url, &headers, body_json);
         }
 
-        let mut request = self.client.post(&url);
+        let mut request = self.client.get().post(&url);
         for (key, value) in headers.iter() {
             request = request.header(key.as_str(), value.as_bytes());
         }
@@ -2967,6 +3110,9 @@ fn log_buffered_retry_exhausted(
 }
 
 fn is_retryable_transport_error(err: &CodexError) -> bool {
+    if err.detail.as_deref() == Some("network_changed") {
+        return true;
+    }
     // Running out of patience for the response headers is not a transport
     // failure. The request reached Codex, which is holding the head while the
     // model reasons, so re-sending it starts that reasoning again from scratch
@@ -3210,6 +3356,40 @@ fn should_reset_websocket_pool(
         return false;
     };
     reason != "disabled"
+}
+
+pub(super) async fn run_network_request<F: std::future::Future>(
+    network: &mut NetworkLease,
+    req_id: &str,
+    future: F,
+) -> Result<F::Output, CodexError> {
+    network.run(future).await.map_err(|error| {
+        log_network_interruption(req_id, false, false, false);
+        network_error(error)
+    })
+}
+
+pub(super) fn log_network_interruption(
+    req_id: &str,
+    stream: bool,
+    retried: bool,
+    output_forwarded: bool,
+) {
+    create_logger("codex").warn(
+        if stream { "network_stream_interrupted" } else { "network_request_interrupted" },
+        Some(serde_json::json!({"reqId": req_id, "retried": retried, "outputForwarded": output_forwarded}).as_object().unwrap().clone()),
+    );
+}
+
+pub(super) fn network_error(error: std::io::Error) -> CodexError {
+    CodexError {
+        status: 0,
+        message: error.to_string(),
+        detail: Some("network_changed".into()),
+        retry_after: None,
+        usage_limit: None,
+        origin: CodexErrorOrigin::Http,
+    }
 }
 
 #[cfg(test)]
@@ -3767,6 +3947,176 @@ mod tests {
             terminal.get("type").and_then(|value| value.as_str()),
             Some("response.completed")
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn network_change_before_headers_retries_once() {
+        assert_network_change_before_output_retries(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn network_change_before_stream_output_retries_once() {
+        assert_network_change_before_output_retries(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn second_network_change_does_not_replay_http_stream() {
+        assert_network_change_before_output_retries(false, true).await;
+    }
+
+    async fn assert_network_change_before_output_retries(
+        send_headers: bool,
+        interrupt_retry: bool,
+    ) {
+        let network = NetworkMonitor::isolated();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_network = network.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(first.read(&mut request).await.unwrap() > 0);
+            if send_headers {
+                first.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n").await.unwrap();
+            }
+            ready_rx.await.unwrap();
+            server_network.notify_change();
+            let (mut second, _) = listener.accept().await.unwrap();
+            assert!(second.read(&mut request).await.unwrap() > 0);
+            if interrupt_retry {
+                server_network.notify_change();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+                return;
+            }
+            let body =
+                b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_retry\"}}\n\n";
+            second.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            second.write_all(body).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let client = Arc::new(http_test_client(format!("http://{addr}/responses"), 60_000));
+        client.auth_manager().set_test_auth(http_test_auth());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let body = buffered_test_request();
+            let ctx = http_test_context();
+            let setup = client.stream_codex_http_events_with_monitor(&body, &ctx, network);
+            let mut events = if send_headers {
+                let mut events = setup.await.unwrap();
+                assert_eq!(events.recv().await.unwrap().unwrap()["type"], "keepalive");
+                ready_tx.send(()).unwrap();
+                events
+            } else {
+                ready_tx.send(()).unwrap();
+                match setup.await {
+                    Ok(events) => events,
+                    Err(error) if interrupt_retry => {
+                        assert_eq!(error.detail.as_deref(), Some("network_changed"));
+                        server.await.unwrap();
+                        return;
+                    }
+                    Err(error) => panic!("unexpected setup error: {error:?}"),
+                }
+            };
+            assert!(!interrupt_retry);
+            let mut completed = 0;
+            while let Some(event) = events.recv().await {
+                if event.unwrap()["type"] == "response.completed" {
+                    completed += 1;
+                }
+            }
+            assert_eq!(completed, 1);
+            server.await.unwrap();
+        })
+        .await
+        .expect("network retry must complete promptly");
+    }
+
+    #[test]
+    fn network_interruption_is_retryable_before_output() {
+        assert!(is_retryable_transport_error(&network_error(
+            crate::network::interrupted()
+        )));
+        assert!(super::super::retryable_live_start_codex_error(
+            &network_error(crate::network::interrupted())
+        ));
+    }
+
+    #[tokio::test]
+    async fn network_change_interrupts_codex_http_after_output_without_replaying() {
+        let network = NetworkMonitor::isolated();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16 * 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            write_http_chunk(
+                &mut stream,
+                b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hello\"}\n\n",
+            )
+            .await;
+            release_rx.await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let client = Arc::new(http_test_client(format!("http://{addr}/responses"), 60_000));
+        client.auth_manager().set_test_auth(http_test_auth());
+        let mut events = client
+            .stream_codex_http_events_on_network(
+                &buffered_test_request(),
+                &http_test_context(),
+                network.lease(),
+                network.clone(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let synthetic = events.recv().await.unwrap().unwrap();
+        assert_eq!(
+            synthetic.get("type").and_then(|value| value.as_str()),
+            Some("keepalive")
+        );
+        let first_upstream = tokio::time::timeout(Duration::from_millis(200), events.recv())
+            .await
+            .expect("first upstream event must arrive before the response completes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first_upstream.get("type").and_then(|value| value.as_str()),
+            Some("response.output_text.delta")
+        );
+
+        network.notify_change();
+        let error = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.detail.as_deref(), Some("network_changed"));
+        assert!(events.recv().await.is_none());
+        release_tx.send(()).unwrap();
         server.await.unwrap();
     }
 

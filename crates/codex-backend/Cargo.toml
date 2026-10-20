@@ -48,6 +48,10 @@ flate2 = "1.0"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 tiktoken-rs = { version = "0.12", default-features = false }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+system-configuration = "0.7"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3.14"

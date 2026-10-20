@@ -4,6 +4,7 @@ pub mod config;
 pub mod embedded;
 pub mod logging;
 pub mod monitor;
+pub mod network;
 pub mod openai_compat;
 pub mod paths;
 pub mod project;
