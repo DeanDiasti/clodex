@@ -610,6 +610,18 @@ clodex auth sync
 clodex context
 ```
 
+- **Switching Wi-Fi, hotspot, or VPN on macOS:** Clodex waits for the network
+  to settle, then reacts to what changed. DNS and proxy changes only retire
+  idle connections, so new requests use fresh ones. A change of primary
+  interface, router, or IPv4 address also interrupts in-flight Codex and
+  Anthropic requests. A Codex request that has not yet sent output is retried
+  once on the new network; already delivered output is never silently
+  replayed. If a stream was interrupted after output began, retry that turn or
+  agent. New connection setup is bounded to 15 seconds without imposing a
+  total time limit on model responses. Logs include `network_changed` (with
+  `kind` `path` or `pool`), `network_request_interrupted`, and
+  `network_stream_interrupted`; addresses and DNS settings are not logged.
+  Automatic network-change notifications are currently macOS-specific.
 - **“Agent terminated early” with “error decoding response body”:** this is an
   interrupted upstream Codex response. The proxy retries failures that are
   still safe to replay, but it cannot safely replay a partially emitted tool

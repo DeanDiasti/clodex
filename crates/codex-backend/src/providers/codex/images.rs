@@ -197,6 +197,7 @@ impl CodexImagesBackend {
             monitor.model_resolved(&ctx.req_id, &prepared.model);
             monitor.upstream_started(&ctx.req_id);
         }
+        let mut network = crate::network::NetworkMonitor::system().lease();
         let upstream = match self
             .client
             .post_image_json(&self.base_url, operation, &prepared.body, &ctx)
@@ -232,13 +233,17 @@ impl CodexImagesBackend {
             copy_safe_image_headers(&headers, response.headers_mut());
             return response;
         }
-        let body =
-            match collect_image_response_body(upstream, self.client.body_idle_timeout_ms(), &ctx)
-                .await
-            {
-                Ok(body) => body,
-                Err(error) => return image_error_response(error),
-            };
+        let body = match super::client::run_network_request(
+            &mut network,
+            &ctx.req_id,
+            collect_image_response_body(upstream, self.client.body_idle_timeout_ms(), &ctx),
+        )
+        .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(error)) => return image_error_response(error),
+            Err(error) => return image_transport_error_response(error),
+        };
         let usage = match validate_success_response(&body) {
             Ok(usage) => usage,
             Err(error) => return image_error_response(error),

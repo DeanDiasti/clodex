@@ -16,6 +16,7 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 use crate::mapping::ANTHROPIC_PREFIX;
+use codex_backend::network::{ClientPool, NetworkMonitor};
 
 const BRIDGE_HEADER: &str = "x-clodex-fast-bridge";
 const BRIDGE_HEADER_VALUE: &str = "1";
@@ -196,7 +197,8 @@ struct RouteState {
 struct BridgeState {
     upstream_port: u16,
     anthropic_base: String,
-    client: reqwest::Client,
+    client: std::sync::Arc<ClientPool>,
+    network: std::sync::Arc<NetworkMonitor>,
     hierarchical: bool,
     ceiling: u64,
 }
@@ -225,6 +227,22 @@ impl FastBridge {
         hierarchical: bool,
         ceiling: u64,
     ) -> Result<Self> {
+        Self::start_with_network(
+            upstream_port,
+            anthropic_base,
+            hierarchical,
+            ceiling,
+            NetworkMonitor::system(),
+        )
+    }
+
+    fn start_with_network(
+        upstream_port: u16,
+        anthropic_base: String,
+        hierarchical: bool,
+        ceiling: u64,
+        network: std::sync::Arc<NetworkMonitor>,
+    ) -> Result<Self> {
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).context("could not bind the Clodex fast bridge")?;
         listener.set_nonblocking(true)?;
@@ -243,13 +261,14 @@ impl FastBridge {
                 let state = std::sync::Arc::new(BridgeState {
                     upstream_port,
                     anthropic_base,
-                    client: reqwest::Client::builder()
-                        // A failed multiplexed TLS connection can abort Claude
-                        // calls across sessions. Match the native CLI's HTTP/1.1
-                        // transport so concurrent calls use separate connections.
-                        .http1_only()
-                        .build()
-                        .context("could not create the Clodex fast bridge client")?,
+                    client: std::sync::Arc::new(ClientPool::new(network.clone(), || {
+                        reqwest::Client::builder()
+                            .http1_only()
+                            .connect_timeout(std::time::Duration::from_secs(15))
+                            .build()
+                            .expect("could not create the Clodex fast bridge client")
+                    })),
+                    network,
                     hierarchical,
                     ceiling,
                 });
@@ -497,6 +516,7 @@ async fn count_tokens(
     }
     let response = state
         .client
+        .get()
         .post(format!(
             "http://127.0.0.1:{}/v1/messages/count_tokens",
             state.upstream_port
@@ -693,6 +713,7 @@ async fn round_summary(
     for attempt in 0..3 {
         let response = state
             .client
+            .get()
             .post(format!(
                 "http://127.0.0.1:{}/v1/messages",
                 state.upstream_port
@@ -801,6 +822,8 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
     } else {
         format!("http://127.0.0.1:{}{query}", state.upstream_port)
     };
+    // Only external Anthropic connections depend on the active network.
+    let mut lease = to_anthropic.then(|| state.network.lease());
     let mut native_log =
         to_anthropic.then(|| AnthropicRequestLog::new(parts.uri.path(), &bytes, &parts.headers));
 
@@ -810,7 +833,7 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
     // without it these surface to the user as hard API errors.
     let mut attempt = 0;
     let upstream = loop {
-        let mut request = state.client.request(parts.method.clone(), &url);
+        let mut request = state.client.get().request(parts.method.clone(), &url);
         for (name, value) in &parts.headers {
             if !should_forward_request_header(name) {
                 continue;
@@ -821,7 +844,15 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
                 request = request.header(name, value);
             }
         }
-        let sent = request.body(bytes.clone()).send().await;
+        let send = request.body(bytes.clone()).send();
+        let sent = if let Some(lease) = &mut lease {
+            lease.run(send).await.inspect_err(|_| {
+                codex_backend::logging::create_logger("network")
+                    .info("network_request_interrupted", None);
+            })?
+        } else {
+            send.await
+        };
 
         // The replay rule covers the local proxy's dropped Codex connection.
         // Claude Code retries Anthropic errors itself.
@@ -887,6 +918,29 @@ async fn proxy_inner(state: &BridgeState, request: Request) -> Result<Response> 
         if should_forward_response_header(name) {
             response.headers_mut().append(name, value.clone());
         }
+    }
+    if let Some(lease) = lease {
+        let (parts, body) = response.into_parts();
+        let stream = futures_util::stream::unfold(
+            (Box::pin(body.into_data_stream()), lease, false),
+            |(mut stream, mut lease, terminal)| async move {
+                if terminal {
+                    return None;
+                }
+                match lease.run(stream.next()).await {
+                    Ok(Some(chunk)) => {
+                        Some((chunk.map_err(std::io::Error::other), (stream, lease, false)))
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        codex_backend::logging::create_logger("network")
+                            .info("network_stream_interrupted", None);
+                        Some((Err(error), (stream, lease, true)))
+                    }
+                }
+            },
+        );
+        response = Response::from_parts(parts, Body::from_stream(stream));
     }
     Ok(response)
 }
@@ -1229,6 +1283,236 @@ mod tests {
 
     use super::*;
 
+    async fn read_test_request(stream: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&chunk[..n]);
+            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                let length: usize = String::from_utf8_lossy(&bytes[..end])
+                    .lines()
+                    .find_map(|line| {
+                        line.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::trim)
+                            .map(str::to_owned)
+                    })
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                if bytes.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn network_change_interrupts_pending_headers_without_replaying() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let network = NetworkMonitor::isolated();
+        let bridge = FastBridge::start_with_network(
+            0,
+            format!("http://{}", listener.local_addr().unwrap()),
+            false,
+            0,
+            network.clone(),
+        )
+        .unwrap();
+        let url = format!("http://127.0.0.1:{}/v1/messages", bridge.port());
+        let request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(url)
+                .json(&serde_json::json!({
+                    "model":"anthropic/claude-test", "messages":[]
+                }))
+                .send()
+                .await
+                .unwrap()
+        });
+        let (mut upstream, _) = listener.accept().await.unwrap();
+        read_test_request(&mut upstream).await;
+        network.notify_change();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(response.text().await.unwrap().contains("Network changed"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn network_change_interrupts_partial_stream_without_success_or_replay() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let network = NetworkMonitor::isolated();
+        let bridge = FastBridge::start_with_network(
+            0,
+            format!("http://{}", listener.local_addr().unwrap()),
+            false,
+            0,
+            network.clone(),
+        )
+        .unwrap();
+        let url = format!("http://127.0.0.1:{}/v1/messages", bridge.port());
+        let request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(url)
+                .json(&serde_json::json!({
+                    "model":"anthropic/claude-test", "messages":[]
+                }))
+                .send()
+                .await
+                .unwrap()
+        });
+        let (mut upstream, _) = listener.accept().await.unwrap();
+        read_test_request(&mut upstream).await;
+        upstream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Type: text/event-stream\r\n\r\ndata: first\n\n").await.unwrap();
+        let mut response = request.await.unwrap();
+        assert_eq!(response.chunk().await.unwrap().unwrap(), "data: first\n\n");
+        network.notify_change();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), response.chunk())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn network_change_does_not_interrupt_loopback_stream() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let network = NetworkMonitor::isolated();
+        let bridge = FastBridge::start_with_network(
+            listener.local_addr().unwrap().port(),
+            "http://127.0.0.1:0".to_string(),
+            false,
+            0,
+            network.clone(),
+        )
+        .unwrap();
+        let url = format!("http://127.0.0.1:{}/v1/messages", bridge.port());
+        let request = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(url)
+                .json(&serde_json::json!({
+                    "model":"gpt-5.6-sol", "messages":[], "stream":true
+                }))
+                .send()
+                .await
+                .unwrap()
+        });
+        let (mut upstream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        read_test_request(&mut upstream).await;
+        // Loopback must survive changes both before headers and mid-stream.
+        network.notify_change();
+        let first = "data: first\n\n";
+        let last = "data: last\n\n";
+        upstream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/event-stream\r\n\r\n{first}",
+                    first.len() + last.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.chunk().await.unwrap().unwrap().to_vec();
+        assert_eq!(body, first.as_bytes());
+        network.notify_change();
+        upstream.write_all(last.as_bytes()).await.unwrap();
+        body.extend_from_slice(
+            &tokio::time::timeout(std::time::Duration::from_secs(2), response.bytes())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(body, format!("{first}{last}").as_bytes());
+    }
+
+    #[tokio::test]
+    async fn network_change_retires_idle_http_connections_and_next_request_succeeds() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let network = NetworkMonitor::isolated();
+        let bridge = FastBridge::start_with_network(
+            0,
+            format!("http://{}", listener.local_addr().unwrap()),
+            false,
+            0,
+            network.clone(),
+        )
+        .unwrap();
+        let url = format!("http://127.0.0.1:{}/v1/messages", bridge.port());
+        let client = reqwest::Client::new();
+        let send = |client: reqwest::Client, url: String| {
+            tokio::spawn(async move {
+                client
+                    .post(url)
+                    .json(&serde_json::json!({"model":"anthropic/claude-test", "messages":[]}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap()
+            })
+        };
+        let first = send(client.clone(), url.clone());
+        let (mut old, _) = listener.accept().await.unwrap();
+        read_test_request(&mut old).await;
+        old.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+            .await
+            .unwrap();
+        assert_eq!(first.await.unwrap(), "OK");
+        // Keep the old socket open: only a real pool replacement can recover.
+        network.notify_change();
+        let second = send(client, url);
+        let (mut fresh, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        read_test_request(&mut fresh).await;
+        fresh
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nNEW")
+            .await
+            .unwrap();
+        assert_eq!(second.await.unwrap(), "NEW");
+    }
+
     #[test]
     fn arming_is_consumed_once_and_expires() {
         let session = "arm-once-session";
@@ -1289,7 +1573,8 @@ mod tests {
         let state = BridgeState {
             upstream_port: 1,
             anthropic_base: String::new(),
-            client: reqwest::Client::new(),
+            client: std::sync::Arc::new(ClientPool::fixed(reqwest::Client::new())),
+            network: NetworkMonitor::isolated(),
             hierarchical: true,
             ceiling: 828_400,
         };
@@ -1322,7 +1607,8 @@ mod tests {
         let state = BridgeState {
             upstream_port: 1,
             anthropic_base: String::new(),
-            client: reqwest::Client::new(),
+            client: std::sync::Arc::new(ClientPool::fixed(reqwest::Client::new())),
+            network: NetworkMonitor::isolated(),
             hierarchical: false,
             ceiling: 828_400,
         };
@@ -1354,7 +1640,8 @@ mod tests {
         let state = BridgeState {
             upstream_port: 1,
             anthropic_base: String::new(),
-            client: reqwest::Client::new(),
+            client: std::sync::Arc::new(ClientPool::fixed(reqwest::Client::new())),
+            network: NetworkMonitor::isolated(),
             hierarchical: true,
             ceiling: 828_400,
         };

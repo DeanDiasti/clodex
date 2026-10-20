@@ -1,3 +1,4 @@
+use crate::network::{NetworkLease, NetworkMonitor};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -305,6 +306,7 @@ impl std::fmt::Display for CodexWebSocketError {
 // ---------------------------------------------------------------------------
 
 struct PoolEntry {
+    network: NetworkLease,
     ws: Arc<AsyncMutex<CodexWebSocketStream>>,
     socket_id: u64,
     created_at: u64,
@@ -312,8 +314,14 @@ struct PoolEntry {
 }
 
 impl PoolEntry {
+    #[cfg(test)]
     fn new(ws: CodexWebSocketStream) -> Self {
+        Self::on_network(ws, NetworkMonitor::system().lease())
+    }
+
+    fn on_network(ws: CodexWebSocketStream, network: NetworkLease) -> Self {
         Self {
+            network,
             ws: Arc::new(AsyncMutex::new(ws)),
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
             created_at: now_ms(),
@@ -444,7 +452,11 @@ fn reservation_pool_owner(
 fn pool_take_for_turn(reservation: &ContinuationReservation) -> Option<Arc<PoolEntry>> {
     let owner = reservation.owner()?;
     super::continuation::if_current_turn_for_owner(reservation, || {
-        WS_POOL.lock().ok()?.remove(owner)
+        WS_POOL
+            .lock()
+            .ok()?
+            .remove(owner)
+            .filter(|entry| entry.network.is_current())
     })
     .flatten()
 }
@@ -513,6 +525,9 @@ pub(super) fn invalidate_codex_websocket_pool_socket(
 }
 
 fn pool_insert_if_vacant_or_same(owner: ConversationIdentity, entry: Arc<PoolEntry>) -> bool {
+    if !entry.network.is_current() {
+        return false;
+    }
     entry.touch();
     let mut guard = WS_POOL.lock().unwrap();
     if let Some(existing) = guard.get(&owner) {
@@ -548,6 +563,7 @@ fn pool_insert(owner: ConversationIdentity, entry: Arc<PoolEntry>) {
 fn cleanup_pool_before_connect() {
     let removed = {
         let mut guard = WS_POOL.lock().unwrap();
+        guard.retain(|_, entry| entry.network.is_current());
         if guard.len() <= POOL_CONNECT_CLEANUP_THRESHOLD {
             return;
         }
@@ -748,6 +764,7 @@ pub(super) async fn codex_websocket_request(
     idle_timeout_ms: u64,
     reservation: Option<&ContinuationReservation>,
 ) -> Result<OwnerAwareCodexResponse, CodexError> {
+    let network = NetworkMonitor::system().lease();
     let continuation = reservation.map(ContinuationReservation::candidate);
     let pool_owner = reservation_pool_owner(reservation);
     let ws_url = to_websocket_url(url).map_err(|e| CodexError {
@@ -792,7 +809,7 @@ pub(super) async fn codex_websocket_request(
     let mut entry = if let Some(entry) = pooled {
         entry
     } else {
-        Arc::new(PoolEntry::new(
+        Arc::new(PoolEntry::on_network(
             connect_with_timeout(
                 websocket_client,
                 proxy_config,
@@ -801,6 +818,7 @@ pub(super) async fn codex_websocket_request(
                 connect_timeout_ms,
             )
             .await?,
+            network.clone(),
         ))
     };
     let mut guard = entry.ws.clone().lock_owned().await;
@@ -817,7 +835,7 @@ pub(super) async fn codex_websocket_request(
         if requires_origin {
             return Err(continuation_socket_missing_error());
         }
-        entry = Arc::new(PoolEntry::new(
+        entry = Arc::new(PoolEntry::on_network(
             connect_with_timeout(
                 websocket_client,
                 proxy_config,
@@ -826,14 +844,19 @@ pub(super) async fn codex_websocket_request(
                 connect_timeout_ms,
             )
             .await?,
+            network.clone(),
         ));
         guard = entry.ws.clone().lock_owned().await;
         used_pooled = false;
     }
 
-    guard
-        .send(Message::Text(body_json))
+    entry
+        .network
+        .clone()
+        .run(guard.send(Message::Text(body_json)))
         .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()))
         .map_err(|error| {
             if let Some(owner) = pool_owner {
                 pool_remove_entry(owner, &entry);
@@ -976,6 +999,7 @@ pub(super) async fn prepare_codex_websocket(
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
 ) -> Result<ReadyWebSocket, CodexError> {
+    let network = NetworkMonitor::system().lease();
     let pool_owner = reservation_pool_owner(reservation);
     let continuation = reservation.map(ContinuationReservation::candidate);
     let ws_url = to_websocket_url(url).map_err(|error| CodexError {
@@ -1002,7 +1026,7 @@ pub(super) async fn prepare_codex_websocket(
             connect_timeout_ms,
         )
         .await?;
-        Arc::new(PoolEntry::new(stream))
+        Arc::new(PoolEntry::on_network(stream, network))
     };
     let mut guard = entry.ws.clone().lock_owned().await;
     if used_pooled
@@ -1073,7 +1097,14 @@ pub(super) fn start_codex_websocket_events(
             idle_timeout_ms,
         } = ready;
         let pool_owner = reservation_pool_owner(reservation.as_ref());
-        if let Err(error) = guard.send(Message::Text(body_json)).await {
+        if let Err(error) = entry
+            .network
+            .clone()
+            .run(guard.send(Message::Text(body_json)))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()))
+        {
             drop(guard);
             if let Some(owner) = pool_owner {
                 pool_remove_entry(owner, &entry);
@@ -1091,8 +1122,14 @@ pub(super) fn start_codex_websocket_events(
                 .await;
             return;
         }
-        let (reusable, terminal_item) =
-            stream_ws_events(&mut guard, idle_timeout_ms, traffic, &tx).await;
+        let (reusable, terminal_item) = stream_ws_events(
+            &mut guard,
+            idle_timeout_ms,
+            traffic,
+            &tx,
+            entry.network.clone(),
+        )
+        .await;
         drop(guard);
 
         let origin_reinserted = if reusable {
@@ -1950,14 +1987,24 @@ async fn connect_with_timeout(
     headers: &HeaderMap,
     connect_timeout_ms: u64,
 ) -> Result<CodexWebSocketStream, CodexError> {
-    connect_with_policy(
-        &WS_CONNECT_GATE,
-        Duration::from_millis(connect_timeout_ms),
-        WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN,
-        || async { cleanup_pool_before_connect() },
-        || connect_once(websocket_client, proxy_config, url, headers),
-    )
-    .await
+    NetworkMonitor::system()
+        .lease()
+        .run(connect_with_policy(
+            &WS_CONNECT_GATE,
+            Duration::from_millis(connect_timeout_ms),
+            WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN,
+            || async { cleanup_pool_before_connect() },
+            || connect_once(websocket_client, proxy_config, url, headers),
+        ))
+        .await
+        .map_err(|error| CodexError {
+            status: 0,
+            message: error.to_string(),
+            detail: Some("network_changed".into()),
+            retry_after: None,
+            usage_limit: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        })?
 }
 
 // ---------------------------------------------------------------------------
@@ -1974,6 +2021,7 @@ async fn read_ws_frame_with_keepalive<S>(
     ws: &mut WebSocketStream<S>,
     read_timeout: Duration,
     keepalive_interval: Duration,
+    network: &mut NetworkLease,
 ) -> WebSocketRead
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1987,6 +2035,7 @@ where
     loop {
         tokio::select! {
             biased;
+            _ = network.changed() => return WebSocketRead::KeepaliveError(crate::network::interrupted().to_string()),
             frame = ws.next() => return WebSocketRead::Frame(frame),
             _ = &mut timeout => return WebSocketRead::Timeout,
             _ = keepalive.tick() => {
@@ -1995,6 +2044,7 @@ where
                 tokio::pin!(send_timeout);
                 tokio::select! {
                     biased;
+                    _ = network.changed() => return WebSocketRead::KeepaliveError(crate::network::interrupted().to_string()),
                     result = send => {
                         if let Err(error) = result {
                             return WebSocketRead::KeepaliveError(error.to_string());
@@ -2050,6 +2100,9 @@ async fn collect_ws_events_with_keepalive_interval<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut network = pool_entry
+        .map(|entry| entry.network.clone())
+        .unwrap_or_else(|| NetworkMonitor::system().lease());
     let mut sse_body: Vec<u8> = Vec::new();
     let mut terminal_event: Option<WsEvent> = None;
     let response_event_budget = Duration::from_millis(idle_timeout_ms);
@@ -2088,35 +2141,38 @@ where
             }
         };
 
-        let frame = match read_ws_frame_with_keepalive(ws, read_timeout, keepalive_interval).await {
-            WebSocketRead::Frame(frame) => frame,
-            WebSocketRead::Timeout => {
-                invalidate_pool_owner(pool_owner, pool_entry);
-                return Err(if response_started {
-                    CodexError {
+        let frame =
+            match read_ws_frame_with_keepalive(ws, read_timeout, keepalive_interval, &mut network)
+                .await
+            {
+                WebSocketRead::Frame(frame) => frame,
+                WebSocketRead::Timeout => {
+                    invalidate_pool_owner(pool_owner, pool_entry);
+                    return Err(if response_started {
+                        CodexError {
+                            status: 0,
+                            message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
+                            detail: None,
+                            retry_after: None,
+                            usage_limit: None,
+                            origin: CodexErrorOrigin::WebSocket,
+                        }
+                    } else {
+                        response_start_timeout_error(idle_timeout_ms)
+                    });
+                }
+                WebSocketRead::KeepaliveError(error) => {
+                    invalidate_pool_owner(pool_owner, pool_entry);
+                    return Err(CodexError {
                         status: 0,
-                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                        detail: None,
+                        message: format!("WebSocket keepalive error: {error}"),
+                        detail: Some(WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
                         retry_after: None,
                         usage_limit: None,
                         origin: CodexErrorOrigin::WebSocket,
-                    }
-                } else {
-                    response_start_timeout_error(idle_timeout_ms)
-                });
-            }
-            WebSocketRead::KeepaliveError(error) => {
-                invalidate_pool_owner(pool_owner, pool_entry);
-                return Err(CodexError {
-                    status: 0,
-                    message: format!("WebSocket keepalive error: {error}"),
-                    detail: Some(WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
-                    retry_after: None,
-                    usage_limit: None,
-                    origin: CodexErrorOrigin::WebSocket,
-                });
-            }
-        };
+                    });
+                }
+            };
 
         match frame {
             Some(Ok(Message::Text(text))) => {
@@ -2220,6 +2276,7 @@ async fn stream_ws_events<S>(
     idle_timeout_ms: u64,
     traffic: Option<Arc<TrafficCapture>>,
     tx: &mpsc::Sender<Result<serde_json::Value, CodexError>>,
+    mut network: NetworkLease,
 ) -> (bool, Option<Result<serde_json::Value, CodexError>>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2267,6 +2324,7 @@ where
                 ws,
                 read_timeout,
                 WEBSOCKET_KEEPALIVE_INTERVAL,
+                &mut network,
             ) => match frame {
                 WebSocketRead::Frame(frame) => frame,
                 WebSocketRead::Timeout => {
@@ -2596,6 +2654,7 @@ mod tests {
 
     fn shared_pool_entry(ws: &Arc<AsyncMutex<CodexWebSocketStream>>) -> Arc<PoolEntry> {
         Arc::new(PoolEntry {
+            network: NetworkMonitor::system().lease(),
             ws: ws.clone(),
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
             created_at: now_ms(),
@@ -3255,6 +3314,70 @@ mod tests {
         assert!(!captured.contains("poolKey"));
         assert!(!captured.contains("session-secret"));
         assert!(!captured.contains("agent-secret"));
+    }
+
+    #[tokio::test]
+    async fn network_change_rejects_old_websocket_pool_entries() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let monitor = NetworkMonitor::isolated();
+        let entry = Arc::new(PoolEntry::on_network(
+            create_dummy_stream_async().await,
+            monitor.lease(),
+        ));
+        let owner = main_owner("network-generation");
+        assert!(pool_insert_if_vacant_or_same(owner.clone(), entry.clone()));
+        monitor.notify_change();
+        let reservation = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &continuation_request(),
+            true,
+        );
+        assert!(
+            take_pool_entry_for_request(Some(&reservation))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!pool_insert_if_vacant_or_same(owner.clone(), entry));
+        let fresh = Arc::new(PoolEntry::on_network(
+            create_dummy_stream_async().await,
+            monitor.lease(),
+        ));
+        assert!(pool_insert_if_vacant_or_same(owner, fresh));
+        assert!(
+            take_pool_entry_for_request(Some(&reservation))
+                .unwrap()
+                .is_some()
+        );
+        clear_codex_websocket_pool_for_tests();
+    }
+
+    #[tokio::test]
+    async fn network_change_interrupts_silent_websocket_read() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let monitor = NetworkMonitor::isolated();
+        let mut lease = monitor.lease();
+        let read = tokio::spawn(async move {
+            read_ws_frame_with_keepalive(
+                &mut client,
+                Duration::from_secs(60),
+                WEBSOCKET_KEEPALIVE_INTERVAL,
+                &mut lease,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        monitor.notify_change();
+        let result = tokio::time::timeout(Duration::from_secs(1), read)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, WebSocketRead::KeepaliveError(message) if message.contains("Network changed"))
+        );
     }
 
     #[tokio::test]
@@ -4246,6 +4369,7 @@ mod tests {
             &mut client,
             Duration::from_secs(60),
             WEBSOCKET_KEEPALIVE_INTERVAL,
+            &mut NetworkMonitor::isolated().lease(),
         )
         .await;
 

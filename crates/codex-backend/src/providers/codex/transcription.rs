@@ -96,6 +96,7 @@ impl CodexTranscriptionBackend {
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
         }
+        let mut network = crate::network::NetworkMonitor::system().lease();
         let upstream = match self
             .client
             .post_transcription(&self.base_url, &input, &ctx)
@@ -124,9 +125,16 @@ impl CodexTranscriptionBackend {
             copy_safe_headers(&headers, response.headers_mut());
             return response;
         }
-        let body = match collect_response_body(upstream, self.client.body_idle_timeout_ms()).await {
-            Ok(body) => body,
-            Err(error) => return transcription_error_response(error),
+        let body = match super::client::run_network_request(
+            &mut network,
+            &ctx.req_id,
+            collect_response_body(upstream, self.client.body_idle_timeout_ms()),
+        )
+        .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(error)) => return transcription_error_response(error),
+            Err(error) => return transcription_transport_error_response(error),
         };
         if let Err(error) = validate_success_response(&body) {
             return transcription_error_response(error);
