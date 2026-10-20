@@ -7,6 +7,28 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-20
+
+### Added
+
+- Native Remote Control while retaining OpenAI models: run `/remote-control`
+  or `/rc` inside a Clodex session, or launch with `clodex --remote-control`.
+  Claude subscription sessions now use an authenticated, session-local HTTPS
+  proxy with a temporary process-scoped certificate. Global certificate trust
+  remains unchanged. Use `clodex config remote-control off` to restore the
+  previous transport. Existing outbound proxy chaining and standalone Remote
+  Control server mode are not supported.
+
+### Fixed
+
+- Recover promptly after macOS Wi-Fi, hotspot, VPN, and network configuration
+  changes, refreshing connections and safely retrying requests only before
+  output has been delivered.
+- Isolate concurrent Claude requests using HTTP/1.1 connections.
+- Keep Codex streams alive while waiting for initial output.
+- Avoid completing tool calls from interrupted streams and improve Claude
+  transport failure logging.
+
 ## [0.1.1] - 2026-10-09
 
 ### Changed
@@ -94,6 +116,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Repeatable source installer for macOS and Linux.
 - Automated tests and GitHub Actions CI on Ubuntu and macOS.
 
-[Unreleased]: https://github.com/DeanDiasti/clodex/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/DeanDiasti/clodex/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/DeanDiasti/clodex/releases/tag/v0.2.0
 [0.1.1]: https://github.com/DeanDiasti/clodex/releases/tag/v0.1.1
 [0.1.0]: https://github.com/DeanDiasti/clodex/releases/tag/v0.1.0
