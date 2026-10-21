@@ -97,6 +97,30 @@ impl CodexProvider {
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
+        // Native-endpoint Claude Code can send only a message delta and inherit
+        // history/tools from an Anthropic message thread. We do not store that
+        // thread, and its message IDs are not Codex response IDs. Reject even
+        // creates rather than silently accepting a thread we cannot continue.
+        // This protocol error makes Claude Code replay the full request and
+        // keep this model stateless for the rest of the session.
+        if body
+            .extra
+            .get("thread")
+            .is_some_and(|thread| !thread.is_null())
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Message thread requests are not supported for Codex models. Resend the full conversation and tools without the thread field.",
+                        "details": {"error_code": "thread_unsupported_request"}
+                    }
+                })),
+            )
+                .into_response();
+        }
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("gpt-6-sol");
@@ -1938,6 +1962,52 @@ mod tests {
             provider: "codex".to_string(),
             traffic: None,
             monitor: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn message_threads_request_stateless_replay_before_contacting_codex() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = CodexProvider {
+            client: authenticated_live_test_client(format!(
+                "http://{}/responses",
+                listener.local_addr().unwrap()
+            )),
+        };
+        for stream in [false, true] {
+            for thread in [
+                serde_json::json!({"type": "create"}),
+                serde_json::json!({
+                    "type": "continue", "previous_message_id": "msg_previous"
+                }),
+            ] {
+                let body = serde_json::from_value(serde_json::json!({
+                    "model": "gpt-6-sol",
+                    "stream": stream,
+                    "thread": thread,
+                    "messages": [{"role": "user", "content": [{
+                        "type": "tool_result", "tool_use_id": "call_previous", "content": "OK"
+                    }]}]
+                }))
+                .unwrap();
+                let response = tokio::select! {
+                    connection = listener.accept() => {
+                        panic!("threaded request reached Codex: {connection:?}");
+                    }
+                    response = provider.handle_messages(body, live_test_context("message-threads")) => response,
+                };
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(response.headers()["content-type"], "application/json");
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(error["type"], "error");
+                assert_eq!(error["error"]["type"], "invalid_request_error");
+                // Claude Code recognizes this code and retries with full history.
+                assert_eq!(
+                    error["error"]["details"]["error_code"],
+                    "thread_unsupported_request"
+                );
+            }
         }
     }
 
