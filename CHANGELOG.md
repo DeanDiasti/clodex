@@ -7,6 +7,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-21
+
+### Fixed
+
+- Keep the Remote Control model proxy out of Bash tools, shell hooks, status-line
+  commands, and stdio MCP startup commands. Restore original extra CA and proxy
+  bypass settings while preserving sandbox proxies and inherited shell wrappers.
+  Claude's model requests and Remote Control continue using the local proxy.
+  Subprocesses outside Claude's shell-prefix path can still inherit the launch
+  environment.
+
 ### Changed
 
 - Stop publishing Intel macOS archives. Prebuilt releases support Apple Silicon
@@ -129,7 +140,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Repeatable source installer for macOS and Linux.
 - Automated tests and GitHub Actions CI on Ubuntu and macOS.
 
-[Unreleased]: https://github.com/DeanDiasti/clodex/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/DeanDiasti/clodex/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/DeanDiasti/clodex/releases/tag/v0.2.2
+[0.2.1]: https://github.com/DeanDiasti/clodex/releases/tag/v0.2.1
 [0.2.0]: https://github.com/DeanDiasti/clodex/releases/tag/v0.2.0
 [0.1.1]: https://github.com/DeanDiasti/clodex/releases/tag/v0.1.1
 [0.1.0]: https://github.com/DeanDiasti/clodex/releases/tag/v0.1.0
