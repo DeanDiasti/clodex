@@ -7,6 +7,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Stop publishing Intel macOS archives. Prebuilt releases support Apple Silicon
+  macOS and Linux x86-64/ARM64; other platforms can build from source.
+
 ## [0.2.1] - 2026-10-21
 
 ### Fixed

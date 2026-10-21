@@ -68,8 +68,8 @@ mkdir -p ~/.local/bin
 install -m 755 clodex ~/.local/bin/clodex
 ```
 
-Release archives are available for Linux x86-64/ARM64 and macOS
-Intel/Apple Silicon. Ensure `~/.local/bin` is on `PATH`.
+Release archives are available for Linux x86-64/ARM64 and Apple Silicon macOS.
+Ensure `~/.local/bin` is on `PATH`.
 
 To build from source instead, install Rust 1.88 or newer and run:
 
