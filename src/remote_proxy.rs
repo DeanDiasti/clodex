@@ -27,6 +27,7 @@ pub struct RemoteProxy {
     port: u16,
     password: String,
     ca: tempfile::NamedTempFile,
+    tool_env: crate::tool_env::ToolEnvironment,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -77,6 +78,10 @@ impl RemoteProxy {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
+        let tool_env = crate::tool_env::ToolEnvironment::new(
+            &format!("http://clodex:{password}@127.0.0.1:{port}"),
+            ca.path(),
+        )?;
         let state = Arc::new(State {
             bridge_port,
             external_base: external_base.to_owned(),
@@ -106,6 +111,7 @@ impl RemoteProxy {
             port,
             password,
             ca,
+            tool_env,
             shutdown: Some(shutdown),
             thread: Some(thread),
         })
@@ -113,6 +119,7 @@ impl RemoteProxy {
 
     pub fn configure(&self, command: &mut Command) {
         configure(command, self.port, &self.password, self.ca.path());
+        self.tool_env.configure(command);
     }
 }
 
@@ -432,6 +439,17 @@ mod tests {
         let proxy = RemoteProxy::start_inner(bridge, "http://127.0.0.1:1").unwrap();
         let path = proxy.ca.path().to_path_buf();
         let port = proxy.port;
+        let mut command = Command::new("claude");
+        proxy.configure(&mut command);
+        let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        let wrapper = std::path::PathBuf::from(
+            env[std::ffi::OsStr::new("CLAUDE_CODE_SHELL_PREFIX")].unwrap(),
+        );
+        assert!(wrapper.is_file());
+        assert_eq!(
+            env[std::ffi::OsStr::new("HTTPS_PROXY")].unwrap(),
+            format!("http://clodex:{}@127.0.0.1:{port}", proxy.password).as_str()
+        );
         for (trusted, authenticated) in [(false, true), (true, false)] {
             assert!(
                 client(&proxy, trusted, authenticated)
@@ -449,6 +467,7 @@ mod tests {
         assert_eq!(ok.status(), StatusCode::OK);
         drop(proxy);
         assert!(!path.exists());
+        assert!(!wrapper.exists());
         assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
         task.abort();
     }
@@ -478,6 +497,15 @@ mod tests {
 
     #[tokio::test]
     async fn other_hosts_use_opaque_tunnels_including_custom_https_ports() {
+        opaque_tunnel("HTTP/1.1", true).await;
+    }
+
+    #[tokio::test]
+    async fn gcloud_http10_connect_without_host_header_opens_a_tunnel() {
+        opaque_tunnel("HTTP/1.0", false).await;
+    }
+
+    async fn opaque_tunnel(version: &str, host_header: bool) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target = listener.local_addr().unwrap();
         let echo = tokio::spawn(async move {
@@ -490,7 +518,20 @@ mod tests {
         let mut socket = TcpStream::connect(("127.0.0.1", proxy.port)).await.unwrap();
         let auth =
             base64::engine::general_purpose::STANDARD.encode(format!("clodex:{}", proxy.password));
-        socket.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: Basic {auth}\r\n\r\n").as_bytes()).await.unwrap();
+        let host = if host_header {
+            format!("Host: {target}\r\n")
+        } else {
+            String::new()
+        };
+        socket
+            .write_all(
+                format!(
+                    "CONNECT {target} {version}\r\n{host}Proxy-Authorization: Basic {auth}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
         let mut headers = Vec::new();
         while !headers.ends_with(b"\r\n\r\n") {
             headers.push(
@@ -500,7 +541,11 @@ mod tests {
                     .unwrap(),
             );
         }
-        assert!(headers.starts_with(b"HTTP/1.1 200"));
+        assert!(
+            String::from_utf8_lossy(&headers).starts_with(&format!("{version} 200")),
+            "{}",
+            String::from_utf8_lossy(&headers)
+        );
         // These bytes need not even be TLS: the proxy must not inspect them.
         socket.write_all(b"ping").await.unwrap();
         let mut reply = [0; 4];
