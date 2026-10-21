@@ -11,6 +11,7 @@ mod picker;
 mod remote_proxy;
 mod statusline;
 mod supervisor;
+mod tool_env;
 mod update;
 
 use std::ffi::OsString;

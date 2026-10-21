@@ -312,9 +312,16 @@ Each launch generates a temporary CA certificate and an authenticated loopback
 proxy. The certificate is trusted through the launched process's
 `NODE_EXTRA_CA_CERTS`, preserving any existing extra roots; no system trust store
 is changed and no private key is written to disk. The proxy and certificate file
-are removed on normal launcher exit. The environment is inherited by Claude's
-child processes. This mode disables request gzip compression and replaces
-`NO_PROXY` with loopback exemptions so model calls cannot bypass the bridge.
+are removed on normal launcher exit. Clodex uses Claude Code's shell-prefix
+mechanism to remove its own proxy and
+restore the original extra CA and bypass settings for Bash tools, shell hooks,
+status-line commands, and stdio MCP startup commands. Inherited shell prefixes
+still run, and a different proxy installed by Claude's sandbox is preserved.
+This is transport isolation, not a sandbox or a change to tool permissions.
+PowerShell/exec-form hooks and other subprocesses outside the shell-prefix path
+can still inherit the launch environment. This mode disables request gzip
+compression and replaces `NO_PROXY` with loopback exemptions in Claude itself
+so model calls cannot bypass the bridge.
 
 Existing outbound `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` settings cannot
 currently be chained. To retain an existing proxy setup or use the previous
