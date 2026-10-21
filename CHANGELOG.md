@@ -7,6 +7,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Ask Claude Code to replay full conversation history when it attempts native
+  message threads on Codex routes, preventing missing tool-call errors after
+  tools run. Claude routes retain their native message-thread behavior.
+
 ## [0.2.0] - 2026-10-20
 
 ### Added
