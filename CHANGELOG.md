@@ -7,6 +7,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-21
+
 ### Fixed
 
 - Ask Claude Code to replay full conversation history when it attempts native
