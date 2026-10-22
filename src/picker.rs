@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 
 use crate::catalog::Catalog;
-use crate::config::LocalConfig;
+use crate::config::{LocalConfig, split_model_server};
 use crate::mapping::{ANTHROPIC_PREFIX, ModelMapping};
 use crate::supervisor::CodexSupport;
 
@@ -90,14 +90,13 @@ fn local_entries(local: &LocalConfig) -> Vec<Entry> {
         .models
         .iter()
         .filter_map(|entry| {
-            let id = entry
-                .split_once('=')
-                .map_or(entry.as_str(), |(id, _)| id)
-                .trim();
+            let (names, server) = split_model_server(entry);
+            let id = names.split_once('=').map_or(names, |(id, _)| id).trim();
+            let server = server.map_or(base_url, |url| url.trim_end_matches('/'));
             (!id.is_empty()).then(|| Entry {
                 id: id.to_string(),
                 display_name: id.to_string(),
-                description: format!("Local · {base_url}"),
+                description: format!("Local · {server}"),
                 agent: agent_name("local", id),
             })
         })
@@ -397,13 +396,17 @@ mod tests {
         local
             .set(
                 "http://127.0.0.1:11434/v1/",
-                &["wollf:32k".into(), "wollf-mlx=default_model".into()],
+                &[
+                    "wollf:32k".into(),
+                    "wollf-mlx=default_model".into(),
+                    "wollf-pool=wollf@http://100.69.85.34:9364/v1/".into(),
+                ],
             )
             .unwrap();
         let entries = entries(&catalog(), &listing(), true, &local);
         let tail: Vec<(&str, &str, &str)> = entries
             .iter()
-            .skip(entries.len() - 2)
+            .skip(entries.len() - 3)
             .map(|entry| {
                 (
                     entry.id.as_str(),
@@ -424,6 +427,11 @@ mod tests {
                     "wollf-mlx",
                     "Local · http://127.0.0.1:11434/v1",
                     "local-wollf-mlx"
+                ),
+                (
+                    "wollf-pool",
+                    "Local · http://100.69.85.34:9364/v1",
+                    "local-wollf-pool"
                 ),
             ]
         );

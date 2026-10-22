@@ -47,7 +47,8 @@ pub struct AppConfig {
 /// A local OpenAI-compatible server (ollama, mlx_lm, llama.cpp, vLLM) that the
 /// bridge offers in `/model` and to subagents beside the Codex and Claude
 /// models. Each entry in `models` is the model id, or `id=upstream` when the
-/// server knows the model by another name.
+/// server knows the model by another name, and may end in `@http://host/v1`
+/// to name its own server instead of `base_url`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct LocalConfig {
@@ -72,9 +73,17 @@ impl LocalConfig {
             bail!("name at least one model the server serves, such as wollf:32k");
         }
         for model in &models {
-            let (id, upstream) = model.split_once('=').unwrap_or((model, model));
+            let (names, server) = split_model_server(model);
+            if let Some(server) = server
+                && server_host(server).is_empty()
+            {
+                bail!("invalid model entry {model:?}; the server after @ needs a host");
+            }
+            let (id, upstream) = names.split_once('=').unwrap_or((names, names));
             if id.trim().is_empty() || upstream.trim().is_empty() {
-                bail!("invalid model entry {model:?}; expected id or id=upstream");
+                bail!(
+                    "invalid model entry {model:?}; expected id, id=upstream or id=upstream@http://host:port/v1"
+                );
             }
             if id.starts_with("claude-") || id.starts_with("anthropic/") {
                 bail!("local model ids cannot start with claude- or anthropic/");
@@ -104,6 +113,27 @@ impl LocalConfig {
             Some(url) => format!("{url} ({})", self.models.join(", ")),
             None => "none".to_string(),
         }
+    }
+}
+
+/// The part of a server URL after its scheme, without a trailing slash.
+fn server_host(server: &str) -> &str {
+    server
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+}
+
+/// Splits a model entry `id=upstream@http://host/v1` at the last `@http://`
+/// or `@https://` into the names and the entry's own server, if it has one.
+pub fn split_model_server(entry: &str) -> (&str, Option<&str>) {
+    let at = ["@http://", "@https://"]
+        .iter()
+        .filter_map(|marker| entry.rfind(marker))
+        .max();
+    match at {
+        Some(index) => (entry[..index].trim(), Some(entry[index + 1..].trim())),
+        None => (entry.trim(), None),
     }
 }
 
@@ -1121,5 +1151,43 @@ mod tests {
                 .unwrap(),
             600_000
         );
+    }
+
+    #[test]
+    fn a_local_model_entry_may_name_its_own_server() {
+        let mut local = LocalConfig::default();
+        local
+            .set(
+                "http://127.0.0.1:8002/v1",
+                &[
+                    "wollf-mlx=default_model".into(),
+                    "wollf-pool=wollf@http://100.69.85.34:9364/v1/".into(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            local.models_env(),
+            "wollf-mlx=default_model,wollf-pool=wollf@http://100.69.85.34:9364/v1/"
+        );
+        assert_eq!(
+            split_model_server("wollf-pool=wollf@http://100.69.85.34:9364/v1"),
+            ("wollf-pool=wollf", Some("http://100.69.85.34:9364/v1"))
+        );
+        assert_eq!(
+            split_model_server("a@b=c@https://h/v1"),
+            ("a@b=c", Some("https://h/v1")),
+            "the split is at the last @http"
+        );
+        assert_eq!(split_model_server("wollf:32k"), ("wollf:32k", None));
+        let error = local
+            .set("http://127.0.0.1:8002/v1", &["x=y@http://".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("needs a host"), "{error}");
+        let error = local
+            .set("http://127.0.0.1:8002/v1", &["@http://h/v1".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected id"), "{error}");
     }
 }
