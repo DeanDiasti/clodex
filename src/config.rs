@@ -40,6 +40,71 @@ pub struct AppConfig {
     pub routes: RoutesConfig,
     /// Prepare subscription-authenticated sessions for native Remote Control.
     pub remote_control: bool,
+    /// A local OpenAI-compatible chat server whose models join the picker.
+    pub local: LocalConfig,
+}
+
+/// A local OpenAI-compatible server (ollama, mlx_lm, llama.cpp, vLLM) that the
+/// bridge offers in `/model` and to subagents beside the Codex and Claude
+/// models. Each entry in `models` is the model id, or `id=upstream` when the
+/// server knows the model by another name.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LocalConfig {
+    pub base_url: Option<String>,
+    pub models: Vec<String>,
+}
+
+impl LocalConfig {
+    pub fn set(&mut self, base_url: &str, models: &[String]) -> Result<()> {
+        let base_url = base_url.trim().trim_end_matches('/');
+        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+            bail!("invalid local server URL {base_url:?}; expected http://host:port/v1");
+        }
+        let models: Vec<String> = models
+            .iter()
+            .flat_map(|entry| entry.split(','))
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect();
+        if models.is_empty() {
+            bail!("name at least one model the server serves, such as wollf:32k");
+        }
+        for model in &models {
+            let (id, upstream) = model.split_once('=').unwrap_or((model, model));
+            if id.trim().is_empty() || upstream.trim().is_empty() {
+                bail!("invalid model entry {model:?}; expected id or id=upstream");
+            }
+            if id.starts_with("claude-") || id.starts_with("anthropic/") {
+                bail!("local model ids cannot start with claude- or anthropic/");
+            }
+        }
+        self.base_url = Some(base_url.to_string());
+        self.models = models;
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        self.base_url = None;
+        self.models.clear();
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.base_url.is_some() && !self.models.is_empty()
+    }
+
+    /// The comma-separated list the backend reads from `CCP_LOCAL_MODELS`.
+    pub fn models_env(&self) -> String {
+        self.models.join(",")
+    }
+
+    pub fn render(&self) -> String {
+        match self.base_url.as_deref().filter(|_| self.is_configured()) {
+            Some(url) => format!("{url} ({})", self.models.join(", ")),
+            None => "none".to_string(),
+        }
+    }
 }
 
 /// Claude models, reached through the user's own Claude subscription, that
@@ -122,6 +187,7 @@ impl Default for AppConfig {
             permissions: PermissionsConfig::default(),
             routes: RoutesConfig::default(),
             remote_control: true,
+            local: LocalConfig::default(),
         }
     }
 }
@@ -214,7 +280,8 @@ impl AppConfig {
              Remote Control transport: {}\n\
              Hierarchical compaction: {}\n\
              Trusted tools:  {}\n\
-             Claude routes:  {}\n",
+             Claude routes:  {}\n\
+             Local server:   {}\n",
             self.context.render_limit(),
             self.context.compact_at_percent,
             self.codex.transport.as_str(),
@@ -226,7 +293,8 @@ impl AppConfig {
                 "off"
             },
             trusted_tools,
-            self.routes.render()
+            self.routes.render(),
+            self.local.render()
         )
     }
 
