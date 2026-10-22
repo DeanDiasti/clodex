@@ -45,6 +45,7 @@ struct FileConfig {
     pub cursor: Option<CursorConfig>,
     pub grok: Option<GrokConfig>,
     pub opencode: Option<OpenCodeConfig>,
+    pub local: Option<LocalConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -106,6 +107,17 @@ struct GrokConfig {
     pub base_url: Option<String>,
     #[serde(rename = "clientVersion")]
     pub client_version: Option<String>,
+}
+
+/// A local OpenAI-compatible chat server (ollama, mlx_lm, llama.cpp, vLLM).
+#[derive(Deserialize, Clone, Default)]
+struct LocalConfig {
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
+    #[serde(rename = "apiKey")]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -321,6 +333,15 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     }
     if env.contains_key("CCP_OPENCODE_BASE_URL") {
         out.push("opencode.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_LOCAL_BASE_URL") {
+        out.push("local.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_LOCAL_MODELS") {
+        out.push("local.models (env)".to_string());
+    }
+    if env.contains_key("CCP_LOCAL_API_KEY") {
+        out.push("local.apiKey (env)".to_string());
     }
     if env
         .get("CCP_CODEX_REASONING_SUMMARY")
@@ -591,6 +612,55 @@ pub fn opencode_api_key() -> Option<String> {
 pub fn opencode_api_key_source() -> Option<&'static str> {
     let env: HashMap<_, _> = std::env::vars().collect();
     resolve_opencode_config(&env, &paths::config_dir()).api_key_source
+}
+
+/// The local OpenAI-compatible server the `local` provider forwards to, when
+/// one is configured. The environment (`CCP_LOCAL_BASE_URL`,
+/// `CCP_LOCAL_MODELS` as a comma-separated list, `CCP_LOCAL_API_KEY`) wins over
+/// the `local` section of config.json. Without a base URL and at least one
+/// model the provider is not registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLocalConfig {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub models: Vec<String>,
+}
+
+pub fn local_config() -> Option<ResolvedLocalConfig> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    resolve_local_config(&env, &paths::config_dir())
+}
+
+fn resolve_local_config(
+    env: &HashMap<String, String>,
+    config_dir: &Path,
+) -> Option<ResolvedLocalConfig> {
+    let file = read_file_config(config_dir)
+        .and_then(|file| file.local)
+        .unwrap_or_default();
+    let base_url = env
+        .get("CCP_LOCAL_BASE_URL")
+        .cloned()
+        .or(file.base_url)
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())?;
+    let models: Vec<String> = match env.get("CCP_LOCAL_MODELS") {
+        Some(raw) => raw.split(',').map(str::trim).filter(|m| !m.is_empty()).map(str::to_string).collect(),
+        None => file.models.into_iter().map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).collect(),
+    };
+    if models.is_empty() {
+        return None;
+    }
+    let api_key = env
+        .get("CCP_LOCAL_API_KEY")
+        .cloned()
+        .or(file.api_key)
+        .filter(|key| !key.is_empty());
+    Some(ResolvedLocalConfig {
+        base_url,
+        api_key,
+        models,
+    })
 }
 
 pub fn opencode_base_url() -> String {
@@ -1214,6 +1284,40 @@ mod tests {
             std::env::set_var("CCP_CODEX_TRANSPORT", "");
         }
         assert_eq!(codex_transport(), CodexTransport::WebSocket);
+    }
+
+    #[test]
+    fn local_config_needs_a_base_url_and_models_and_prefers_the_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+
+        assert_eq!(local_config(), None);
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"local":{"baseUrl":"http://127.0.0.1:11434/v1/","models":[" wollf:32k ","", "wollf"]}}"#,
+        )
+        .unwrap();
+        let resolved = local_config().expect("configured");
+        assert_eq!(resolved.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(resolved.models, vec!["wollf:32k".to_string(), "wollf".to_string()]);
+        assert_eq!(resolved.api_key, None);
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"local":{"baseUrl":"http://127.0.0.1:11434/v1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(local_config(), None, "no models, no provider");
+        {
+            let _models = EnvGuard::set("CCP_LOCAL_MODELS", "a, b,,c");
+            let _key = EnvGuard::set("CCP_LOCAL_API_KEY", "secret");
+            let _url = EnvGuard::set("CCP_LOCAL_BASE_URL", "http://127.0.0.1:8002/v1");
+            let resolved = local_config().expect("env configured");
+            assert_eq!(resolved.base_url, "http://127.0.0.1:8002/v1");
+            assert_eq!(resolved.models, vec!["a", "b", "c"]);
+            assert_eq!(resolved.api_key.as_deref(), Some("secret"));
+        }
     }
 
     #[test]
