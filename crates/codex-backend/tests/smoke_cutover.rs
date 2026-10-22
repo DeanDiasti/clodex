@@ -2280,7 +2280,10 @@ async fn smoke_codex_http_bounds_initial_status_retries() {
     .await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst) as u32,
+        codex_backend::config::CODEX_DEFAULT_TRANSPORT_MAX_RETRIES + 1
+    );
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -2394,7 +2397,11 @@ async fn smoke_codex_http_stops_after_retry_limit() {
     .expect("exhausted stream must terminate")
     .unwrap();
     let text = String::from_utf8_lossy(&body);
-    assert_eq!(attempts.load(Ordering::SeqCst), 4, "stream body: {text}");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst) as u32,
+        codex_backend::config::CODEX_DEFAULT_TRANSPORT_MAX_RETRIES + 1,
+        "stream body: {text}"
+    );
     assert!(
         text.contains("overloaded until retry limit"),
         "stream body: {text}"
