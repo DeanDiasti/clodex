@@ -141,7 +141,10 @@ fn tool_result_text(content: &Value) -> String {
         Value::Array(blocks) => blocks
             .iter()
             .filter_map(|block| match block.get("type").and_then(Value::as_str) {
-                Some("text") => block.get("text").and_then(Value::as_str).map(str::to_string),
+                Some("text") => block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 Some("image") => Some("[image omitted]".to_string()),
                 _ => None,
             })
@@ -297,15 +300,18 @@ impl StreamTranslator {
                     .get("id")
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty());
-                let already_open = matches!(self.open, Some((_, Open::Tool { slot: open })) if open == slot);
-                if !already_open || name.is_some() && id.is_some() && !self.tool_ids.contains_key(&slot) {
+                let already_open =
+                    matches!(self.open, Some((_, Open::Tool { slot: open })) if open == slot);
+                if !already_open
+                    || name.is_some() && id.is_some() && !self.tool_ids.contains_key(&slot)
+                {
                     let Some(name) = name else {
                         // An argument fragment for a call that was never opened.
                         continue;
                     };
-                    let id = id.map(str::to_string).unwrap_or_else(|| {
-                        format!("call_{}_{}", self.message_id, self.next_index)
-                    });
+                    let id = id
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("call_{}_{}", self.message_id, self.next_index));
                     self.close_open(out);
                     self.tool_ids.insert(slot, id.clone());
                     self.open_block(
@@ -494,11 +500,7 @@ fn emit(out: &mut Vec<u8>, event: &str, data: &Value) {
 pub fn drain_sse_payloads(buffer: &mut Vec<u8>) -> (Vec<Value>, bool) {
     let mut payloads = Vec::new();
     let mut done = false;
-    loop {
-        let Some(end) = find_event_end(buffer) else {
-            break;
-        };
-        let (event_len, sep_len) = end;
+    while let Some((event_len, sep_len)) = find_event_end(buffer) {
         let event: Vec<u8> = buffer.drain(..event_len + sep_len).collect();
         let text = String::from_utf8_lossy(&event[..event_len]);
         let data: Vec<&str> = text
@@ -695,9 +697,16 @@ mod tests {
         ] {
             let mut value = base.clone();
             value["tool_choice"] = choice;
-            assert_eq!(to_chat_request(&request(value), "m", false)["tool_choice"], expected);
+            assert_eq!(
+                to_chat_request(&request(value), "m", false)["tool_choice"],
+                expected
+            );
         }
-        let none = to_chat_request(&request(json!({"model": "m", "messages": [], "tool_choice": {"type": "any"}})), "m", false);
+        let none = to_chat_request(
+            &request(json!({"model": "m", "messages": [], "tool_choice": {"type": "any"}})),
+            "m",
+            false,
+        );
         assert!(none.get("tools").is_none());
         assert!(none.get("tool_choice").is_none());
         assert!(none.get("stream_options").is_none());
@@ -706,9 +715,14 @@ mod tests {
     #[test]
     fn text_stream_becomes_anthropic_events() {
         let mut t = StreamTranslator::new("msg_1".into(), "wollf".into(), 12);
-        let mut bytes = t.on_chunk(&json!({"choices": [{"delta": {"role": "assistant", "content": "Hel"}}]}));
-        bytes.extend(t.on_chunk(&json!({"choices": [{"delta": {"content": "lo"}, "finish_reason": "stop"}]})));
-        bytes.extend(t.on_chunk(&json!({"choices": [], "usage": {"prompt_tokens": 40, "completion_tokens": 2}})));
+        let mut bytes =
+            t.on_chunk(&json!({"choices": [{"delta": {"role": "assistant", "content": "Hel"}}]}));
+        bytes.extend(t.on_chunk(
+            &json!({"choices": [{"delta": {"content": "lo"}, "finish_reason": "stop"}]}),
+        ));
+        bytes.extend(t.on_chunk(
+            &json!({"choices": [], "usage": {"prompt_tokens": 40, "completion_tokens": 2}}),
+        ));
         bytes.extend(t.finish());
         let events = events(&bytes);
         let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
@@ -747,7 +761,9 @@ mod tests {
         bytes.extend(t.on_chunk(&json!({"choices": [{"delta": {"tool_calls": [
             {"index": 0, "function": {"arguments": "mand\":\"ls\"}"}}
         ]}}]})));
-        bytes.extend(t.on_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})));
+        bytes.extend(
+            t.on_chunk(&json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})),
+        );
         bytes.extend(t.finish());
         let events = events(&bytes);
         let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
@@ -795,7 +811,8 @@ mod tests {
     #[test]
     fn reasoning_becomes_a_thinking_block_before_the_text() {
         let mut t = StreamTranslator::new("msg_4".into(), "wollf".into(), 1);
-        let mut bytes = t.on_chunk(&json!({"choices": [{"delta": {"reasoning_content": "think"}}]}));
+        let mut bytes =
+            t.on_chunk(&json!({"choices": [{"delta": {"reasoning_content": "think"}}]}));
         bytes.extend(t.on_chunk(&json!({"choices": [{"delta": {"content": "answer"}}]})));
         bytes.extend(t.finish());
         let events = events(&bytes);
