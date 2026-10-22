@@ -158,6 +158,13 @@ enum ConfigCommand {
         /// Exact tool name to remove.
         tool: String,
     },
+    /// Offer a local OpenAI-compatible server's models (ollama, mlx_lm, llama.cpp) in /model.
+    Local {
+        /// The server's OpenAI base URL, such as http://127.0.0.1:11434/v1, or "off".
+        base_url: String,
+        /// Model ids the server serves, or id=upstream when it knows a model by another name.
+        models: Vec<String>,
+    },
     /// Print the configuration file path.
     Path,
 }
@@ -393,6 +400,23 @@ fn run_config(args: ConfigArgs) -> Result<()> {
                 println!("Removed {tool} from the Clodex trusted-tool allowlist.");
             } else {
                 println!("{tool} was not in the Clodex trusted-tool allowlist.");
+            }
+        }
+        ConfigCommand::Local { base_url, models } => {
+            let mut config = config::AppConfig::load()?;
+            if base_url.eq_ignore_ascii_case("off") {
+                config.local.clear();
+                config.save()?;
+                println!(
+                    "Local server removed. Close every active Clodex session, then start a new one to apply it."
+                );
+            } else {
+                config.local.set(&base_url, &models)?;
+                config.save()?;
+                println!(
+                    "Local server set to {}. Close every active Clodex session, then start a new one to apply it.",
+                    config.local.render()
+                );
             }
         }
         ConfigCommand::Path => println!("{}", config::config_path()?.display()),
