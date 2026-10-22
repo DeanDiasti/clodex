@@ -49,6 +49,11 @@ impl Registry {
             "codex".into(),
             Arc::new(crate::providers::codex::CodexProvider::new()),
         );
+        if let Some(local) = crate::config::local_config() {
+            let provider = crate::providers::local::LocalProvider::new(local);
+            models.insert(provider.name().into(), provider.supported_models());
+            handlers.insert(provider.name().into(), Arc::new(provider));
+        }
 
         Self {
             alias_provider,
