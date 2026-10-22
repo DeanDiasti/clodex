@@ -623,7 +623,34 @@ pub fn opencode_api_key_source() -> Option<&'static str> {
 pub struct ResolvedLocalConfig {
     pub base_url: String,
     pub api_key: Option<String>,
-    pub models: Vec<String>,
+    pub models: Vec<LocalModel>,
+}
+
+/// One model the local provider lists. `id` is what Claude Code sends and
+/// shows; `upstream` is the name the server receives. A config entry
+/// `wollf-mlx=default_model` separates the two (the mlx_lm server only knows
+/// its loaded model as `default_model`); a bare `wollf:32k` uses one name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalModel {
+    pub id: String,
+    pub upstream: String,
+}
+
+impl LocalModel {
+    pub fn parse(entry: &str) -> Option<Self> {
+        let entry = entry.trim();
+        let (id, upstream) = match entry.split_once('=') {
+            Some((id, upstream)) => (id.trim(), upstream.trim()),
+            None => (entry, entry),
+        };
+        if id.is_empty() || upstream.is_empty() {
+            return None;
+        }
+        Some(Self {
+            id: id.to_string(),
+            upstream: upstream.to_string(),
+        })
+    }
 }
 
 pub fn local_config() -> Option<ResolvedLocalConfig> {
@@ -644,9 +671,13 @@ fn resolve_local_config(
         .or(file.base_url)
         .map(|url| url.trim().trim_end_matches('/').to_string())
         .filter(|url| !url.is_empty())?;
-    let models: Vec<String> = match env.get("CCP_LOCAL_MODELS") {
-        Some(raw) => raw.split(',').map(str::trim).filter(|m| !m.is_empty()).map(str::to_string).collect(),
-        None => file.models.into_iter().map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).collect(),
+    let models: Vec<LocalModel> = match env.get("CCP_LOCAL_MODELS") {
+        Some(raw) => raw.split(',').filter_map(LocalModel::parse).collect(),
+        None => file
+            .models
+            .iter()
+            .filter_map(|entry| LocalModel::parse(entry))
+            .collect(),
     };
     if models.is_empty() {
         return None;
@@ -1300,7 +1331,13 @@ mod tests {
         .unwrap();
         let resolved = local_config().expect("configured");
         assert_eq!(resolved.base_url, "http://127.0.0.1:11434/v1");
-        assert_eq!(resolved.models, vec!["wollf:32k".to_string(), "wollf".to_string()]);
+        assert_eq!(
+            resolved.models,
+            vec![
+                LocalModel::parse("wollf:32k").unwrap(),
+                LocalModel::parse("wollf").unwrap()
+            ]
+        );
         assert_eq!(resolved.api_key, None);
 
         std::fs::write(
@@ -1310,12 +1347,17 @@ mod tests {
         .unwrap();
         assert_eq!(local_config(), None, "no models, no provider");
         {
-            let _models = EnvGuard::set("CCP_LOCAL_MODELS", "a, b,,c");
+            let _models = EnvGuard::set("CCP_LOCAL_MODELS", "a, b,,c=default_model, =x");
             let _key = EnvGuard::set("CCP_LOCAL_API_KEY", "secret");
             let _url = EnvGuard::set("CCP_LOCAL_BASE_URL", "http://127.0.0.1:8002/v1");
             let resolved = local_config().expect("env configured");
             assert_eq!(resolved.base_url, "http://127.0.0.1:8002/v1");
-            assert_eq!(resolved.models, vec!["a", "b", "c"]);
+            let names: Vec<(&str, &str)> = resolved
+                .models
+                .iter()
+                .map(|m| (m.id.as_str(), m.upstream.as_str()))
+                .collect();
+            assert_eq!(names, vec![("a", "a"), ("b", "b"), ("c", "default_model")]);
             assert_eq!(resolved.api_key.as_deref(), Some("secret"));
         }
     }

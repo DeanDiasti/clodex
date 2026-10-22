@@ -74,7 +74,12 @@ async fn a_tool_request_streams_anthropic_events_from_a_live_server() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     let events = parse_sse_events(&bytes);
     let names: Vec<&str> = events
         .iter()
@@ -100,7 +105,10 @@ async fn a_tool_request_streams_anthropic_events_from_a_live_server() {
             .data,
     )
     .unwrap();
-    eprintln!("stop_reason: {} usage: {}", delta["delta"]["stop_reason"], delta["usage"]);
+    eprintln!(
+        "stop_reason: {} usage: {}",
+        delta["delta"]["stop_reason"], delta["usage"]
+    );
     if let Some(tool) = tool {
         assert_eq!(tool["content_block"]["name"], "Bash");
         assert_eq!(delta["delta"]["stop_reason"], "tool_use");
@@ -136,7 +144,12 @@ async fn a_non_streaming_request_returns_one_message_and_count_tokens_estimates(
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     let message: Value = serde_json::from_slice(&bytes).unwrap();
     eprintln!("message: {message}");
     assert_eq!(message["type"], "message");
