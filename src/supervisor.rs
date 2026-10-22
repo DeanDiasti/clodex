@@ -151,7 +151,7 @@ pub fn run() -> Result<()> {
     paths.prepare()?;
     let app_config = config::AppConfig::load()?;
     // Set private backend paths before auth refresh can start HTTP threads.
-    configure_embedded_environment(&paths, app_config.codex.transport);
+    configure_embedded_environment(&paths, app_config.codex.transport, &app_config.local);
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -179,7 +179,12 @@ pub fn run() -> Result<()> {
     let upstream_port = match app_config.codex.backend {
         config::CodexBackend::Proxy => {
             let upstream_port = available_proxy_port()?;
-            let mut child = spawn_proxy(&paths, upstream_port, app_config.codex.transport)?;
+            let mut child = spawn_proxy(
+                &paths,
+                upstream_port,
+                app_config.codex.transport,
+                &app_config.local,
+            )?;
             let started = wait_for_owned_proxy(&mut child, upstream_port, &shutdown_requested);
             cleanup.proxy = Some(Translator::Proxy(child));
             started?;
@@ -427,12 +432,17 @@ fn spawn_supervisor(paths: &SupervisorPaths) -> Result<()> {
     Deployment::current()?.snapshot(&paths.runtime)?;
     let stdout = append_log(&paths.supervisor_log)?;
     let stderr = stdout.try_clone()?;
-    let transport = config::AppConfig::load()?.codex.transport;
+    let app_config = config::AppConfig::load()?;
 
     let mut command = Command::new(&paths.executable);
     // The built-in backend reads the same settings the external proxy does,
     // from the process it runs in.
-    configure_backend_environment(&mut command, paths, transport)?;
+    configure_backend_environment(
+        &mut command,
+        paths,
+        app_config.codex.transport,
+        &app_config.local,
+    )?;
     command
         .arg("__supervisor")
         .stdin(Stdio::null())
@@ -470,12 +480,13 @@ fn spawn_proxy(
     paths: &SupervisorPaths,
     proxy_port: u16,
     transport: config::CodexTransport,
+    local: &config::LocalConfig,
 ) -> Result<Child> {
     let stdout = append_log(&paths.proxy_log)?;
     let stderr = stdout.try_clone()?;
 
     let mut command = Command::new("claude-code-proxy");
-    configure_backend_environment(&mut command, paths, transport)?;
+    configure_backend_environment(&mut command, paths, transport, local)?;
     command
         .args(["serve", "--no-monitor", "--port", &proxy_port.to_string()])
         .stdin(Stdio::null())
@@ -490,7 +501,17 @@ fn configure_backend_environment(
     command: &mut Command,
     paths: &SupervisorPaths,
     transport: config::CodexTransport,
+    local: &config::LocalConfig,
 ) -> Result<()> {
+    if let Some(base_url) = local.base_url.as_deref().filter(|_| local.is_configured()) {
+        command
+            .env("CCP_LOCAL_BASE_URL", base_url)
+            .env("CCP_LOCAL_MODELS", local.models_env());
+    } else {
+        command
+            .env_remove("CCP_LOCAL_BASE_URL")
+            .env_remove("CCP_LOCAL_MODELS");
+    }
     command
         .env("CCP_CONFIG_DIR", &paths.proxy_config)
         .env("CCP_CODEX_TRANSPORT", transport.as_str())
@@ -505,10 +526,24 @@ fn configure_backend_environment(
     Ok(())
 }
 
-fn configure_embedded_environment(paths: &SupervisorPaths, transport: config::CodexTransport) {
+fn configure_embedded_environment(
+    paths: &SupervisorPaths,
+    transport: config::CodexTransport,
+    local: &config::LocalConfig,
+) {
     // This is called only in the dedicated, still-single-threaded supervisor
     // process, before the embedded backend or bridge creates any threads.
     unsafe {
+        match local.base_url.as_deref().filter(|_| local.is_configured()) {
+            Some(base_url) => {
+                std::env::set_var("CCP_LOCAL_BASE_URL", base_url);
+                std::env::set_var("CCP_LOCAL_MODELS", local.models_env());
+            }
+            None => {
+                std::env::remove_var("CCP_LOCAL_BASE_URL");
+                std::env::remove_var("CCP_LOCAL_MODELS");
+            }
+        }
         std::env::set_var("CCP_CONFIG_DIR", &paths.proxy_config);
         std::env::set_var("CCP_CODEX_TRANSPORT", transport.as_str());
         std::env::set_var("CCP_CODEX_SERVER_COMPACTION", "1");
