@@ -65,29 +65,48 @@ impl LocalProvider {
         &self.base_url
     }
 
-    /// The name the server receives for a listed model id; an unlisted id
-    /// (the registry never routes one here) passes through unchanged.
-    fn upstream_model(&self, id: &str) -> String {
-        self.models
-            .iter()
-            .find(|model| model.id == id)
-            .map(|model| model.upstream.clone())
-            .unwrap_or_else(|| id.to_string())
+    /// The name the server receives for a listed model id and the server it
+    /// lives on (its own, or the shared base URL); an unlisted id (the
+    /// registry never routes one here) passes through unchanged.
+    fn target(&self, id: &str) -> (String, String) {
+        match self.models.iter().find(|model| model.id == id) {
+            Some(model) => (
+                model.upstream.clone(),
+                model
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| self.base_url.clone()),
+            ),
+            None => (id.to_string(), self.base_url.clone()),
+        }
     }
 
-    fn chat_url(&self) -> String {
-        format!("{}/chat/completions", self.base_url)
+    /// The servers the listed models reach, the shared one first, each once.
+    pub fn servers(&self) -> Vec<String> {
+        let mut servers = vec![self.base_url.clone()];
+        for model in &self.models {
+            if let Some(url) = model.base_url.as_ref()
+                && !servers.contains(url)
+            {
+                servers.push(url.clone());
+            }
+        }
+        servers
     }
 
     async fn send(
         &self,
+        base_url: &str,
         chat: &Value,
         traffic: Option<&TrafficCapture>,
     ) -> Result<reqwest::Response, Box<Response>> {
         if let Some(traffic) = traffic {
             traffic.write_json("020-local-chat-request", chat);
         }
-        let mut request = self.client.post(self.chat_url()).json(chat);
+        let mut request = self
+            .client
+            .post(format!("{base_url}/chat/completions"))
+            .json(chat);
         if let Some(key) = self.api_key.as_deref() {
             request = request.bearer_auth(key);
         }
@@ -95,7 +114,7 @@ impl LocalProvider {
             Box::new(json_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
-                format!("local server at {} unreachable: {error}", self.base_url),
+                format!("local server at {base_url} unreachable: {error}"),
             ))
         })?;
         let status = response.status();
@@ -120,9 +139,7 @@ impl LocalProvider {
                 status,
                 kind,
                 format!(
-                    "local server at {} answered {}: {}",
-                    self.base_url,
-                    status,
+                    "local server at {base_url} answered {status}: {}",
                     message.trim()
                 ),
             )));
@@ -187,12 +204,13 @@ impl Provider for LocalProvider {
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let model = body.model.clone().unwrap_or_default();
         let message_id = format!("msg_local_{}", uuid::Uuid::new_v4().simple());
-        let chat = to_chat_request(&body, &self.upstream_model(&model), body.stream);
+        let (upstream_model, base_url) = self.target(&model);
+        let chat = to_chat_request(&body, &upstream_model, body.stream);
         let estimated_input = estimate_tokens(&chat);
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &model);
         }
-        let upstream = match self.send(&chat, ctx.traffic.as_deref()).await {
+        let upstream = match self.send(&base_url, &chat, ctx.traffic.as_deref()).await {
             Ok(upstream) => upstream,
             Err(response) => return *response,
         };
@@ -296,7 +314,8 @@ impl Provider for LocalProvider {
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
         let model = body.model.clone().unwrap_or_default();
-        let tokens = estimate_tokens(&to_chat_request(&body, &self.upstream_model(&model), false));
+        let (upstream_model, _) = self.target(&model);
+        let tokens = estimate_tokens(&to_chat_request(&body, &upstream_model, false));
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.usage_updated(&ctx.req_id, Some(tokens), None);
         }
