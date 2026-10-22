@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 
 use crate::catalog::Catalog;
+use crate::config::LocalConfig;
 use crate::mapping::{ANTHROPIC_PREFIX, ModelMapping};
 use crate::supervisor::CodexSupport;
 
@@ -41,8 +42,13 @@ pub struct Entry {
 }
 
 /// Every Codex model the proxy can route, then, with a subscription, every
-/// current Claude model.
-pub fn entries(catalog: &Catalog, support: &CodexSupport, claude: bool) -> Vec<Entry> {
+/// current Claude model, then the models of a configured local server.
+pub fn entries(
+    catalog: &Catalog,
+    support: &CodexSupport,
+    claude: bool,
+    local: &LocalConfig,
+) -> Vec<Entry> {
     let codex = catalog
         .routable_models()
         .into_iter()
@@ -69,7 +75,33 @@ pub fn entries(catalog: &Catalog, support: &CodexSupport, claude: bool) -> Vec<E
             description: "Claude subscription".to_string(),
             agent: agent_name("", model),
         });
-    codex.chain(claude_models).collect()
+    let local_models = local_entries(local);
+    codex.chain(claude_models).chain(local_models).collect()
+}
+
+/// The configured local server's models, under their picker ids. The bridge
+/// sends an id that is neither `anthropic/` nor `claude-` to the backend,
+/// whose registry routes a listed local model to the local provider.
+fn local_entries(local: &LocalConfig) -> Vec<Entry> {
+    let Some(base_url) = local.base_url.as_deref().filter(|_| local.is_configured()) else {
+        return Vec::new();
+    };
+    local
+        .models
+        .iter()
+        .filter_map(|entry| {
+            let id = entry
+                .split_once('=')
+                .map_or(entry.as_str(), |(id, _)| id)
+                .trim();
+            (!id.is_empty()).then(|| Entry {
+                id: id.to_string(),
+                display_name: id.to_string(),
+                description: format!("Local · {base_url}"),
+                agent: agent_name("local", id),
+            })
+        })
+        .collect()
 }
 
 /// Writes the entries a role does not already show into Claude Code's
@@ -242,7 +274,7 @@ mod tests {
 
     #[test]
     fn lists_proxy_supported_codex_models_then_claude_models() {
-        let ids: Vec<_> = entries(&catalog(), &listing(), true)
+        let ids: Vec<_> = entries(&catalog(), &listing(), true, &LocalConfig::default())
             .into_iter()
             .map(|entry| entry.id)
             .collect();
@@ -261,16 +293,21 @@ mod tests {
 
     #[test]
     fn the_builtin_backend_lists_every_catalog_model() {
-        let ids: Vec<_> = entries(&catalog(), &CodexSupport::Builtin, false)
-            .into_iter()
-            .map(|entry| entry.id)
-            .collect();
+        let ids: Vec<_> = entries(
+            &catalog(),
+            &CodexSupport::Builtin,
+            false,
+            &LocalConfig::default(),
+        )
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
         assert_eq!(ids, ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]);
     }
 
     #[test]
     fn claude_models_need_a_subscription() {
-        let entries = entries(&catalog(), &listing(), false);
+        let entries = entries(&catalog(), &listing(), false, &LocalConfig::default());
         assert!(
             entries
                 .iter()
@@ -282,7 +319,7 @@ mod tests {
     fn cache_names_the_bridge_and_skips_models_a_role_shows() {
         let mut mapping = ModelMapping::from_catalog(&catalog()).unwrap();
         mapping.opus = Route::anthropic("claude-opus-5-5");
-        let entries = entries(&catalog(), &listing(), true);
+        let entries = entries(&catalog(), &listing(), true, &LocalConfig::default());
 
         let cache: Value = serde_json::from_slice(
             &gateway_cache("http://127.0.0.1:41234", &entries, &mapping).unwrap(),
@@ -316,8 +353,13 @@ mod tests {
 
     #[test]
     fn every_model_gets_a_subagent_on_its_own_provider() {
-        let agents: Value =
-            serde_json::from_str(&agents_json(&entries(&catalog(), &listing(), true))).unwrap();
+        let agents: Value = serde_json::from_str(&agents_json(&entries(
+            &catalog(),
+            &listing(),
+            true,
+            &LocalConfig::default(),
+        )))
+        .unwrap();
         assert_eq!(agents["codex-gpt-6-luna"]["model"], "gpt-6-luna");
         assert_eq!(
             agents["claude-sonnet-5-5"]["model"],
@@ -329,7 +371,13 @@ mod tests {
 
     #[test]
     fn every_model_is_a_curated_picker_row() {
-        let picker = model_picker(&entries(&catalog(), &listing(), true)).unwrap();
+        let picker = model_picker(&entries(
+            &catalog(),
+            &listing(),
+            true,
+            &LocalConfig::default(),
+        ))
+        .unwrap();
         let models: Vec<_> = picker["options"]
             .as_array()
             .unwrap()
@@ -341,6 +389,47 @@ mod tests {
         assert!(models.contains(&"anthropic/claude-opus-5-5"));
         assert_eq!(picker["options"][0]["label"], "GPT-6-SOL");
         assert!(model_picker(&[]).is_none());
+    }
+
+    #[test]
+    fn a_configured_local_server_lists_its_models_last_with_their_own_agents() {
+        let mut local = LocalConfig::default();
+        local
+            .set(
+                "http://127.0.0.1:11434/v1/",
+                &["wollf:32k".into(), "wollf-mlx=default_model".into()],
+            )
+            .unwrap();
+        let entries = entries(&catalog(), &listing(), true, &local);
+        let tail: Vec<(&str, &str, &str)> = entries
+            .iter()
+            .skip(entries.len() - 2)
+            .map(|entry| {
+                (
+                    entry.id.as_str(),
+                    entry.description.as_str(),
+                    entry.agent.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                (
+                    "wollf:32k",
+                    "Local · http://127.0.0.1:11434/v1",
+                    "local-wollf-32k"
+                ),
+                (
+                    "wollf-mlx",
+                    "Local · http://127.0.0.1:11434/v1",
+                    "local-wollf-mlx"
+                ),
+            ]
+        );
+        assert!(local_entries(&LocalConfig::default()).is_empty());
+        let agents: Value = serde_json::from_str(&agents_json(&entries)).unwrap();
+        assert_eq!(agents["local-wollf-32k"]["model"], "wollf:32k");
     }
 
     #[test]
