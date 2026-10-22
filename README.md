@@ -307,8 +307,17 @@ replaced by a placeholder. Token counts are estimated from the request size.
 When the server knows a model by another name, write `id=upstream`: the mlx_lm
 server, for instance, only answers to `default_model` for the model it loaded,
 so `clodex config local http://127.0.0.1:8002/v1 wollf-mlx=default_model`
-lists it as `wollf-mlx`. Several models may be listed; `clodex config local
-off` removes the server. The settings reach the shared backend when a
+lists it as `wollf-mlx`. Several models may be listed, and a model may name
+its own server after an `@`, so two servers can be offered at once:
+
+```sh
+clodex config local http://127.0.0.1:8002/v1 \
+  wollf-mlx=/Users/me/wollf/mlx-4bit \
+  wollf-pool=wollf@http://100.69.85.34:9364/v1
+```
+
+The base URL serves every entry without an `@`. `clodex config local off`
+removes them all. The settings reach the shared backend when a
 supervisor starts, so close every Clodex session after changing them. A bearer
 token for the server can be set in the backend's own `config.json` as
 `local.apiKey` or in its environment as `CCP_LOCAL_API_KEY`.
