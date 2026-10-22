@@ -521,8 +521,17 @@ impl std::ops::Deref for OwnerAwareCodexResponse {
 // Client
 // ---------------------------------------------------------------------------
 
-const MAX_BUFFERED_TRANSPORT_RETRIES: u32 = 3;
-const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_BUFFERED_TRANSPORT_RETRIES + 1;
+/// The retry budget for a buffered transport failure, read once from the
+/// configuration (`codex.transportMaxRetries`, default 8) so every retry
+/// site agrees for the life of the process.
+fn max_buffered_transport_retries() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(crate::config::codex_transport_max_retries)
+}
+
+fn max_buffered_transport_attempts() -> u32 {
+    max_buffered_transport_retries() + 1
+}
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
 const IMAGE_HEADER_TIMEOUT_MS: u64 = 300_000;
 /// Marks the error raised when the wait for the Codex response headers runs
@@ -1149,7 +1158,7 @@ impl CodexHttpClient {
                 continue;
             }
             if should_retry_codex_status(response.status)
-                && retries < MAX_BUFFERED_TRANSPORT_RETRIES
+                && retries < max_buffered_transport_retries()
             {
                 let retry_after = response
                     .headers
@@ -1257,7 +1266,7 @@ impl CodexHttpClient {
             {
                 Ok(attempt) => break attempt,
                 Err(error) if retryable_http_stream_error(&error) => {
-                    if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
+                    if retries >= max_buffered_transport_retries() {
                         log_http_stream_retry(ctx, &error, retries, None);
                         return Err(error);
                     }
@@ -1682,7 +1691,7 @@ impl CodexHttpClient {
                 };
 
                 loop {
-                    if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
+                    if retries >= max_buffered_transport_retries() {
                         log_http_stream_retry(&ctx, &retry_error, retries, None);
                         let _ = tx.send(Err(retry_error)).await;
                         return;
@@ -1946,7 +1955,7 @@ impl CodexHttpClient {
                 && (200..300).contains(&response.status)
                 && let Some(failure) = super::events::first_retryable_failure(&response.body)
             {
-                if transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
+                if transport_failures < max_buffered_transport_retries() {
                     let delay =
                         compute_backoff_delay(transport_failures, failure.retry_after.as_deref());
                     if delay.exceeds_budget {
@@ -2023,7 +2032,7 @@ impl CodexHttpClient {
                         .iter()
                         .find(|(k, _)| k.to_lowercase() == "retry-after")
                         .map(|(_, v)| v.clone());
-                    if transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
+                    if transport_failures < max_buffered_transport_retries() {
                         let delay =
                             compute_backoff_delay(transport_failures, retry_after.as_deref());
                         if delay.exceeds_budget {
@@ -2068,7 +2077,7 @@ impl CodexHttpClient {
                     });
                 }
                 Ok(response) if should_retry_codex_status(response.status) => {
-                    if transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
+                    if transport_failures < max_buffered_transport_retries() {
                         let retry_after = response
                             .headers
                             .iter()
@@ -2113,7 +2122,7 @@ impl CodexHttpClient {
                 Err(err) => {
                     // Determine if retryable
                     let retryable = is_retryable_transport_error(&err);
-                    if retryable && transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
+                    if retryable && transport_failures < max_buffered_transport_retries() {
                         let delay =
                             compute_backoff_delay(transport_failures, err.retry_after.as_deref());
                         if delay.exceeds_budget {
@@ -3080,7 +3089,7 @@ fn log_buffered_retry(
     fields.insert("nextAttempt".into(), serde_json::json!(failed_attempt + 1));
     fields.insert(
         "maxAttempts".into(),
-        serde_json::json!(MAX_BUFFERED_TRANSPORT_ATTEMPTS),
+        serde_json::json!(max_buffered_transport_attempts()),
     );
     fields.insert("delayMs".into(), serde_json::json!(delay_ms));
     fields.insert("status".into(), serde_json::json!(status));
@@ -3101,7 +3110,7 @@ fn log_buffered_retry_exhausted(
     fields.insert("transport".into(), serde_json::json!(transport.as_str()));
     fields.insert(
         "attempts".into(),
-        serde_json::json!(MAX_BUFFERED_TRANSPORT_ATTEMPTS),
+        serde_json::json!(max_buffered_transport_attempts()),
     );
     fields.insert("status".into(), serde_json::json!(status));
     fields.insert("origin".into(), serde_json::json!(origin));
@@ -3248,7 +3257,7 @@ fn log_http_stream_retry(
             ("retries".into(), serde_json::json!(retries)),
             (
                 "maxRetries".into(),
-                serde_json::json!(MAX_BUFFERED_TRANSPORT_RETRIES),
+                serde_json::json!(max_buffered_transport_retries()),
             ),
             ("delayMs".into(), serde_json::json!(delay_ms)),
             ("reason".into(), serde_json::json!(error.message)),
