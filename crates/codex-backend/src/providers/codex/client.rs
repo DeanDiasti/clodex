@@ -4354,7 +4354,7 @@ mod tests {
         assert_eq!(error.status, 503);
         assert_eq!(
             server.await.unwrap(),
-            MAX_BUFFERED_TRANSPORT_ATTEMPTS,
+            max_buffered_transport_attempts(),
             "initial status failures must share the HTTP stream retry budget"
         );
     }
