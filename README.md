@@ -180,6 +180,7 @@ only if the saved configuration, sign-in, cache, and logs are no longer wanted.
 | `clodex config remote-control <on\|off>` | Enable the Remote Control compatible launch transport (default: on) |
 | `clodex config hierarchical-compaction <on\|off>` | Fold an oversized compaction into rounds |
 | `clodex config route <role> <claude-model\|codex>` | Route a role to a Claude model on your subscription |
+| `clodex config local <base-url\|off> [model…]` | Offer a local OpenAI-compatible server's models in `/model` |
 | `clodex config allow-tool <exact-name>` | Trust one tool for sessions and subagents |
 | `clodex config forget-tool <exact-name>` | Remove a trusted tool |
 | `clodex config path` | Print the configuration path |
@@ -283,6 +284,41 @@ working in a Clodex session, on Codex models too: claude.ai connectors,
 managed plugins, feature-flagged tools, and artifacts. Without one, Clodex
 turns off Claude Code's nonessential traffic, since there is no Claude account
 for it to reach.
+
+## Local models through an OpenAI-compatible server
+
+A model served locally by ollama, the mlx_lm server, llama.cpp's
+`llama-server` or vLLM can join the picker beside the Codex and Claude models.
+Name the server's OpenAI base URL and the models it serves:
+
+```sh
+clodex config local http://127.0.0.1:11434/v1 wollf:32k
+```
+
+Start a new session and pick the model from `/model`, or ask for a subagent on
+it: every listed model gets an agent definition such as `local-wollf-32k`. The
+bridge sends the model's requests to Clodex's backend, which translates the
+Anthropic Messages request into a Chat Completions request (system prompt,
+messages, tool definitions and tool results, `tool_choice`, `max_tokens`,
+`temperature`, stop sequences) and streams the reply back as Anthropic events,
+including tool calls and a `reasoning` stream as a thinking block. Images are
+replaced by a placeholder. Token counts are estimated from the request size.
+
+When the server knows a model by another name, write `id=upstream`: the mlx_lm
+server, for instance, only answers to `default_model` for the model it loaded,
+so `clodex config local http://127.0.0.1:8002/v1 wollf-mlx=default_model`
+lists it as `wollf-mlx`. Several models may be listed; `clodex config local
+off` removes the server. The settings reach the shared backend when a
+supervisor starts, so close every Clodex session after changing them. A bearer
+token for the server can be set in the backend's own `config.json` as
+`local.apiKey` or in its environment as `CCP_LOCAL_API_KEY`.
+
+Local models cannot take a Claude Code role (`clodex config route` stays for
+Claude models) and do not change the context capacity, which still follows the
+four roles: a conversation larger than the local model accepts fails at the
+server. Claude Code's system prompt and tool schemas add well over ten thousand
+tokens to every turn, so a small model with a short context, or a server
+without a prompt cache, answers slowly.
 
 ## Remote Control with OpenAI models
 
