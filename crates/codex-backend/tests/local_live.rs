@@ -16,10 +16,16 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tower::util::ServiceExt;
 
+/// The server URL and the model entry (`id` or `id=upstream`); the request
+/// names the id, as Claude Code would.
 fn target() -> Option<(String, String)> {
     let url = std::env::var("CLODEX_LOCAL_TEST_URL").ok()?;
     let model = std::env::var("CLODEX_LOCAL_TEST_MODEL").ok()?;
     Some((url, model))
+}
+
+fn model_id(entry: &str) -> String {
+    LocalModel::parse(entry).expect("model entry").id
 }
 
 fn live_app(url: &str, model: &str) -> axum::Router {
@@ -63,7 +69,7 @@ async fn a_tool_request_streams_anthropic_events_from_a_live_server() {
     let (status, bytes) = post_messages(
         &app,
         json!({
-            "model": model,
+            "model": model_id(&model),
             "max_tokens": 200,
             "stream": true,
             "system": [{"type": "text", "text": "You are a coding agent. Use tools when asked."}],
@@ -138,7 +144,7 @@ async fn a_non_streaming_request_returns_one_message_and_count_tokens_estimates(
     let (status, bytes) = post_messages(
         &app,
         json!({
-            "model": model,
+            "model": model_id(&model),
             "max_tokens": 40,
             "messages": [{"role": "user", "content": "Reply with the single word: pong"}]
         }),
@@ -164,7 +170,7 @@ async fn a_non_streaming_request_returns_one_message_and_count_tokens_estimates(
                 .uri("/v1/messages/count_tokens")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({"model": model, "messages": [{"role": "user", "content": "hello there"}]})
+                    json!({"model": model_id(&model), "messages": [{"role": "user", "content": "hello there"}]})
                         .to_string(),
                 ))
                 .unwrap(),
