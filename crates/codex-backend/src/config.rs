@@ -629,19 +629,38 @@ pub struct ResolvedLocalConfig {
 /// One model the local provider lists. `id` is what Claude Code sends and
 /// shows; `upstream` is the name the server receives. A config entry
 /// `wollf-mlx=default_model` separates the two (the mlx_lm server only knows
-/// its loaded model as `default_model`); a bare `wollf:32k` uses one name.
+/// its loaded model as `default_model`); a bare `wollf:32k` uses one name. An
+/// entry may name its own server after an `@`: `wollf-pool=wollf@http://hasu:9364/v1`
+/// is served from that URL instead of the shared `base_url`, so several
+/// servers can be listed at once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalModel {
     pub id: String,
     pub upstream: String,
+    pub base_url: Option<String>,
 }
 
 impl LocalModel {
     pub fn parse(entry: &str) -> Option<Self> {
         let entry = entry.trim();
-        let (id, upstream) = match entry.split_once('=') {
+        let (names, base_url) = split_model_server(entry);
+        let base_url = match base_url {
+            Some(url) => {
+                let url = url.trim();
+                let host = url
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .trim_end_matches('/');
+                if host.is_empty() {
+                    return None;
+                }
+                Some(url.trim_end_matches('/').to_string())
+            }
+            None => None,
+        };
+        let (id, upstream) = match names.split_once('=') {
             Some((id, upstream)) => (id.trim(), upstream.trim()),
-            None => (entry, entry),
+            None => (names, names),
         };
         if id.is_empty() || upstream.is_empty() {
             return None;
@@ -649,7 +668,21 @@ impl LocalModel {
         Some(Self {
             id: id.to_string(),
             upstream: upstream.to_string(),
+            base_url,
         })
+    }
+}
+
+/// Splits `id=upstream@http://host/v1` at the last `@http://` or `@https://`,
+/// so an upstream name may itself hold an `@` and a URL may hold `=`.
+pub fn split_model_server(entry: &str) -> (&str, Option<&str>) {
+    let at = ["@http://", "@https://"]
+        .iter()
+        .filter_map(|marker| entry.rfind(marker))
+        .max();
+    match at {
+        Some(index) => (entry[..index].trim(), Some(&entry[index + 1..])),
+        None => (entry, None),
     }
 }
 
@@ -1339,6 +1372,44 @@ mod tests {
             ]
         );
         assert_eq!(resolved.api_key, None);
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"local":{"baseUrl":"http://127.0.0.1:8002/v1","models":["wollf-mlx=default_model","wollf-pool=wollf@http://100.69.85.34:9364/v1/","a@b=c@https://h/v1"]}}"#,
+        )
+        .unwrap();
+        let resolved = local_config().expect("configured");
+        assert_eq!(
+            resolved.models,
+            vec![
+                LocalModel {
+                    id: "wollf-mlx".into(),
+                    upstream: "default_model".into(),
+                    base_url: None,
+                },
+                LocalModel {
+                    id: "wollf-pool".into(),
+                    upstream: "wollf".into(),
+                    base_url: Some("http://100.69.85.34:9364/v1".into()),
+                },
+                LocalModel {
+                    id: "a@b".into(),
+                    upstream: "c".into(),
+                    base_url: Some("https://h/v1".into()),
+                },
+            ],
+            "an entry's own server follows the last @http; an upstream may hold an @"
+        );
+        assert_eq!(
+            LocalModel::parse("x=y@http://"),
+            None,
+            "an empty server is no entry"
+        );
+        assert_eq!(
+            LocalModel::parse("@http://h/v1"),
+            None,
+            "a server without a model is no entry"
+        );
 
         std::fs::write(
             config.path().join("config.json"),
