@@ -635,6 +635,45 @@ fn read_output_format(req: &MessagesRequest) -> Option<ResponsesTextFormat> {
     }
 }
 
+// Anthropic expands tool_reference blocks server-side. Responses has no such
+// expansion, so expose only the deferred tools discovered in this history.
+// Include prior tool calls too so resumed histories can still reuse those tools.
+fn discovered_tool_names(req: &MessagesRequest) -> HashSet<&str> {
+    let mut names = HashSet::new();
+    for message in &req.messages {
+        let Some(blocks) = message.content.as_array() else {
+            continue;
+        };
+        for block in blocks {
+            match (
+                message.role.as_str(),
+                block.get("type").and_then(Value::as_str),
+            ) {
+                ("assistant", Some("tool_use")) => {
+                    if let Some(name) = block.get("name").and_then(Value::as_str) {
+                        names.insert(name);
+                    }
+                }
+                ("user", Some("tool_result")) => {
+                    if let Some(content) = block.get("content").and_then(Value::as_array) {
+                        for reference in content {
+                            if reference.get("type").and_then(Value::as_str)
+                                == Some("tool_reference")
+                                && let Some(name) =
+                                    reference.get("tool_name").and_then(Value::as_str)
+                            {
+                                names.insert(name);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    names
+}
+
 fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyhow::Error> {
     let Some(tools) = req.extra.get("tools") else {
         return Ok(None);
@@ -643,8 +682,17 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
         Value::Array(a) => a,
         _ => return Ok(None),
     };
+    let discovered = discovered_tool_names(req);
     let mut out = Vec::new();
     for tool in tools_arr {
+        if tool.get("defer_loading").and_then(Value::as_bool) == Some(true)
+            && !tool
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| discovered.contains(name))
+        {
+            continue;
+        }
         let tool_type = tool
             .get("type")
             .and_then(|v| v.as_str())
@@ -1109,6 +1157,13 @@ fn render_tool_result_block(block: &Value) -> RenderedToolResultPart {
                 RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block))
             }),
         Some("image") => render_tool_result_image(block),
+        Some("tool_reference") => block
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .map(|name| RenderedToolResultPart::Text(format!("Tool reference: {name}")))
+            .unwrap_or_else(|| {
+                RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block))
+            }),
         Some(other) => {
             RenderedToolResultPart::Text(format!("[unsupported content block omitted: {other}]"))
         }
@@ -1209,6 +1264,106 @@ mod tests {
             service_tier: None,
             model: "gpt-5.5".to_string(),
             use_responses_lite: false,
+        }
+    }
+
+    #[test]
+    fn deferred_tools_load_only_after_discovery_in_both_responses_lanes() {
+        for lite in [false, true] {
+            let mut req: MessagesRequest = serde_json::from_value(json!({
+                "model": "gpt-5.5",
+                "messages": [{"role": "user", "content": "Use mcp__test__search"}],
+                "tools": [
+                    {"name":"ToolSearch", "input_schema":{"type":"object"}},
+                    {"name":"Read", "defer_loading":false, "input_schema":{"type":"object"}},
+                    {"name":"mcp__test__search", "defer_loading":true,
+                     "description":"deferred search schema", "input_schema":{"type":"object"}},
+                    {"name":"mcp__test__unused", "defer_loading":true,
+                     "description":"unused schema must never enter context".repeat(1000),
+                     "input_schema":{"type":"object"}}
+                ]
+            }))
+            .unwrap();
+            let translate = |req: &MessagesRequest| {
+                let mut options = opts();
+                options.use_responses_lite = lite;
+                let out = translate_request(req, options).unwrap();
+                let wire = serde_json::to_value(&out).unwrap();
+                let tools = if lite {
+                    &wire["input"][0]["tools"]
+                } else {
+                    &wire["tools"]
+                };
+                let names: Vec<String> = tools
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["name"].as_str().unwrap().to_string())
+                    .collect();
+                assert!(
+                    !wire
+                        .to_string()
+                        .contains("unused schema must never enter context")
+                );
+                (out, names)
+            };
+            assert_eq!(translate(&req).1, ["ToolSearch", "Read"]);
+            req.messages.extend(
+                serde_json::from_value::<Vec<crate::anthropic::schema::Message>>(json!([
+                    {"role":"assistant", "content":[{
+                        "type":"tool_use", "id":"search_1", "name":"ToolSearch",
+                        "input":{"query":"select:mcp__test__search"}
+                    }]},
+                    {"role":"user", "content":[{
+                        "type":"tool_result", "tool_use_id":"search_1", "content":[
+                            {"type":"text", "text":"Found one tool"},
+                            {"type":"tool_reference", "tool_name":"mcp__test__search"},
+                            {"type":"tool_reference", "tool_name":"mcp__test__missing"}
+                        ]
+                    }]}
+                ]))
+                .unwrap(),
+            );
+            let (out, names) = translate(&req);
+            assert_eq!(names, ["ToolSearch", "Read", "mcp__test__search"]);
+            let output = out
+                .input
+                .iter()
+                .find_map(|item| match item {
+                    ResponsesInputItem::FunctionCallOutput { call_id, output }
+                        if call_id == "search_1" =>
+                    {
+                        output.as_text()
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                output,
+                "Found one tool\nTool reference: mcp__test__search\nTool reference: mcp__test__missing"
+            );
+
+            // A later turn or a resumed history keeps the discovered tool callable.
+            req.messages.extend(
+                serde_json::from_value::<Vec<crate::anthropic::schema::Message>>(json!([
+                    {"role":"assistant", "content":[{
+                        "type":"tool_use", "id":"call_1", "name":"mcp__test__search", "input":{}
+                    }]},
+                    {"role":"user", "content":[{
+                        "type":"tool_result", "tool_use_id":"call_1", "content":"search result"
+                    }]}
+                ]))
+                .unwrap(),
+            );
+            assert_eq!(
+                translate(&req).1,
+                ["ToolSearch", "Read", "mcp__test__search"]
+            );
+            req.messages.drain(1..3);
+            assert_eq!(
+                translate(&req).1,
+                ["ToolSearch", "Read", "mcp__test__search"]
+            );
         }
     }
 

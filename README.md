@@ -112,6 +112,26 @@ and selects a Clodex-only purple Claude theme, including the welcome logo. The
 theme definition is stored at `~/.claude/themes/clodex.json`; ordinary Claude
 sessions retain their own theme.
 
+### MCP tool context
+
+Clodex uses Claude Code's normal user and project settings, including MCP tool
+search. To explicitly enable loading MCP tools on demand, merge this into
+`~/.claude/settings.json` (or the settings directory set by `CLAUDE_CONFIG_DIR`):
+
+```json
+{
+  "env": {
+    "ENABLE_TOOL_SEARCH": "true"
+  }
+}
+```
+
+Start a new `claude` or `clodex` session after changing it. The built-in Codex
+backend keeps deferred tool schemas out of the model's context until Claude
+Code's `ToolSearch` discovers them, and keeps discovered tools available on
+later turns. Claude routes use Anthropic's tool search handling directly.
+Use `/context` to inspect usage and `/mcp` to disable servers you do not need.
+
 ## Update or uninstall
 
 Clodex checks for a new stable GitHub release in the background when you launch
