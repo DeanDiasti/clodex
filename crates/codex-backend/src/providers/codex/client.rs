@@ -3190,6 +3190,13 @@ fn is_retryable_connection_source(error: &(dyn std::error::Error + 'static)) -> 
             "channel closed",
             "goaway",
             "refused_stream",
+            // An HTTP/2 RST_STREAM on SendRequest (hyper reports it as
+            // "http2 error: stream error received: unspecific protocol error
+            // detected"): the request was never accepted, so re-sending it is
+            // as safe as after a refused stream. Seen 13 times in 16 minutes
+            // of network resets, each one ending an agent's session.
+            "stream error",
+            "protocol error",
             "econnreset",
             "etimedout",
             "epipe",
@@ -3705,6 +3712,49 @@ mod tests {
             .unwrap_err();
         assert!(error.is_builder());
         assert!(!is_retryable_reqwest_error(&error));
+    }
+
+    #[derive(Debug)]
+    struct ChainError {
+        message: &'static str,
+        source: Option<Box<ChainError>>,
+    }
+
+    impl std::fmt::Display for ChainError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for ChainError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|error| error as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn http2_stream_reset_on_send_is_retryable() {
+        // hyper's cause chain for an HTTP/2 RST_STREAM received while sending
+        // the request, as proxy.log recorded it on 2026-10-22.
+        let reset = ChainError {
+            message: "client error (SendRequest)",
+            source: Some(Box::new(ChainError {
+                message: "http2 error: stream error received: unspecific protocol error detected",
+                source: None,
+            })),
+        };
+        assert!(is_retryable_connection_source(&reset));
+
+        let rejected = ChainError {
+            message: "client error (SendRequest)",
+            source: Some(Box::new(ChainError {
+                message: "invalid header value",
+                source: None,
+            })),
+        };
+        assert!(!is_retryable_connection_source(&rejected));
     }
 
     #[tokio::test]
