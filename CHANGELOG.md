@@ -7,6 +7,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Retry a Codex request whose HTTP/2 stream is reset while it is being sent
+  (`stream error received: unspecific protocol error detected`). The reset
+  arrives before the request is accepted, so re-sending it is as safe as
+  after a refused stream; it used to surface as a 502 and end the agent's
+  turn.
+
+### Added
+
+- `codex.transportMaxRetries` (or `CCP_CODEX_TRANSPORT_MAX_RETRIES`) sets how
+  many times a Codex request is re-sent after a transport failure on the HTTP
+  transport. The default rises from 3 to 8.
+
 ## [0.2.2] - 2026-10-21
 
 ### Fixed

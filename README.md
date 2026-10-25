@@ -601,6 +601,12 @@ WebSocket and falls back to HTTP only if setup fails before a request is sent;
 it cannot replay an interrupted in-flight request. Close every active Clodex
 session after changing the transport so the shared supervisor restarts.
 
+On the HTTP transport a request that fails before any output has been
+delivered (a reset connection, an HTTP/2 stream reset, a TLS record error) is
+retried with backoff, up to eight times by default. Set
+`codex.transportMaxRetries` in `~/.clodex/config.json` (0–50) or
+`CCP_CODEX_TRANSPORT_MAX_RETRIES` to change the budget.
+
 ## Credentials and local files
 
 Clodex uses its own sign-in from `clodex auth login` when there is one, and
