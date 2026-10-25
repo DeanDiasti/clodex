@@ -78,6 +78,8 @@ struct CodexConfig {
     pub transport: Option<String>,
     #[serde(rename = "headerTimeoutMs")]
     pub header_timeout_ms: Option<u64>,
+    #[serde(default, alias = "transportMaxRetries")]
+    pub transport_max_retries: Option<u32>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -393,6 +395,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(ms) = codex.header_timeout_ms {
                 out.push(format!("codex.headerTimeoutMs: {ms}"));
+            }
+            if let Some(n) = codex.transport_max_retries {
+                out.push(format!("codex.transportMaxRetries: {n}"));
             }
         }
     }
@@ -932,6 +937,37 @@ pub fn codex_transport() -> CodexTransport {
 pub const CODEX_DEFAULT_HEADER_TIMEOUT_MS: u64 = 300_000;
 pub const CODEX_MIN_HEADER_TIMEOUT_MS: u64 = 1_000;
 
+/// How many times a buffered Codex request is retried after a retryable
+/// transport failure (an HTTP/2 stream reset, a TLS record fault, a 5xx)
+/// before the live start fails. With the backoff ceiling of 30 s, the
+/// default of 8 rides out an outage of a few minutes; 3 rode out about
+/// fifteen seconds, which lost whole agents to an eleven-minute path
+/// fault on 2026-10-22. Values above `CODEX_MAX_TRANSPORT_MAX_RETRIES`
+/// are ignored rather than clamped, as the header timeout's floor is.
+pub const CODEX_DEFAULT_TRANSPORT_MAX_RETRIES: u32 = 8;
+pub const CODEX_MAX_TRANSPORT_MAX_RETRIES: u32 = 50;
+
+pub fn codex_transport_max_retries() -> u32 {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(n) = env
+        .get("CCP_CODEX_TRANSPORT_MAX_RETRIES")
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|n| *n <= CODEX_MAX_TRANSPORT_MAX_RETRIES)
+    {
+        return n;
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(n) = codex
+            .transport_max_retries
+            .filter(|n| *n <= CODEX_MAX_TRANSPORT_MAX_RETRIES)
+    {
+        return n;
+    }
+    CODEX_DEFAULT_TRANSPORT_MAX_RETRIES
+}
+
 pub fn codex_header_timeout_ms() -> u64 {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(ms) = env
@@ -1214,6 +1250,43 @@ mod tests {
             std::env::set_var("CCP_CODEX_TRANSPORT", "");
         }
         assert_eq!(codex_transport(), CodexTransport::WebSocket);
+    }
+
+    #[test]
+    fn codex_transport_max_retries_defaults_overrides_and_caps() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+
+        assert_eq!(
+            codex_transport_max_retries(),
+            CODEX_DEFAULT_TRANSPORT_MAX_RETRIES
+        );
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"transportMaxRetries":12}}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_transport_max_retries(), 12);
+        {
+            let _retries_env = EnvGuard::set("CCP_CODEX_TRANSPORT_MAX_RETRIES", "2");
+            assert_eq!(codex_transport_max_retries(), 2);
+        }
+        // Above the cap is ignored, not clamped, as the header timeout's floor is.
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"transportMaxRetries":500}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_transport_max_retries(),
+            CODEX_DEFAULT_TRANSPORT_MAX_RETRIES
+        );
+        let _retries_env = EnvGuard::set("CCP_CODEX_TRANSPORT_MAX_RETRIES", "x");
+        assert_eq!(
+            codex_transport_max_retries(),
+            CODEX_DEFAULT_TRANSPORT_MAX_RETRIES
+        );
     }
 
     #[test]
