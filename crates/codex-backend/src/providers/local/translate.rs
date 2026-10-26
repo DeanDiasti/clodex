@@ -117,9 +117,29 @@ fn function_tool(tool: &Value) -> Option<Value> {
     if let Some(description) = tool.get("description").and_then(Value::as_str) {
         function.insert("description".into(), json!(description));
     }
-    function.insert("parameters".into(), parameters.clone());
+    function.insert("parameters".into(), without_patterns(parameters));
     Some(json!({"type": "function", "function": function}))
 }
+
+/// The schema without its `pattern` keywords. llama.cpp compiles tool schemas
+/// into a sampling grammar and its regex converter rejects some patterns: one
+/// of Claude Code's own (`^[^\0]*$`) fails the whole request with "failed to
+/// parse grammar". A pattern is a validation hint, not structure, so local
+/// servers get schemas without them. Only a string-valued `pattern` is a
+/// keyword; a property named `pattern` (Grep's) is a schema object and stays.
+fn without_patterns(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, value)| !(key.as_str() == "pattern" && value.is_string()))
+                .map(|(key, value)| (key.clone(), without_patterns(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_patterns).collect()),
+        other => other.clone(),
+    }
+}
+
 
 fn tool_choice(choice: Option<&Value>) -> Option<Value> {
     let choice = choice?;
@@ -710,6 +730,46 @@ mod tests {
         assert!(none.get("tools").is_none());
         assert!(none.get("tool_choice").is_none());
         assert!(none.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn tool_schemas_lose_string_patterns_but_keep_a_property_named_pattern() {
+        let chat = to_chat_request(
+            &request(json!({
+                "model": "wollf",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "Grep", "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "pattern": "^.+$"},
+                        "paths": {"type": "array", "items": {"type": "string", "pattern": "^[^\\0]*$"}},
+                        "id": {"anyOf": [{"const": "latest"}, {"type": "string", "pattern": "^[0-9]+$", "maxLength": 9}]}
+                    },
+                    "required": ["pattern"]
+                }}]
+            })),
+            "wollf",
+            false,
+        );
+        let parameters = &chat["tools"][0]["function"]["parameters"];
+        assert_eq!(
+            parameters["properties"]["pattern"],
+            json!({"type": "string"})
+        );
+        assert_eq!(
+            parameters["properties"]["paths"]["items"],
+            json!({"type": "string"})
+        );
+        assert_eq!(
+            parameters["properties"]["id"]["anyOf"][1],
+            json!({"type": "string", "maxLength": 9})
+        );
+        assert_eq!(parameters["required"], json!(["pattern"]));
+        assert!(
+            !chat.to_string().contains("\"pattern\":\""),
+            "no pattern keyword survives"
+        );
     }
 
     #[test]
