@@ -336,6 +336,11 @@ because two long prompts prefilled at once can exhaust a single machine's
 memory. A reply whose client has gone keeps the server's turn until the server
 finishes it, since the server goes on computing it regardless.
 
+Claude Code may send a follow-up turn as a message-thread delta that leaves its
+history on Anthropic's side. A local server keeps no such thread, so the
+backend refuses those requests and Claude Code resends the whole conversation,
+as it does for the Codex models.
+
 ## Remote Control with OpenAI models
 
 With a Claude subscription login, new Clodex sessions are prepared for native
