@@ -45,6 +45,7 @@ struct FileConfig {
     pub cursor: Option<CursorConfig>,
     pub grok: Option<GrokConfig>,
     pub opencode: Option<OpenCodeConfig>,
+    pub local: Option<LocalConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -106,6 +107,17 @@ struct GrokConfig {
     pub base_url: Option<String>,
     #[serde(rename = "clientVersion")]
     pub client_version: Option<String>,
+}
+
+/// A local OpenAI-compatible chat server (ollama, mlx_lm, llama.cpp, vLLM).
+#[derive(Deserialize, Clone, Default)]
+struct LocalConfig {
+    #[serde(rename = "baseUrl")]
+    pub base_url: Option<String>,
+    #[serde(rename = "apiKey")]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -321,6 +333,15 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     }
     if env.contains_key("CCP_OPENCODE_BASE_URL") {
         out.push("opencode.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_LOCAL_BASE_URL") {
+        out.push("local.baseUrl (env)".to_string());
+    }
+    if env.contains_key("CCP_LOCAL_MODELS") {
+        out.push("local.models (env)".to_string());
+    }
+    if env.contains_key("CCP_LOCAL_API_KEY") {
+        out.push("local.apiKey (env)".to_string());
     }
     if env
         .get("CCP_CODEX_REASONING_SUMMARY")
@@ -591,6 +612,119 @@ pub fn opencode_api_key() -> Option<String> {
 pub fn opencode_api_key_source() -> Option<&'static str> {
     let env: HashMap<_, _> = std::env::vars().collect();
     resolve_opencode_config(&env, &paths::config_dir()).api_key_source
+}
+
+/// The local OpenAI-compatible server the `local` provider forwards to, when
+/// one is configured. The environment (`CCP_LOCAL_BASE_URL`,
+/// `CCP_LOCAL_MODELS` as a comma-separated list, `CCP_LOCAL_API_KEY`) wins over
+/// the `local` section of config.json. Without a base URL and at least one
+/// model the provider is not registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLocalConfig {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub models: Vec<LocalModel>,
+}
+
+/// One model the local provider lists. `id` is what Claude Code sends and
+/// shows; `upstream` is the name the server receives. A config entry
+/// `wollf-mlx=default_model` separates the two (the mlx_lm server only knows
+/// its loaded model as `default_model`); a bare `wollf:32k` uses one name. An
+/// entry may name its own server after an `@`: `wollf-pool=wollf@http://hasu:9364/v1`
+/// is served from that URL instead of the shared `base_url`, so several
+/// servers can be listed at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalModel {
+    pub id: String,
+    pub upstream: String,
+    pub base_url: Option<String>,
+}
+
+impl LocalModel {
+    pub fn parse(entry: &str) -> Option<Self> {
+        let entry = entry.trim();
+        let (names, base_url) = split_model_server(entry);
+        let base_url = match base_url {
+            Some(url) => {
+                let url = url.trim();
+                let host = url
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .trim_end_matches('/');
+                if host.is_empty() {
+                    return None;
+                }
+                Some(url.trim_end_matches('/').to_string())
+            }
+            None => None,
+        };
+        let (id, upstream) = match names.split_once('=') {
+            Some((id, upstream)) => (id.trim(), upstream.trim()),
+            None => (names, names),
+        };
+        if id.is_empty() || upstream.is_empty() {
+            return None;
+        }
+        Some(Self {
+            id: id.to_string(),
+            upstream: upstream.to_string(),
+            base_url,
+        })
+    }
+}
+
+/// Splits `id=upstream@http://host/v1` at the last `@http://` or `@https://`,
+/// so an upstream name may itself hold an `@` and a URL may hold `=`.
+pub fn split_model_server(entry: &str) -> (&str, Option<&str>) {
+    let at = ["@http://", "@https://"]
+        .iter()
+        .filter_map(|marker| entry.rfind(marker))
+        .max();
+    match at {
+        Some(index) => (entry[..index].trim(), Some(&entry[index + 1..])),
+        None => (entry, None),
+    }
+}
+
+pub fn local_config() -> Option<ResolvedLocalConfig> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    resolve_local_config(&env, &paths::config_dir())
+}
+
+fn resolve_local_config(
+    env: &HashMap<String, String>,
+    config_dir: &Path,
+) -> Option<ResolvedLocalConfig> {
+    let file = read_file_config(config_dir)
+        .and_then(|file| file.local)
+        .unwrap_or_default();
+    let base_url = env
+        .get("CCP_LOCAL_BASE_URL")
+        .cloned()
+        .or(file.base_url)
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())?;
+    let models: Vec<LocalModel> = match env.get("CCP_LOCAL_MODELS") {
+        Some(raw) => raw.split(',').filter_map(LocalModel::parse).collect(),
+        None => file
+            .models
+            .iter()
+            .filter_map(|entry| LocalModel::parse(entry))
+            .collect(),
+    };
+    if models.is_empty() {
+        return None;
+    }
+    let api_key = env
+        .get("CCP_LOCAL_API_KEY")
+        .cloned()
+        .or(file.api_key)
+        .filter(|key| !key.is_empty());
+    Some(ResolvedLocalConfig {
+        base_url,
+        api_key,
+        models,
+    })
 }
 
 pub fn opencode_base_url() -> String {
@@ -1214,6 +1348,89 @@ mod tests {
             std::env::set_var("CCP_CODEX_TRANSPORT", "");
         }
         assert_eq!(codex_transport(), CodexTransport::WebSocket);
+    }
+
+    #[test]
+    fn local_config_needs_a_base_url_and_models_and_prefers_the_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+
+        assert_eq!(local_config(), None);
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"local":{"baseUrl":"http://127.0.0.1:11434/v1/","models":[" wollf:32k ","", "wollf"]}}"#,
+        )
+        .unwrap();
+        let resolved = local_config().expect("configured");
+        assert_eq!(resolved.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(
+            resolved.models,
+            vec![
+                LocalModel::parse("wollf:32k").unwrap(),
+                LocalModel::parse("wollf").unwrap()
+            ]
+        );
+        assert_eq!(resolved.api_key, None);
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"local":{"baseUrl":"http://127.0.0.1:8002/v1","models":["wollf-mlx=default_model","wollf-pool=wollf@http://100.69.85.34:9364/v1/","a@b=c@https://h/v1"]}}"#,
+        )
+        .unwrap();
+        let resolved = local_config().expect("configured");
+        assert_eq!(
+            resolved.models,
+            vec![
+                LocalModel {
+                    id: "wollf-mlx".into(),
+                    upstream: "default_model".into(),
+                    base_url: None,
+                },
+                LocalModel {
+                    id: "wollf-pool".into(),
+                    upstream: "wollf".into(),
+                    base_url: Some("http://100.69.85.34:9364/v1".into()),
+                },
+                LocalModel {
+                    id: "a@b".into(),
+                    upstream: "c".into(),
+                    base_url: Some("https://h/v1".into()),
+                },
+            ],
+            "an entry's own server follows the last @http; an upstream may hold an @"
+        );
+        assert_eq!(
+            LocalModel::parse("x=y@http://"),
+            None,
+            "an empty server is no entry"
+        );
+        assert_eq!(
+            LocalModel::parse("@http://h/v1"),
+            None,
+            "a server without a model is no entry"
+        );
+
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"local":{"baseUrl":"http://127.0.0.1:11434/v1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(local_config(), None, "no models, no provider");
+        {
+            let _models = EnvGuard::set("CCP_LOCAL_MODELS", "a, b,,c=default_model, =x");
+            let _key = EnvGuard::set("CCP_LOCAL_API_KEY", "secret");
+            let _url = EnvGuard::set("CCP_LOCAL_BASE_URL", "http://127.0.0.1:8002/v1");
+            let resolved = local_config().expect("env configured");
+            assert_eq!(resolved.base_url, "http://127.0.0.1:8002/v1");
+            let names: Vec<(&str, &str)> = resolved
+                .models
+                .iter()
+                .map(|m| (m.id.as_str(), m.upstream.as_str()))
+                .collect();
+            assert_eq!(names, vec![("a", "a"), ("b", "b"), ("c", "default_model")]);
+            assert_eq!(resolved.api_key.as_deref(), Some("secret"));
+        }
     }
 
     #[test]

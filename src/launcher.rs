@@ -83,7 +83,7 @@ pub fn run(claude_args: Vec<OsString>, fast: bool) -> Result<()> {
             "this Clodex deployment does not support native auto mode; update Clodex and start a new session"
         );
     }
-    let models = picker::entries(&catalog, &support, claude);
+    let models = picker::entries(&catalog, &support, claude, &config.local);
     let remote_proxy = if claude && config.remote_control {
         Some(crate::remote_proxy::RemoteProxy::start(proxy_port)?)
     } else {

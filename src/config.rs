@@ -40,6 +40,101 @@ pub struct AppConfig {
     pub routes: RoutesConfig,
     /// Prepare subscription-authenticated sessions for native Remote Control.
     pub remote_control: bool,
+    /// A local OpenAI-compatible chat server whose models join the picker.
+    pub local: LocalConfig,
+}
+
+/// A local OpenAI-compatible server (ollama, mlx_lm, llama.cpp, vLLM) that the
+/// bridge offers in `/model` and to subagents beside the Codex and Claude
+/// models. Each entry in `models` is the model id, or `id=upstream` when the
+/// server knows the model by another name, and may end in `@http://host/v1`
+/// to name its own server instead of `base_url`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LocalConfig {
+    pub base_url: Option<String>,
+    pub models: Vec<String>,
+}
+
+impl LocalConfig {
+    pub fn set(&mut self, base_url: &str, models: &[String]) -> Result<()> {
+        let base_url = base_url.trim().trim_end_matches('/');
+        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+            bail!("invalid local server URL {base_url:?}; expected http://host:port/v1");
+        }
+        let models: Vec<String> = models
+            .iter()
+            .flat_map(|entry| entry.split(','))
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect();
+        if models.is_empty() {
+            bail!("name at least one model the server serves, such as wollf:32k");
+        }
+        for model in &models {
+            let (names, server) = split_model_server(model);
+            if let Some(server) = server
+                && server_host(server).is_empty()
+            {
+                bail!("invalid model entry {model:?}; the server after @ needs a host");
+            }
+            let (id, upstream) = names.split_once('=').unwrap_or((names, names));
+            if id.trim().is_empty() || upstream.trim().is_empty() {
+                bail!(
+                    "invalid model entry {model:?}; expected id, id=upstream or id=upstream@http://host:port/v1"
+                );
+            }
+            if id.starts_with("claude-") || id.starts_with("anthropic/") {
+                bail!("local model ids cannot start with claude- or anthropic/");
+            }
+        }
+        self.base_url = Some(base_url.to_string());
+        self.models = models;
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        self.base_url = None;
+        self.models.clear();
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.base_url.is_some() && !self.models.is_empty()
+    }
+
+    /// The comma-separated list the backend reads from `CCP_LOCAL_MODELS`.
+    pub fn models_env(&self) -> String {
+        self.models.join(",")
+    }
+
+    pub fn render(&self) -> String {
+        match self.base_url.as_deref().filter(|_| self.is_configured()) {
+            Some(url) => format!("{url} ({})", self.models.join(", ")),
+            None => "none".to_string(),
+        }
+    }
+}
+
+/// The part of a server URL after its scheme, without a trailing slash.
+fn server_host(server: &str) -> &str {
+    server
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+}
+
+/// Splits a model entry `id=upstream@http://host/v1` at the last `@http://`
+/// or `@https://` into the names and the entry's own server, if it has one.
+pub fn split_model_server(entry: &str) -> (&str, Option<&str>) {
+    let at = ["@http://", "@https://"]
+        .iter()
+        .filter_map(|marker| entry.rfind(marker))
+        .max();
+    match at {
+        Some(index) => (entry[..index].trim(), Some(entry[index + 1..].trim())),
+        None => (entry.trim(), None),
+    }
 }
 
 /// Claude models, reached through the user's own Claude subscription, that
@@ -122,6 +217,7 @@ impl Default for AppConfig {
             permissions: PermissionsConfig::default(),
             routes: RoutesConfig::default(),
             remote_control: true,
+            local: LocalConfig::default(),
         }
     }
 }
@@ -214,7 +310,8 @@ impl AppConfig {
              Remote Control transport: {}\n\
              Hierarchical compaction: {}\n\
              Trusted tools:  {}\n\
-             Claude routes:  {}\n",
+             Claude routes:  {}\n\
+             Local server:   {}\n",
             self.context.render_limit(),
             self.context.compact_at_percent,
             self.codex.transport.as_str(),
@@ -226,7 +323,8 @@ impl AppConfig {
                 "off"
             },
             trusted_tools,
-            self.routes.render()
+            self.routes.render(),
+            self.local.render()
         )
     }
 
@@ -1053,5 +1151,43 @@ mod tests {
                 .unwrap(),
             600_000
         );
+    }
+
+    #[test]
+    fn a_local_model_entry_may_name_its_own_server() {
+        let mut local = LocalConfig::default();
+        local
+            .set(
+                "http://127.0.0.1:8002/v1",
+                &[
+                    "wollf-mlx=default_model".into(),
+                    "wollf-pool=wollf@http://100.69.85.34:9364/v1/".into(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            local.models_env(),
+            "wollf-mlx=default_model,wollf-pool=wollf@http://100.69.85.34:9364/v1/"
+        );
+        assert_eq!(
+            split_model_server("wollf-pool=wollf@http://100.69.85.34:9364/v1"),
+            ("wollf-pool=wollf", Some("http://100.69.85.34:9364/v1"))
+        );
+        assert_eq!(
+            split_model_server("a@b=c@https://h/v1"),
+            ("a@b=c", Some("https://h/v1")),
+            "the split is at the last @http"
+        );
+        assert_eq!(split_model_server("wollf:32k"), ("wollf:32k", None));
+        let error = local
+            .set("http://127.0.0.1:8002/v1", &["x=y@http://".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("needs a host"), "{error}");
+        let error = local
+            .set("http://127.0.0.1:8002/v1", &["@http://h/v1".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected id"), "{error}");
     }
 }
