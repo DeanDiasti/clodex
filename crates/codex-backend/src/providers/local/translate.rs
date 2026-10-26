@@ -140,7 +140,6 @@ fn without_patterns(schema: &Value) -> Value {
     }
 }
 
-
 fn tool_choice(choice: Option<&Value>) -> Option<Value> {
     let choice = choice?;
     match choice.get("type").and_then(Value::as_str)? {
@@ -228,6 +227,19 @@ impl StreamTranslator {
 
     pub fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    /// An Anthropic `ping` for a quiet upstream (a long prompt still being
+    /// prefilled), preceded by `message_start` if nothing has been sent yet, so
+    /// the client sees the stream is alive. Nothing once the message finished.
+    pub fn ping(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.finished {
+            return out;
+        }
+        self.ensure_started(&mut out);
+        emit(&mut out, "ping", &json!({"type": "ping"}));
+        out
     }
 
     /// Feeds one parsed SSE `data:` payload. Returns the Anthropic SSE bytes
@@ -770,6 +782,36 @@ mod tests {
             !chat.to_string().contains("\"pattern\":\""),
             "no pattern keyword survives"
         );
+    }
+
+    #[test]
+    fn a_ping_starts_the_message_once_and_stops_after_the_end() {
+        let mut t = StreamTranslator::new("msg_p".into(), "wollf".into(), 27_000);
+        let mut bytes = t.ping();
+        bytes.extend(t.ping());
+        bytes.extend(t.on_chunk(
+            &json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}),
+        ));
+        bytes.extend(t.finish());
+        let names: Vec<String> = events(&bytes).into_iter().map(|(name, _)| name).collect();
+        assert_eq!(
+            names,
+            [
+                "message_start",
+                "ping",
+                "ping",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert_eq!(
+            events(&bytes)[0].1["message"]["usage"]["input_tokens"],
+            27_000
+        );
+        assert!(t.ping().is_empty(), "no ping after message_stop");
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub struct LocalProvider {
     api_key: Option<String>,
     models: Vec<LocalModel>,
     client: reqwest::Client,
+    ping_every: Duration,
 }
 
 impl LocalProvider {
@@ -58,7 +59,14 @@ impl LocalProvider {
             api_key: config.api_key,
             models: config.models,
             client,
+            ping_every: PING_EVERY,
         }
+    }
+
+    /// The same provider with another quiet interval before a `ping`.
+    pub fn with_ping_every(mut self, ping_every: Duration) -> Self {
+        self.ping_every = ping_every;
+        self
     }
 
     pub fn base_url(&self) -> &str {
@@ -184,6 +192,111 @@ fn sse_headers() -> [(http::HeaderName, &'static str); 3] {
     ]
 }
 
+/// How long the client may go without an event before a `ping` is sent. A
+/// local server can spend minutes prefilling a long prompt before its first
+/// token (the mlx_lm server sends only SSE comments meanwhile, llama.cpp sends
+/// nothing), and Claude Code abandons a stream that is silent for about a
+/// minute and retries it from the start.
+pub const PING_EVERY: Duration = Duration::from_secs(10);
+
+/// Translates the upstream chat-completions stream into Anthropic SSE events,
+/// sending a `ping` whenever the client has had no event for `ping_every`.
+fn relay<S, E>(
+    upstream: S,
+    translator: StreamTranslator,
+    traffic: Option<Arc<TrafficCapture>>,
+    ping_every: Duration,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Unpin + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let state = (
+        upstream,
+        translator,
+        Vec::<u8>::new(),
+        false,
+        tokio::time::Instant::now(),
+    );
+    futures_util::stream::unfold(
+        state,
+        move |(mut upstream, mut translator, mut buffer, mut done, mut quiet_since)| {
+            let traffic = traffic.clone();
+            async move {
+                if translator.is_finished() {
+                    return None;
+                }
+                loop {
+                    if done {
+                        let out = translator.finish();
+                        return Some((
+                            Ok::<Bytes, std::io::Error>(Bytes::from(out)),
+                            (upstream, translator, buffer, done, quiet_since),
+                        ));
+                    }
+                    let next =
+                        match tokio::time::timeout_at(quiet_since + ping_every, upstream.next())
+                            .await
+                        {
+                            Ok(next) => next,
+                            Err(_) => {
+                                let out = translator.ping();
+                                quiet_since = tokio::time::Instant::now();
+                                if out.is_empty() {
+                                    continue;
+                                }
+                                return Some((
+                                    Ok(Bytes::from(out)),
+                                    (upstream, translator, buffer, done, quiet_since),
+                                ));
+                            }
+                        };
+                    match next {
+                        Some(Ok(chunk)) => {
+                            if let Some(traffic) = traffic.as_deref() {
+                                traffic.write_bytes("031-local-chat-chunk", &chunk);
+                            }
+                            buffer.extend_from_slice(&chunk);
+                            let (payloads, finished) = drain_sse_payloads(&mut buffer);
+                            done = finished;
+                            let mut out = Vec::new();
+                            for payload in &payloads {
+                                out.extend(translator.on_chunk(payload));
+                            }
+                            if done {
+                                out.extend(translator.finish());
+                            }
+                            if out.is_empty() {
+                                // An SSE comment (the mlx_lm server's prefill
+                                // keepalive) or a partial event: the client
+                                // still has heard nothing, so the clock runs on.
+                                continue;
+                            }
+                            quiet_since = tokio::time::Instant::now();
+                            return Some((
+                                Ok(Bytes::from(out)),
+                                (upstream, translator, buffer, done, quiet_since),
+                            ));
+                        }
+                        Some(Err(error)) => {
+                            let out =
+                                translator.fail(&format!("local server stream failed: {error}"));
+                            return Some((
+                                Ok(Bytes::from(out)),
+                                (upstream, translator, buffer, true, quiet_since),
+                            ));
+                        }
+                        None => {
+                            // The server closed without `[DONE]`; close the message anyway.
+                            done = true;
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
 #[async_trait]
 impl Provider for LocalProvider {
     fn name(&self) -> &'static str {
@@ -251,63 +364,11 @@ impl Provider for LocalProvider {
         }
 
         let translator = StreamTranslator::new(message_id, model, estimated_input);
-        let traffic: Option<Arc<TrafficCapture>> = ctx.traffic.clone();
-        let state = (upstream.bytes_stream(), translator, Vec::<u8>::new(), false);
-        let stream = futures_util::stream::unfold(
-            state,
-            move |(mut upstream, mut translator, mut buffer, mut done)| {
-                let traffic = traffic.clone();
-                async move {
-                    if translator.is_finished() {
-                        return None;
-                    }
-                    loop {
-                        if done {
-                            let out = translator.finish();
-                            return Some((
-                                Ok::<Bytes, std::io::Error>(Bytes::from(out)),
-                                (upstream, translator, buffer, done),
-                            ));
-                        }
-                        match upstream.next().await {
-                            Some(Ok(chunk)) => {
-                                if let Some(traffic) = traffic.as_deref() {
-                                    traffic.write_bytes("031-local-chat-chunk", &chunk);
-                                }
-                                buffer.extend_from_slice(&chunk);
-                                let (payloads, finished) = drain_sse_payloads(&mut buffer);
-                                done = finished;
-                                let mut out = Vec::new();
-                                for payload in &payloads {
-                                    out.extend(translator.on_chunk(payload));
-                                }
-                                if done {
-                                    out.extend(translator.finish());
-                                }
-                                if out.is_empty() {
-                                    continue;
-                                }
-                                return Some((
-                                    Ok(Bytes::from(out)),
-                                    (upstream, translator, buffer, done),
-                                ));
-                            }
-                            Some(Err(error)) => {
-                                let out = translator
-                                    .fail(&format!("local server stream failed: {error}"));
-                                return Some((
-                                    Ok(Bytes::from(out)),
-                                    (upstream, translator, buffer, true),
-                                ));
-                            }
-                            None => {
-                                // The server closed without `[DONE]`; close the message anyway.
-                                done = true;
-                            }
-                        }
-                    }
-                }
-            },
+        let stream = relay(
+            upstream.bytes_stream(),
+            translator,
+            ctx.traffic.clone(),
+            self.ping_every,
         );
         (sse_headers(), Body::from_stream(stream)).into_response()
     }
@@ -326,5 +387,78 @@ impl Provider for LocalProvider {
             }),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anthropic::sse::parse_sse_events;
+
+    fn names(bytes: &[u8]) -> Vec<String> {
+        parse_sse_events(bytes)
+            .into_iter()
+            .map(|event| event.event.unwrap_or_default())
+            .collect()
+    }
+
+    /// An upstream that sends only SSE comments for `quiet` (a prompt being
+    /// prefilled, as the mlx_lm server does every four seconds), then a reply.
+    fn prefilling_upstream(
+        quiet: Duration,
+    ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Unpin + Send + 'static
+    {
+        let comments = (quiet.as_secs() / 4) as usize;
+        Box::pin(futures_util::stream::unfold(
+            0usize,
+            move |step| async move {
+                let chunk: &'static [u8] = if step < comments {
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    b": keepalive 512/27000\n\n"
+                } else if step == comments {
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                } else {
+                    return None;
+                };
+                Some((Ok(Bytes::from_static(chunk)), step + 1))
+            },
+        ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_upstream_still_gets_pings_through_its_comments() {
+        let translator = StreamTranslator::new("msg_r".into(), "wollf".into(), 27_000);
+        let stream = relay(
+            prefilling_upstream(Duration::from_secs(25)),
+            translator,
+            None,
+            Duration::from_secs(10),
+        );
+        let chunks: Vec<Bytes> = stream.map(|chunk| chunk.unwrap()).collect().await;
+        let bytes: Vec<u8> = chunks.concat();
+        let names = names(&bytes);
+        let pings = names.iter().filter(|name| *name == "ping").count();
+        assert_eq!(names[0], "message_start");
+        assert_eq!(
+            pings, 2,
+            "a ping at 10 s and 20 s of a 24 s prefill: {names:?}"
+        );
+        assert_eq!(names.last().map(String::as_str), Some("message_stop"));
+        assert!(names.contains(&"content_block_delta".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_upstream_gets_no_ping() {
+        let translator = StreamTranslator::new("msg_q".into(), "wollf".into(), 10);
+        let stream = relay(
+            prefilling_upstream(Duration::ZERO),
+            translator,
+            None,
+            Duration::from_secs(10),
+        );
+        let chunks: Vec<Bytes> = stream.map(|chunk| chunk.unwrap()).collect().await;
+        let names = names(&chunks.concat());
+        assert!(!names.contains(&"ping".to_string()), "{names:?}");
+        assert_eq!(names.first().map(String::as_str), Some("message_start"));
     }
 }
