@@ -20,6 +20,7 @@ axum = { version = "0.8", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "fs"] }
 tower = { version = "0.5", features = ["util"] }
 http = "1"
+h2 = "0.4"
 http-body-util = "0.1"
 bytes = "1"
 futures-core = "0.3"

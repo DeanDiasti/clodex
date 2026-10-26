@@ -408,6 +408,7 @@ dependencies = [
  "flate2",
  "futures-core",
  "futures-util",
+ "h2",
  "hex",
  "hostname",
  "http",

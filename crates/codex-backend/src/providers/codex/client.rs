@@ -3165,6 +3165,15 @@ fn is_retryable_connection_source(error: &(dyn std::error::Error + 'static)) -> 
     let mut source = Some(error);
     for _ in 0..16 {
         let Some(error) = source else { break };
+        // Peer resets such as PROTOCOL_ERROR are hidden behind reqwest's
+        // generic "error sending request". Let the existing pre-output retry
+        // policy handle them without depending on h2's display wording.
+        if let Some(error) = error.downcast_ref::<h2::Error>()
+            && error.is_remote()
+            && error.is_reset()
+        {
+            return true;
+        }
         if let Some(error) = error.downcast_ref::<std::io::Error>()
             && matches!(
                 error.kind(),
@@ -3395,6 +3404,7 @@ pub(super) fn network_error(error: std::io::Error) -> CodexError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -3694,6 +3704,146 @@ mod tests {
         assert!(is_retryable_reqwest_error(&error), "{error:?}");
         assert!(!reqwest_error_causes(&error).is_empty());
         assert!(!error.to_string().contains("connection closed"));
+    }
+
+    enum Http2TestReply {
+        Reset,
+        Complete,
+        ResetAfterOutput(tokio::sync::oneshot::Receiver<()>),
+    }
+
+    async fn http2_test_server(
+        replies: Vec<Http2TestReply>,
+    ) -> (
+        Arc<CodexHttpClient>,
+        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let mut replies = replies.into_iter();
+            while let Some(request) = connection.accept().await {
+                let (request, mut respond) = request.unwrap();
+                let reply = replies.next().expect("unexpected HTTP/2 request replay");
+                let requests_tx = requests_tx.clone();
+                tokio::spawn(async move {
+                    let mut body = request.into_body();
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = body.data().await {
+                        let chunk = chunk.unwrap();
+                        bytes.extend_from_slice(&chunk);
+                        body.flow_control().release_capacity(chunk.len()).unwrap();
+                    }
+                    requests_tx.send(bytes).unwrap();
+                    if matches!(reply, Http2TestReply::Reset) {
+                        respond.send_reset(h2::Reason::PROTOCOL_ERROR);
+                        return;
+                    }
+                    let response = http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(())
+                        .unwrap();
+                    let mut stream = respond.send_response(response, false).unwrap();
+                    match reply {
+                        Http2TestReply::Complete => stream
+                            .send_data(
+                                Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"),
+                                true,
+                            )
+                            .unwrap(),
+                        Http2TestReply::ResetAfterOutput(release) => {
+                            stream
+                                .send_data(
+                                    Bytes::from_static(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"),
+                                    false,
+                                )
+                                .unwrap();
+                            release.await.unwrap();
+                            stream.send_reset(h2::Reason::PROTOCOL_ERROR);
+                        }
+                        Http2TestReply::Reset => unreachable!(),
+                    }
+                });
+            }
+        });
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder()
+                .no_proxy()
+                .http2_prior_knowledge()
+                .build()
+                .unwrap(),
+            format!("http://{addr}/responses"),
+            1_000,
+            1_000,
+        );
+        client.auth_manager().set_test_auth(http_test_auth());
+        (Arc::new(client), requests_rx, server)
+    }
+
+    #[tokio::test]
+    async fn http2_protocol_reset_before_headers_retries_the_original_request() {
+        let (client, mut requests, server) =
+            http2_test_server(vec![Http2TestReply::Reset, Http2TestReply::Complete]).await;
+        let mut events = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.stream_codex_http_events(&buffered_test_request(), &http_test_context()),
+        )
+        .await
+        .unwrap()
+        .expect("a remote HTTP/2 protocol reset must recover before output");
+        let mut completed = 0;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if event.unwrap()["type"] == "response.completed" {
+                    completed += 1;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed, 1);
+        let first = requests.recv().await.unwrap();
+        let second = requests.recv().await.unwrap();
+        assert_eq!(first, second, "the retry must preserve the full request");
+        assert!(requests.try_recv().is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http2_protocol_reset_after_output_is_not_replayed() {
+        let (release, reset) = tokio::sync::oneshot::channel();
+        let (client, mut requests, server) =
+            http2_test_server(vec![Http2TestReply::ResetAfterOutput(reset)]).await;
+        let mut events = client
+            .stream_codex_http_events(&buffered_test_request(), &http_test_context())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if event.unwrap()["type"] == "response.output_text.delta" {
+                    return;
+                }
+            }
+            panic!("expected partial output before the reset");
+        })
+        .await
+        .unwrap();
+        release.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.detail.as_deref(), Some("http_response_body"));
+        assert!(error.message.contains("unspecific protocol error detected"));
+        assert!(events.recv().await.is_none());
+        assert!(requests.recv().await.is_some());
+        assert!(requests.try_recv().is_err());
+        server.abort();
     }
 
     #[tokio::test]
