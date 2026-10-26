@@ -15,7 +15,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Messages requests to Chat Completions and streams the reply back as
   Anthropic events, tool calls included. A model entry may name its own
   server (`id=upstream@http://host:port/v1`), so several servers can be
-  offered at once.
+  offered at once. Each server answers one request at a time; the rest wait
+  in order, their clients kept alive with pings.
 
 ## [0.2.2] - 2026-10-21
 

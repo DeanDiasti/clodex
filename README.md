@@ -329,6 +329,13 @@ server. Claude Code's system prompt and tool schemas add well over ten thousand
 tokens to every turn, so a small model with a short context, or a server
 without a prompt cache, answers slowly.
 
+Each server gets one request at a time. A request that arrives while the
+server is busy, such as a background agent's progress summary sent on the
+agent's own model, waits its turn while its client receives keepalive pings,
+because two long prompts prefilled at once can exhaust a single machine's
+memory. A reply whose client has gone keeps the server's turn until the server
+finishes it, since the server goes on computing it regardless.
+
 ## Remote Control with OpenAI models
 
 With a Claude subscription login, new Clodex sessions are prepared for native
