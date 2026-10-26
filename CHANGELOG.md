@@ -7,6 +7,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Retry upstream HTTP/2 stream resets before model output using the existing
+  bounded backoff policy, instead of immediately reporting a generic network
+  error. Responses that already forwarded output are never replayed.
+
 ## [0.2.2] - 2026-10-21
 
 ### Fixed
