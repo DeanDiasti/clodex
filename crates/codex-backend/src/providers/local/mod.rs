@@ -18,7 +18,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::anthropic::error::json_error;
@@ -342,6 +342,29 @@ where
     )
 }
 
+/// Claude Code can send only a message delta that inherits its history and
+/// tools from an Anthropic message thread. A local server keeps no thread, so
+/// the delta would reach the model without its task: after the first turn it
+/// saw only the newest tool result, invented a task, and Qwen's chat template
+/// refused a request whose every user turn was a tool response ("No user query
+/// found in messages"). This protocol error makes Claude Code replay the full
+/// request and keep the model stateless for the rest of the session, as the
+/// Codex provider does.
+fn thread_unsupported() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Message thread requests are not supported for local models. Resend the full conversation and tools without the thread field.",
+                "details": {"error_code": "thread_unsupported_request"}
+            }
+        })),
+    )
+        .into_response()
+}
+
 /// One relayed reply as the client reads it, from a task that owns the relay.
 type Relayed = Result<Bytes, std::io::Error>;
 
@@ -455,6 +478,13 @@ impl Provider for LocalProvider {
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        if body
+            .extra
+            .get("thread")
+            .is_some_and(|thread| !thread.is_null())
+        {
+            return thread_unsupported();
+        }
         let model = body.model.clone().unwrap_or_default();
         let message_id = format!("msg_local_{}", uuid::Uuid::new_v4().simple());
         let (upstream_model, base_url) = self.target(&model);
@@ -720,6 +750,55 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_secs(30)).await;
         assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_thread_request_is_refused_before_the_server_is_asked() {
+        use http_body_util::BodyExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = LocalProvider::new(ResolvedLocalConfig {
+            base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
+            api_key: None,
+            models: vec![LocalModel::parse("wollf").unwrap()],
+        });
+        for stream in [false, true] {
+            for thread in [
+                json!({"type": "create"}),
+                json!({"type": "continue", "previous_message_id": "msg_previous"}),
+            ] {
+                let body: MessagesRequest = serde_json::from_value(json!({
+                    "model": "wollf",
+                    "stream": stream,
+                    "thread": thread,
+                    "messages": [{"role": "user", "content": [{
+                        "type": "tool_result", "tool_use_id": "call_previous", "content": "OK"
+                    }]}]
+                }))
+                .unwrap();
+                let ctx = RequestContext {
+                    req_id: "request-thread".into(),
+                    session_id: None,
+                    session_seq: None,
+                    provider: PROVIDER_NAME.into(),
+                    traffic: None,
+                    monitor: None,
+                };
+                let response = tokio::select! {
+                    connection = listener.accept() => {
+                        panic!("a thread request reached the local server: {connection:?}");
+                    }
+                    response = provider.handle_messages(body, ctx) => response,
+                };
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let error: Value = serde_json::from_slice(&bytes).unwrap();
+                // Claude Code recognizes this code and retries with full history.
+                assert_eq!(
+                    error["error"]["details"]["error_code"],
+                    "thread_unsupported_request"
+                );
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
