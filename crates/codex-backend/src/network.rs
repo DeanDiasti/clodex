@@ -117,9 +117,19 @@ pub fn interrupted() -> std::io::Error {
 /// Recreation is lazy, on the next request, and serialized across callers.
 pub struct ClientPool {
     network: Arc<NetworkMonitor>,
-    current: Mutex<(u64, reqwest::Client)>,
+    current: Mutex<CachedClient>,
     factory: Box<dyn Fn() -> reqwest::Client + Send + Sync>,
 }
+
+struct CachedClient {
+    network_generation: u64,
+    revision: u64,
+    client: Option<reqwest::Client>,
+}
+
+/// Identifies the pool used by a request, including after its response starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientRevision(u64);
 
 impl ClientPool {
     pub fn new(
@@ -130,7 +140,11 @@ impl ClientPool {
         let client = factory();
         Self {
             network,
-            current: Mutex::new((generation, client)),
+            current: Mutex::new(CachedClient {
+                network_generation: generation,
+                revision: 0,
+                client: Some(client),
+            }),
             factory: Box::new(factory),
         }
     }
@@ -141,12 +155,30 @@ impl ClientPool {
     }
 
     pub fn get(&self) -> reqwest::Client {
+        self.get_with_revision().0
+    }
+
+    pub fn get_with_revision(&self) -> (reqwest::Client, ClientRevision) {
         let mut current = self.current.lock().unwrap();
         let generation = self.network.generation();
-        if current.0 != generation {
-            *current = (generation, (self.factory)());
+        if current.network_generation != generation || current.client.is_none() {
+            current.network_generation = generation;
+            current.revision += 1;
+            current.client = Some((self.factory)());
         }
-        current.1.clone()
+        (
+            current.client.as_ref().unwrap().clone(),
+            ClientRevision(current.revision),
+        )
+    }
+
+    /// Retire failed connections without letting late errors discard a newer pool.
+    /// Existing responses retain their client and are not interrupted here.
+    pub fn retire(&self, revision: ClientRevision) {
+        let mut current = self.current.lock().unwrap();
+        if current.revision == revision.0 {
+            current.client = None;
+        }
     }
 }
 
@@ -461,6 +493,25 @@ mod tests {
         assert!(lease.is_current());
         pool.get();
         pool.get();
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn concurrent_failures_retire_only_the_pool_they_used() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let builds = Arc::new(AtomicUsize::new(0));
+        let count = builds.clone();
+        let pool = ClientPool::new(NetworkMonitor::isolated(), move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            reqwest::Client::new()
+        });
+        let (_, old) = pool.get_with_revision();
+        pool.retire(old);
+        pool.retire(old);
+        let (_, fresh) = pool.get_with_revision();
+        assert_ne!(fresh, old);
+        pool.retire(old); // A late error on an old connection must not evict fresh connections.
+        assert_eq!(pool.get_with_revision().1, fresh);
         assert_eq!(builds.load(Ordering::Relaxed), 2);
     }
 }
