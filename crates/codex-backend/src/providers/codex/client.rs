@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
-use crate::network::{ClientPool, NetworkLease, NetworkMonitor};
+use crate::network::{ClientPool, ClientRevision, NetworkLease, NetworkMonitor};
 use crate::provider::RequestContext;
 use crate::request_identity::ConversationIdentity;
 use crate::retry::{compute_backoff_delay, should_retry_status, sleep};
@@ -377,7 +377,7 @@ struct DecodedHttpSseEvent {
 struct HttpEventStreamState {
     network: NetworkLease,
     monitor: Arc<NetworkMonitor>,
-    network_retried: bool,
+    recovery: NetworkRecovery,
     resp: reqwest::Response,
     response_headers: Vec<(String, String)>,
     started_at: Instant,
@@ -386,6 +386,44 @@ struct HttpEventStreamState {
     auth_refresh_attempted: bool,
     use_responses_lite: bool,
     retries: u32,
+}
+
+const NETWORK_RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+const DNS_RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// One deadline across disconnect, reconnect, and DNS recovery. It is never
+/// extended by another notification or by a new transport attempt.
+#[derive(Clone, Default)]
+struct NetworkRecovery {
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl NetworkRecovery {
+    fn begin(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        now < *self.deadline.get_or_insert(now + NETWORK_RECOVERY_TIMEOUT)
+    }
+
+    async fn run<F: std::future::Future>(&self, future: F) -> Result<F::Output, CodexError> {
+        match self.deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, future)
+                .await
+                .map_err(|_| Self::timeout_error()),
+            None => Ok(future.await),
+        }
+    }
+
+    fn timeout_error() -> CodexError {
+        CodexError {
+            status: 503,
+            message: "Network recovery timed out after 120 seconds; check connectivity and retry."
+                .into(),
+            detail: Some("network_recovery_timeout".into()),
+            retry_after: None,
+            usage_limit: None,
+            origin: CodexErrorOrigin::Http,
+        }
+    }
 }
 
 impl HttpSseDecoder {
@@ -1193,7 +1231,8 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         monitor: Arc<NetworkMonitor>,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
-        for retried in [false, true] {
+        let mut recovery = NetworkRecovery::default();
+        loop {
             let mut network = monitor.lease();
             let result = network
                 .run(self.stream_codex_http_events_on_network(
@@ -1201,20 +1240,20 @@ impl CodexHttpClient {
                     ctx,
                     network.clone(),
                     monitor.clone(),
-                    retried,
+                    &mut recovery,
                 ))
                 .await;
             match result {
                 Ok(result) => return result,
-                Err(error) => {
-                    log_network_interruption(&ctx.req_id, false, !retried, false);
-                    if retried {
-                        return Err(network_error(error));
+                Err(_) => {
+                    let retry = recovery.begin();
+                    log_network_interruption(&ctx.req_id, false, retry, false);
+                    if !retry {
+                        return Err(NetworkRecovery::timeout_error());
                     }
                 }
             }
         }
-        unreachable!()
     }
 
     async fn stream_codex_http_events_on_network(
@@ -1223,7 +1262,7 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         network: NetworkLease,
         monitor: Arc<NetworkMonitor>,
-        network_retried: bool,
+        recovery: &mut NetworkRecovery,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
         let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
@@ -1244,40 +1283,23 @@ impl CodexHttpClient {
         let mut auth_refresh_attempted = false;
         let use_responses_lite = body.client_metadata.is_some();
         let mut retries = 0_u32;
-        let (resp, response_headers, started_at) = loop {
-            match self
-                .start_http_event_attempt(
-                    &mut auth,
-                    &body_json,
-                    ctx,
-                    use_responses_lite,
-                    &mut auth_refresh_attempted,
-                )
-                .await
-            {
-                Ok(attempt) => break attempt,
-                Err(error) if retryable_http_stream_error(&error) => {
-                    if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
-                        log_http_stream_retry(ctx, &error, retries, None);
-                        return Err(error);
-                    }
-                    let delay = compute_backoff_delay(retries, error.retry_after.as_deref());
-                    if delay.exceeds_budget {
-                        return Err(error);
-                    }
-                    retries += 1;
-                    log_http_stream_retry(ctx, &error, retries, Some(delay.wait_ms));
-                    sleep(delay.wait_ms).await;
-                }
-                Err(error) => return Err(error),
-            }
-        };
+        let (resp, response_headers, started_at) = self
+            .start_http_event_attempt_with_retry(
+                &mut auth,
+                &body_json,
+                ctx,
+                use_responses_lite,
+                &mut auth_refresh_attempted,
+                &mut retries,
+                recovery,
+            )
+            .await?;
 
         Ok(self.spawn_http_event_stream(
             HttpEventStreamState {
                 network,
                 monitor,
-                network_retried,
+                recovery: recovery.clone(),
                 resp,
                 response_headers,
                 started_at,
@@ -1299,6 +1321,65 @@ impl CodexHttpClient {
         let receiver = self.stream_codex_http_events(body, ctx).await?;
         let (stream, _) = super::websocket::CodexWebSocketEventStream::pending(receiver);
         Ok(stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_http_event_attempt_with_retry(
+        &self,
+        auth: &mut StoredAuth,
+        body_json: &str,
+        ctx: &RequestContext,
+        use_responses_lite: bool,
+        auth_refresh_attempted: &mut bool,
+        retries: &mut u32,
+        recovery: &mut NetworkRecovery,
+    ) -> Result<(reqwest::Response, Vec<(String, String)>, Instant), CodexError> {
+        loop {
+            let result = recovery
+                .run(self.start_http_event_attempt(
+                    auth,
+                    body_json,
+                    ctx,
+                    use_responses_lite,
+                    auth_refresh_attempted,
+                ))
+                .await?;
+            match result {
+                Ok(attempt) => return Ok(attempt),
+                Err(error)
+                    if error.status == 0
+                        && error
+                            .detail
+                            .as_deref()
+                            .is_some_and(|cause| cause.contains("dns error")) =>
+                {
+                    if !recovery.begin() {
+                        return Err(NetworkRecovery::timeout_error());
+                    }
+                    create_logger("codex").info("network_waiting_for_dns", Some(
+                        serde_json::json!({"reqId": ctx.req_id, "retryInMs": DNS_RECOVERY_INTERVAL.as_millis()})
+                            .as_object().unwrap().clone(),
+                    ));
+                    recovery
+                        .run(tokio::time::sleep(DNS_RECOVERY_INTERVAL))
+                        .await?;
+                }
+                Err(error) if retryable_http_stream_error(&error) => {
+                    if *retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
+                        log_http_stream_retry(ctx, &error, *retries, None);
+                        return Err(error);
+                    }
+                    let delay = compute_backoff_delay(*retries, error.retry_after.as_deref());
+                    if delay.exceeds_budget {
+                        return Err(error);
+                    }
+                    *retries += 1;
+                    log_http_stream_retry(ctx, &error, *retries, Some(delay.wait_ms));
+                    recovery.run(sleep(delay.wait_ms)).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn start_http_event_attempt(
@@ -1400,7 +1481,7 @@ impl CodexHttpClient {
         let HttpEventStreamState {
             mut network,
             monitor,
-            mut network_retried,
+            mut recovery,
             mut resp,
             mut response_headers,
             mut started_at,
@@ -1423,9 +1504,14 @@ impl CodexHttpClient {
             loop {
                 let result = network.run(async {
                 if restart {
-                    match client.start_http_event_attempt(
-                        &mut auth, &body_json, &ctx, use_responses_lite, &mut auth_refresh_attempted,
-                    ).await {
+                    let restarted = tokio::select! {
+                        _ = tx.closed() => return,
+                        result = client.start_http_event_attempt_with_retry(
+                            &mut auth, &body_json, &ctx, use_responses_lite,
+                            &mut auth_refresh_attempted, &mut retries, &mut recovery,
+                        ) => result,
+                    };
+                    match restarted {
                         Ok((next_resp, next_headers, next_started)) => {
                             resp = next_resp;
                             response_headers = next_headers;
@@ -1500,6 +1586,7 @@ impl CodexHttpClient {
                             return;
                         }
                         Ok(Err(err)) => {
+                            client.retire_failed_http_response(&resp);
                             let error = CodexError {
                                 status: 0,
                                 message: format!(
@@ -1701,12 +1788,14 @@ impl CodexHttpClient {
 
                     let next_attempt = tokio::select! {
                         _ = tx.closed() => return,
-                        result = client.start_http_event_attempt(
+                        result = client.start_http_event_attempt_with_retry(
                             &mut auth,
                             &body_json,
                             &ctx,
                             use_responses_lite,
                             &mut auth_refresh_attempted,
+                            &mut retries,
+                            &mut recovery,
                         ) => result
                     };
                     match next_attempt {
@@ -1730,13 +1819,18 @@ impl CodexHttpClient {
                 match result {
                     Ok(()) => break,
                     Err(error) => {
-                        let retry = !network_retried && !semantic_output_forwarded;
+                        let retry = !semantic_output_forwarded && recovery.begin();
                         log_network_interruption(&req_id, true, retry, semantic_output_forwarded);
                         if !retry {
-                            let _ = tx.send(Err(network_error(error))).await;
+                            let error = if semantic_output_forwarded {
+                                network_error(error)
+                            } else {
+                                NetworkRecovery::timeout_error()
+                            };
+                            let _ = tx.send(Err(error)).await;
                             break;
                         }
-                        network_retried = true;
+                        retries = 0;
                         network = monitor.lease();
                         restart = true;
                     }
@@ -2511,7 +2605,8 @@ impl CodexHttpClient {
         }
 
         // Build headers
-        let mut req_builder = self.client.get().post(url);
+        let (client, revision) = self.client.get_with_revision();
+        let mut req_builder = client.post(url);
         for (key, value) in headers.iter() {
             req_builder = req_builder.header(key.as_str(), value.as_bytes());
         }
@@ -2521,7 +2616,7 @@ impl CodexHttpClient {
         let send_fut = req_builder.body(body_json.to_string()).send();
         let header_timeout_dur = Duration::from_millis(self.header_timeout_ms);
 
-        let resp = tokio::time::timeout(header_timeout_dur, send_fut)
+        let mut resp = tokio::time::timeout(header_timeout_dur, send_fut)
             .await
             .map_err(|_| CodexError {
                 status: 0,
@@ -2537,6 +2632,9 @@ impl CodexHttpClient {
             .map_err(|e| {
                 let e = e.without_url();
                 let retryable = is_retryable_reqwest_error(&e);
+                if retryable {
+                    self.client.retire(revision);
+                }
                 let causes = reqwest_error_causes(&e);
                 create_logger("codex").warn(
                     "codex_http_request_failed",
@@ -2562,7 +2660,14 @@ impl CodexHttpClient {
                 }
             })?;
 
+        resp.extensions_mut().insert(revision);
         Ok((resp, started_at))
+    }
+
+    fn retire_failed_http_response(&self, resp: &reqwest::Response) {
+        if let Some(revision) = resp.extensions().get::<ClientRevision>() {
+            self.client.retire(*revision);
+        }
     }
 
     async fn collect_http_response(
@@ -2597,16 +2702,19 @@ impl CodexHttpClient {
                 usage_limit: None,
                 origin: CodexErrorOrigin::Http,
             })?
-            .map_err(|e| CodexError {
-                status: 0,
-                message: format!(
-                    "Transport error reading Codex response body: {}",
-                    reqwest_error_summary(&e.without_url())
-                ),
-                detail: Some("http_response_body".to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Http,
+            .map_err(|e| {
+                self.retire_failed_http_response(&resp);
+                CodexError {
+                    status: 0,
+                    message: format!(
+                        "Transport error reading Codex response body: {}",
+                        reqwest_error_summary(&e.without_url())
+                    ),
+                    detail: Some("http_response_body".to_string()),
+                    retry_after: None,
+                    usage_limit: None,
+                    origin: CodexErrorOrigin::Http,
+                }
             })?;
 
             let Some(chunk) = chunk else {
@@ -2786,7 +2894,7 @@ fn codex_usage_limit_error(limit: CodexUsageLimit, origin: CodexErrorOrigin) -> 
 }
 
 fn retryable_http_stream_error(error: &CodexError) -> bool {
-    if error.usage_limit.is_some() {
+    if error.usage_limit.is_some() || error.detail.as_deref() == Some("network_recovery_timeout") {
         return false;
     }
     if should_retry_codex_status(error.status) || is_retryable_transport_error(error) {
@@ -3788,6 +3896,7 @@ mod tests {
     async fn http2_protocol_reset_before_headers_retries_the_original_request() {
         let (client, mut requests, server) =
             http2_test_server(vec![Http2TestReply::Reset, Http2TestReply::Complete]).await;
+        let original_pool = client.client.get_with_revision().1;
         let mut events = tokio::time::timeout(
             Duration::from_secs(5),
             client.stream_codex_http_events(&buffered_test_request(), &http_test_context()),
@@ -3809,6 +3918,7 @@ mod tests {
         let first = requests.recv().await.unwrap();
         let second = requests.recv().await.unwrap();
         assert_eq!(first, second, "the retry must preserve the full request");
+        assert_ne!(client.client.get_with_revision().1, original_pool);
         assert!(requests.try_recv().is_err());
         server.abort();
     }
@@ -3818,6 +3928,7 @@ mod tests {
         let (release, reset) = tokio::sync::oneshot::channel();
         let (client, mut requests, server) =
             http2_test_server(vec![Http2TestReply::ResetAfterOutput(reset)]).await;
+        let original_pool = client.client.get_with_revision().1;
         let mut events = client
             .stream_codex_http_events(&buffered_test_request(), &http_test_context())
             .await
@@ -3840,6 +3951,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.detail.as_deref(), Some("http_response_body"));
         assert!(error.message.contains("unspecific protocol error detected"));
+        assert_ne!(client.client.get_with_revision().1, original_pool);
         assert!(events.recv().await.is_none());
         assert!(requests.recv().await.is_some());
         assert!(requests.try_recv().is_err());
@@ -4111,8 +4223,233 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_network_change_does_not_replay_http_stream() {
+    async fn disconnect_then_reconnect_before_headers_recovers() {
         assert_network_change_before_output_retries(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_then_reconnect_before_stream_output_recovers() {
+        assert_network_change_before_output_retries(true, true).await;
+    }
+
+    struct TransitionDns {
+        attempts: std::sync::atomic::AtomicUsize,
+        failures: usize,
+        address: std::net::SocketAddr,
+    }
+
+    impl reqwest::dns::Resolve for TransitionDns {
+        fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            use std::sync::atomic::Ordering;
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            let result: Result<reqwest::dns::Addrs, Box<dyn std::error::Error + Send + Sync>> =
+                if attempt < self.failures {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "DNS unavailable during network transition",
+                    )
+                    .into())
+                } else {
+                    Ok(Box::new(std::iter::once(self.address)))
+                };
+            Box::pin(std::future::ready(result))
+        }
+    }
+
+    fn dns_transition_client(dns: Arc<TransitionDns>) -> Arc<CodexHttpClient> {
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder()
+                .no_proxy()
+                .dns_resolver(dns.clone())
+                .build()
+                .unwrap(),
+            format!(
+                "http://network-transition.test:{}/responses",
+                dns.address.port()
+            ),
+            1_000,
+            1_000,
+        );
+        client.auth_manager().set_test_auth(http_test_auth());
+        Arc::new(client)
+    }
+
+    #[tokio::test]
+    async fn dns_recovery_outlasts_the_ordinary_retry_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dns = Arc::new(TransitionDns {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            failures: MAX_BUFFERED_TRANSPORT_ATTEMPTS as usize + 1,
+            address: listener.local_addr().unwrap(),
+        });
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            let body = b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        let client = dns_transition_client(dns.clone());
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut events = client
+                .stream_codex_http_events_with_monitor(
+                    &buffered_test_request(),
+                    &http_test_context(),
+                    NetworkMonitor::isolated(),
+                )
+                .await
+                .unwrap();
+            let mut completed = 0;
+            while let Some(event) = events.recv().await {
+                if event.unwrap()["type"] == "response.completed" {
+                    completed += 1;
+                }
+            }
+            assert_eq!(completed, 1);
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(
+            dns.attempts.load(std::sync::atomic::Ordering::SeqCst)
+                > MAX_BUFFERED_TRANSPORT_ATTEMPTS as usize
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_dns_failure_stops_at_the_recovery_deadline() {
+        let dns = Arc::new(TransitionDns {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            failures: usize::MAX,
+            address: "127.0.0.1:1".parse().unwrap(),
+        });
+        let client = dns_transition_client(dns.clone());
+        let started = tokio::time::Instant::now();
+        let result = client
+            .stream_codex_http_events_with_monitor(
+                &buffered_test_request(),
+                &http_test_context(),
+                NetworkMonitor::isolated(),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("offline request unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.detail.as_deref(), Some("network_recovery_timeout"));
+        assert_eq!(started.elapsed(), NETWORK_RECOVERY_TIMEOUT);
+        assert!(!retryable_http_stream_error(&error));
+        assert!(!super::super::retryable_live_start_codex_error(&error));
+        assert!(dns.attempts.load(std::sync::atomic::Ordering::SeqCst) <= 61);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_request_cancels_dns_recovery() {
+        let dns = Arc::new(TransitionDns {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            failures: usize::MAX,
+            address: "127.0.0.1:1".parse().unwrap(),
+        });
+        let client = dns_transition_client(dns.clone());
+        let request = tokio::spawn(async move {
+            client
+                .stream_codex_http_events_with_monitor(
+                    &buffered_test_request(),
+                    &http_test_context(),
+                    NetworkMonitor::isolated(),
+                )
+                .await
+        });
+        while dns.attempts.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let attempts = dns.attempts.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            dns.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            attempts
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_network_changes_do_not_extend_the_recovery_deadline() {
+        let mut recovery = NetworkRecovery::default();
+        assert!(recovery.begin());
+        let deadline = recovery.deadline;
+        tokio::time::advance(Duration::from_secs(119)).await;
+        assert!(recovery.begin());
+        assert_eq!(recovery.deadline, deadline);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!recovery.begin());
+    }
+
+    #[tokio::test]
+    async fn restarted_stream_retries_transport_failures_on_the_new_network() {
+        let network = NetworkMonitor::isolated();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ready, change) = tokio::sync::oneshot::channel();
+        let server_network = network.clone();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let original = read_http_request(&mut first).await;
+            first.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n").await.unwrap();
+            change.await.unwrap();
+            server_network.notify_change();
+            let (mut failed, _) = listener.accept().await.unwrap();
+            assert_eq!(read_http_request(&mut failed).await, original);
+            drop(failed); // New Wi-Fi route exists, but its first connection fails.
+            let (mut recovered, _) = listener.accept().await.unwrap();
+            assert_eq!(read_http_request(&mut recovered).await, original);
+            let body = b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+            recovered
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            recovered.write_all(body).await.unwrap();
+        });
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let mut events = client
+            .stream_codex_http_events_with_monitor(
+                &buffered_test_request(),
+                &http_test_context(),
+                network,
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.recv().await.unwrap().unwrap()["type"], "keepalive");
+        ready.send(()).unwrap();
+        let mut completed = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.recv().await {
+                if event.unwrap()["type"] == "response.completed" {
+                    completed += 1;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed, 1);
+        server.await.unwrap();
     }
 
     async fn assert_network_change_before_output_retries(
@@ -4137,12 +4474,9 @@ mod tests {
             assert!(second.read(&mut request).await.unwrap() > 0);
             if interrupt_retry {
                 server_network.notify_change();
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                        .await
-                        .is_err()
-                );
-                return;
+                let (mut third, _) = listener.accept().await.unwrap();
+                assert!(third.read(&mut request).await.unwrap() > 0);
+                second = third;
             }
             let body =
                 b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_retry\"}}\n\n";
@@ -4167,17 +4501,8 @@ mod tests {
                 events
             } else {
                 ready_tx.send(()).unwrap();
-                match setup.await {
-                    Ok(events) => events,
-                    Err(error) if interrupt_retry => {
-                        assert_eq!(error.detail.as_deref(), Some("network_changed"));
-                        server.await.unwrap();
-                        return;
-                    }
-                    Err(error) => panic!("unexpected setup error: {error:?}"),
-                }
+                setup.await.unwrap()
             };
-            assert!(!interrupt_retry);
             let mut completed = 0;
             while let Some(event) = events.recv().await {
                 if event.unwrap()["type"] == "response.completed" {
@@ -4238,7 +4563,7 @@ mod tests {
                 &http_test_context(),
                 network.lease(),
                 network.clone(),
-                false,
+                &mut NetworkRecovery::default(),
             )
             .await
             .unwrap();

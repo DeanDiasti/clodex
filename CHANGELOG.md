@@ -9,6 +9,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Keep streaming Codex HTTP requests pending through DNS recovery and repeated
+  disconnect/reconnect events for up to two minutes before output starts.
+  Restarted streams retain normal transport retries, and failed connections
+  retire their pool without discarding newer connections or replaying output.
 - Retry upstream HTTP/2 stream resets before model output using the existing
   bounded backoff policy, instead of immediately reporting a generic network
   error. Responses that already forwarded output are never replayed.

@@ -668,13 +668,19 @@ clodex context
   to settle, then reacts to what changed. DNS and proxy changes only retire
   idle connections, so new requests use fresh ones. A change of primary
   interface, router, or IPv4 address also interrupts in-flight Codex and
-  Anthropic requests. A Codex request that has not yet sent output is retried
-  once on the new network; already delivered output is never silently
-  replayed. If a stream was interrupted after output began, retry that turn or
-  agent. New connection setup is bounded to 15 seconds without imposing a
+  Anthropic requests. When HTTP is configured or used as a fallback, streaming
+  Codex requests can recover across disconnect and reconnect notifications
+  before output starts. DNS recovery waits for up to two minutes while the
+  client receives keepalives; if the
+  network stays unavailable, the request returns a recovery timeout. Failed
+  transport/TLS connections retire their pool before the next attempt, and
+  late errors cannot discard a newer pool. Already delivered output is never
+  silently replayed. If a stream was interrupted after output began, retry that
+  turn or agent. New connection setup is bounded to 15 seconds without imposing a
   total time limit on model responses. Logs include `network_changed` (with
-  `kind` `path` or `pool`), `network_request_interrupted`, and
-  `network_stream_interrupted`; addresses and DNS settings are not logged.
+  `kind` `path` or `pool`), `network_request_interrupted`,
+  `network_stream_interrupted`, and `network_waiting_for_dns`; addresses and
+  DNS settings are not logged.
   Automatic network-change notifications are currently macOS-specific.
 - **“Agent terminated early” with “error decoding response body”:** this is an
   interrupted upstream Codex response. The proxy retries failures that are

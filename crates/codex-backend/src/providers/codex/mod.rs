@@ -1564,6 +1564,9 @@ fn is_codex_success_terminal_event(payload: &serde_json::Value) -> bool {
 }
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
+    if err.detail.as_deref() == Some("network_recovery_timeout") {
+        return false;
+    }
     if err.detail.as_deref() == Some("network_changed") {
         return true;
     }
