@@ -668,9 +668,10 @@ clodex context
   to settle, then reacts to what changed. DNS and proxy changes only retire
   idle connections, so new requests use fresh ones. A change of primary
   interface, router, or IPv4 address also interrupts in-flight Codex and
-  Anthropic requests. Default streaming Codex HTTP requests can recover across
-  disconnect and reconnect notifications before output starts. DNS recovery
-  waits for up to two minutes while the client receives keepalives; if the
+  Anthropic requests. When HTTP is configured or used as a fallback, streaming
+  Codex requests can recover across disconnect and reconnect notifications
+  before output starts. DNS recovery waits for up to two minutes while the
+  client receives keepalives; if the
   network stays unavailable, the request returns a recovery timeout. Failed
   transport/TLS connections retire their pool before the next attempt, and
   late errors cannot discard a newer pool. Already delivered output is never
